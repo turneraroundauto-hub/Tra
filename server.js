@@ -26,7 +26,7 @@ app.use(express.json());
 // Server identifies tier and attaches user status to req
 
 const TIER_KEYS = {
-  free:    process.env.FREE_KEY    || process.env.APP_SECRET,
+  free:    process.env.APP_SECRET    || process.env.APP_SECRET,
   starter: process.env.STARTER_KEY,
   pro:     process.env.PRO_KEY,
   shark:   process.env.SHARK_KEY,

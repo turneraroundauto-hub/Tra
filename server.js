@@ -567,7 +567,7 @@ Write exactly 2 sentences: sector rotation summary for a swing trader.
 // ─── HEALTH CHECK ─────────────────────────────────────────────────
 // ── USER STATUS ───────────────────────────────────────────────────
 app.get("/status", (req, res) => {
-  const status = credits.getUserStatus(req.userKey);
+  const status = credits.getUserStatus(req.userKey, req.userTier);
   res.json(status);
 });
 
@@ -747,7 +747,7 @@ app.post("/analyze", async (req, res) => {
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
 
   // ── CREDIT CHECK ──────────────────────────────────────────────
-  const userStatus = credits.getUserStatus(req.userKey);
+  const userStatus = credits.getUserStatus(req.userKey, req.userTier);
 
   // Check ticker limit
   if (req.userTier !== "shark" && req.userTier !== "pro") {
@@ -776,7 +776,7 @@ app.post("/analyze", async (req, res) => {
   }
 
   // Deduct 1 credit (only if not cached)
-  credits.deductCredit(req.userKey, 1);
+  credits.deductCredit(req.userKey, 1, req.userTier);
 
   // ── GATE 0 — PRE-DETERMINED ───────────────────────────────────────
   const gate0Status = sectorContext?.gateStatus || "GREEN";

@@ -1,4 +1,3 @@
-
 // ═══════════════════════════════════════════════════════════════════
 // CREDIT SYSTEM — Trade Verdict
 // ═══════════════════════════════════════════════════════════════════
@@ -92,16 +91,31 @@ function saveCredits() {
 
 // ── USER RECORD ───────────────────────────────────────────────────
 // apiKey → { tier, credits, purchasedCredits, lastReset, createdAt }
-function getUser(apiKey) {
+function getUser(apiKey, tier) {
+  tier = tier || "free";
   if (!creditStore[apiKey]) {
-    // New user — create free tier record
+    // New user — initialize with correct tier and credits
+    const tierConfig = TIERS[tier] || TIERS.free;
+    const startCredits = tierConfig.monthlyCredits || tierConfig.startingCredits || 0;
     creditStore[apiKey] = {
-      tier:             "free",
-      credits:          TIERS.free.startingCredits,
+      tier:             tier,
+      credits:          startCredits,
       purchasedCredits: 0,
       lastReset:        currentMonthKey(),
       createdAt:        new Date().toISOString(),
     };
+    console.log(`New ${tier} user initialized with ${startCredits} credits`);
+    saveCredits();
+  } else if (creditStore[apiKey].tier !== tier) {
+    // Key exists but tier mismatch — upgrade/correct the tier
+    const tierConfig = TIERS[tier] || TIERS.free;
+    creditStore[apiKey].tier = tier;
+    // Only top up if current credits are lower than new tier's starting amount
+    const minCredits = tierConfig.monthlyCredits || tierConfig.startingCredits || 0;
+    if (creditStore[apiKey].credits < minCredits) {
+      creditStore[apiKey].credits = minCredits;
+    }
+    console.log(`User tier corrected to ${tier}`);
     saveCredits();
   }
   return creditStore[apiKey];
@@ -137,8 +151,8 @@ function getTotalCredits(user) {
   return (user.credits || 0) + (user.purchasedCredits || 0);
 }
 
-function deductCredit(apiKey, count = 1) {
-  const user = getUser(apiKey);
+function deductCredit(apiKey, count = 1, tier) {
+  const user = getUser(apiKey, tier);
   checkMonthlyReset(user);
 
   const total = getTotalCredits(user);
@@ -178,24 +192,24 @@ function upgradeTier(apiKey, newTier) {
   return true;
 }
 
-function getUserStatus(apiKey) {
-  const user = getUser(apiKey);
+function getUserStatus(apiKey, tier) {
+  const user = getUser(apiKey, tier);
   checkMonthlyReset(user);
-  const tier = TIERS[user.tier] || TIERS.free;
+  const tierConfig = TIERS[user.tier] || TIERS.free;
   return {
     tier:             user.tier,
-    tierName:         tier.name,
+    tierName:         tierConfig.name,
     credits:          user.credits,
     purchasedCredits: user.purchasedCredits,
     totalCredits:     getTotalCredits(user),
-    maxTickers:       tier.maxTickers,
-    cacheMinutes:     tier.cacheMinutes,
+    maxTickers:       tierConfig.maxTickers,
+    cacheMinutes:     tierConfig.cacheMinutes,
     features:         {
-      pulse:    tier.pulse,
-      tracker:  tier.tracker,
-      glossary: tier.glossary,
-      alpaca:   tier.alpaca,
-      earnings: tier.earnings,
+      pulse:    tierConfig.pulse,
+      tracker:  tierConfig.tracker,
+      glossary: tierConfig.glossary,
+      alpaca:   tierConfig.alpaca,
+      earnings: tierConfig.earnings,
     },
     lastReset: user.lastReset,
   };

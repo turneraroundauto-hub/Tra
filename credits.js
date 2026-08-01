@@ -2,37 +2,31 @@
 // ═══════════════════════════════════════════════════════════════════
 // CREDIT SYSTEM — Trade Verdict
 // ═══════════════════════════════════════════════════════════════════
-// Replaces the previous daily-drip design (free tier topped back up to
-// exactly 1 credit/day once balance hit 0). That had two bugs: dbSave()
-// never actually persisted last_daily_drip, so the "once per day" gate
-// never stuck — the very next request after hitting 0 re-triggered the
-// drip back to 1, making free credits look like they never ran out —
-// and every anonymous visitor shared one row keyed by the literal
-// public secret, so it was never really "your" balance to begin with.
+// Storage: Supabase (the existing public.credits table + RPC functions
+// added on top of it, see supabase-ddl-patch5-credits.sql), with every
+// mutation going through an atomic Postgres function instead of app-level
+// read-then-write —
+// needed because "Analyze All" fires one /analyze call per watchlist
+// ticker concurrently, and a naive read/modify/write over the network
+// could let two concurrent deducts double-spend the same balance.
 //
-// Storage: Supabase (the public.credits table + RPC functions added on
-// top of it — see supabase-ddl-patch5-credits.sql in the
-// turneraroundauto-hub/trade-verdict repo, run against this same
-// Supabase project), with every mutation going through an atomic
-// Postgres function instead of app-level read-then-write — needed
-// because "Analyze All" fires one /analyze call per watchlist ticker
-// concurrently, and a naive read/modify/write over the network could
-// let two concurrent deducts double-spend the same balance.
+// Falls back to an in-memory + JSON-file store (the original
+// implementation) when server.js never calls setSupabase() with a real
+// client — e.g. local dev without SUPABASE_URL/SUPABASE_SERVICE_KEY set.
+// That fallback is NOT safe for production: Render's default web
+// service disk is ephemeral, so a file-backed store there silently
+// loses every balance on every deploy/restart. Configure Supabase.
 //
-// Falls back to an in-memory + JSON-file store when server.js never
-// calls setSupabase() with a real client — e.g. local dev without
-// SUPABASE_URL/SUPABASE_SERVICE_KEY set. That fallback is NOT safe for
-// production: Render's default web service disk is ephemeral, so a
-// file-backed store there silently loses every balance on every
-// deploy/restart. Configure Supabase.
-//
-// CREDIT ECONOMICS: 1 credit == 1 ticker analysis (one /analyze call).
-// server.js deducts exactly 1 credit per ticker, before the Anthropic
-// call, and never batches multiple tickers into one deduction — keep
-// it that way so "credits" stays legible as "analyses." The Anthropic
-// call is capped at max_tokens:800 on claude-sonnet-4-6, which keeps
-// real cost per analysis well under the $0.05/credit target; if the
-// model or max_tokens ever changes, re-check that math.
+// CREDIT ECONOMICS: 1 credit == 3 ticker analyses, across every tier.
+// server.js still deducts by ticker count (1 per /analyze call, before
+// the Anthropic call) — deductCredit/deduct_user_credit is what converts
+// analysis-count into credit-count, via a 0-2 pending_analyses counter
+// per user that only decrements a whole credit on the 3rd analysis since
+// the last one. This keeps the credit balance shown to users a true
+// whole number of fully-available 3-packs. The Anthropic call is capped
+// at max_tokens:800 on claude-sonnet-4-6 (~$0.02/analysis), so a full
+// credit now costs the business ~$0.06 — re-check that math if the
+// model, max_tokens, or the 3-per-credit ratio ever changes.
 // ═══════════════════════════════════════════════════════════════════
 
 const fs   = require("fs");
@@ -101,6 +95,12 @@ const TIERS = {
     price:         39.99,
   },
 };
+
+// 1 credit buys this many ticker analyses, across every tier. Must match
+// the literal `3` used in supabase-ddl-patch5-credits.sql's
+// deduct_user_credit — only the local fallback store reads this constant;
+// the Supabase path's math lives entirely in that SQL function.
+const ANALYSES_PER_CREDIT = 3;
 
 function currentMonthKey() {
   const now = new Date();
@@ -228,6 +228,7 @@ function getUserLocal(apiKey, tier) {
       tier:             initTier,
       credits:          TIERS[initTier].startingCredits ?? TIERS[initTier].monthlyCredits,
       purchasedCredits: 0,
+      pendingAnalyses:  0,
       lastReset:        currentMonthKey(),
       lastWeeklyReset:  currentWeekKey(),
       createdAt:        new Date().toISOString(),
@@ -268,21 +269,28 @@ function checkResetLocal(user) {
   else checkMonthlyResetLocal(user);
 }
 
+// 1 credit = 3 ticker analyses. `count` is ticker-analyses just run
+// (always 1 in practice), not a credit amount — the balance check below
+// is deliberately "< 1 whole credit", not "< count", since a request
+// only needs *a* credit to draw down, not a full credit's worth of
+// remaining analyses. Mirrors deduct_user_credit in
+// supabase-ddl-patch5-credits.sql; keep the two in sync.
 function deductCreditLocal(apiKey, count, tier) {
   const user = getUserLocal(apiKey, tier);
   checkResetLocal(user);
 
-  const total = getTotalCredits(user);
-  if (total < count) return false;
+  if (getTotalCredits(user) < 1) return false;
 
-  let remaining = count;
-  if (user.purchasedCredits >= remaining) {
-    user.purchasedCredits -= remaining;
-  } else {
-    remaining -= user.purchasedCredits;
-    user.purchasedCredits = 0;
-    user.credits -= remaining;
+  let pending = (user.pendingAnalyses || 0) + count;
+  const wholeToSpend = Math.floor(pending / ANALYSES_PER_CREDIT);
+  pending = pending % ANALYSES_PER_CREDIT;
+
+  for (let i = 0; i < wholeToSpend; i++) {
+    if (user.purchasedCredits > 0) user.purchasedCredits -= 1;
+    else if (user.credits > 0) user.credits -= 1;
+    else break; // guarded against by the balance check above; defensive only
   }
+  user.pendingAnalyses = pending;
 
   saveCreditsLocal();
   return true;

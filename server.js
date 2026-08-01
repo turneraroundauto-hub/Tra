@@ -683,11 +683,34 @@ No bullets. No labels. Plain sentences only. Return only the text.
 
 
 // ─── ALPACA OHLCV ─────────────────────────────────────────────────
-async function fetchOpeningBar(symbol) {
-  const key    = process.env.ALPACA_KEY;
+// Shared low-level client for any Alpaca Market Data API call, any tier.
+// Gate 1/5's daily-close fetching (below, all tiers) and fetchOpeningBar's
+// intraday bars (Shark + non-Shark blind-sequence bar-1) both go through
+// this. Future Shark-exclusive "deep analytics" (extended/granular bars,
+// options/greeks — scope still TBD) should build on this same client when
+// it's scoped, gated behind tierConfig.alpaca like the rest of Shark's
+// Alpaca usage already is, in its own section — not folded in here.
+function alpacaKeys() {
+  const key = process.env.ALPACA_KEY;
   const secret = process.env.ALPACA_SECRET;
-  if (!key || !secret) return null;
+  return key && secret ? { key, secret } : null;
+}
 
+async function alpacaGet(path) {
+  const creds = alpacaKeys();
+  if (!creds) throw new Error("No ALPACA_KEY/ALPACA_SECRET");
+  const res = await fetch(`https://data.alpaca.markets${path}`, {
+    headers: {
+      "APCA-API-KEY-ID":     creds.key,
+      "APCA-API-SECRET-KEY": creds.secret,
+    },
+  });
+  if (!res.ok) throw new Error(`Alpaca ${res.status}: ${path}`);
+  return res.json();
+}
+
+async function fetchOpeningBar(symbol) {
+  if (!alpacaKeys()) return null;
   try {
     // Get today's date in ET
     const now = new Date();
@@ -695,15 +718,7 @@ async function fetchOpeningBar(symbol) {
     const today = et.toISOString().split("T")[0];
 
     // Fetch 15-min bars for today — first bar is the opening bar
-    const url = `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=15Min&start=${today}T09:30:00-04:00&limit=5&feed=iex`;
-    const res = await fetch(url, {
-      headers: {
-        "APCA-API-KEY-ID":     key,
-        "APCA-API-SECRET-KEY": secret,
-      }
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await alpacaGet(`/v2/stocks/${symbol}/bars?timeframe=15Min&start=${today}T09:30:00-04:00&limit=5&feed=iex`);
     const bars = data.bars || [];
     if (!bars.length) return null;
 
@@ -814,21 +829,32 @@ async function fetchTickerMetrics(symbol) {
 }
 
 // ─── DAILY CLOSES (shared) ──────────────────────────────────────────
-// Ascending [oldest...newest] daily-close series from Finnhub. Reused by
+// Ascending [oldest...newest] daily-close series from Alpaca. Reused by
 // Gate 1 (needs >=61 session bars) and Gate 5's Dynamic Proxy correlation
 // math (Patch 2, gates-extended.js) — 130 calendar days comfortably covers
 // both. Do NOT date-anchor into this array; index positionally (sessions).
+//
+// Sourced from Alpaca, not Finnhub — Finnhub's /stock/candle returns 403
+// on the current API key; historical candles are gated behind their paid
+// tiers (confirmed via Render logs + finnhubio/Finnhub-API#546, a known,
+// persistent restriction, not transient). Finnhub could be reinstated as
+// an alternate source later if that plan is ever upgraded, but there's no
+// reason to keep a dead fallback path for a 403 that isn't going away on
+// its own. adjustment=split avoids a stock split reading as a fake crash
+// in Gate 1's % change math.
 async function fetchDailyCloses(symbol, lookbackDays = 130) {
+  if (!alpacaKeys()) return null;
   try {
-    const nowSec = Math.floor(Date.now() / 1000);
-    const fromSec = nowSec - lookbackDays * 24 * 60 * 60;
-    const candles = await finnhubGet(
-      `/stock/candle?symbol=${symbol}&resolution=D&from=${fromSec}&to=${nowSec}`
+    const end   = new Date();
+    const start = new Date(end.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
+    const startStr = start.toISOString().split("T")[0];
+    const endStr   = end.toISOString().split("T")[0];
+    const data = await alpacaGet(
+      `/v2/stocks/${symbol}/bars?timeframe=1Day&start=${startStr}&end=${endStr}&limit=${lookbackDays + 10}&feed=iex&adjustment=split`
     );
-    if (!candles || candles.s !== "ok" || !candles.c || candles.c.length < 2) {
-      return null;
-    }
-    return candles.c;
+    const bars = data.bars || [];
+    if (bars.length < 2) return null;
+    return bars.map(b => b.c);
   } catch (e) {
     console.error(`fetchDailyCloses ${symbol}:`, e.message);
     return null;
@@ -1840,6 +1866,7 @@ app.listen(PORT, async () => {
   console.log(`Trade Verdict API v4.0.0 on port ${PORT}`);
   console.log(`Anthropic: ${!!process.env.ANTHROPIC_API_KEY}`);
   console.log(`Finnhub:   ${!!process.env.FINNHUB_KEY}`);
+  console.log(`Alpaca:    ${!!(process.env.ALPACA_KEY && process.env.ALPACA_SECRET)}`);
   console.log(`Secured:   ${!!process.env.APP_SECRET}`);
   console.log(`Market open: ${isMarketOpen()}`);
   console.log(`Free key:    ${!!process.env.FREE_KEY}`);

@@ -1,258 +1,364 @@
+
 // ═══════════════════════════════════════════════════════════════════
-// CREDIT SYSTEM — Trade Verdict (Supabase backend)
+// CREDIT SYSTEM — Trade Verdict
+// ═══════════════════════════════════════════════════════════════════
+// Replaces the previous daily-drip design (free tier topped back up to
+// exactly 1 credit/day once balance hit 0). That had two bugs: dbSave()
+// never actually persisted last_daily_drip, so the "once per day" gate
+// never stuck — the very next request after hitting 0 re-triggered the
+// drip back to 1, making free credits look like they never ran out —
+// and every anonymous visitor shared one row keyed by the literal
+// public secret, so it was never really "your" balance to begin with.
+//
+// Storage: Supabase (the public.credits table + RPC functions added on
+// top of it — see supabase-ddl-patch5-credits.sql in the
+// turneraroundauto-hub/trade-verdict repo, run against this same
+// Supabase project), with every mutation going through an atomic
+// Postgres function instead of app-level read-then-write — needed
+// because "Analyze All" fires one /analyze call per watchlist ticker
+// concurrently, and a naive read/modify/write over the network could
+// let two concurrent deducts double-spend the same balance.
+//
+// Falls back to an in-memory + JSON-file store when server.js never
+// calls setSupabase() with a real client — e.g. local dev without
+// SUPABASE_URL/SUPABASE_SERVICE_KEY set. That fallback is NOT safe for
+// production: Render's default web service disk is ephemeral, so a
+// file-backed store there silently loses every balance on every
+// deploy/restart. Configure Supabase.
+//
+// CREDIT ECONOMICS: 1 credit == 1 ticker analysis (one /analyze call).
+// server.js deducts exactly 1 credit per ticker, before the Anthropic
+// call, and never batches multiple tickers into one deduction — keep
+// it that way so "credits" stays legible as "analyses." The Anthropic
+// call is capped at max_tokens:800 on claude-sonnet-4-6, which keeps
+// real cost per analysis well under the $0.05/credit target; if the
+// model or max_tokens ever changes, re-check that math.
 // ═══════════════════════════════════════════════════════════════════
 
+const fs   = require("fs");
+const path = require("path");
+
+const CREDIT_FILE = path.join(__dirname, "credits.json");
+
+let supabaseClient = null;
+function setSupabase(client) {
+  supabaseClient = client;
+}
+
 // ── TIER DEFINITIONS ──────────────────────────────────────────────
+// Mirrored in supabase-ddl-patch5-credits.sql's RPC functions — if you
+// change credits/rollover amounts here, update the SQL too.
 const TIERS = {
   free: {
-    name:           "Free",
-    monthlyCredits: 0,
-    maxTickers:     3,
-    cacheMinutes:   15,
-    pulse:          false,
-    tracker:        false,
-    glossary:       true,
-    alpaca:         false,
-    earnings:       false,
-    maxRollover:    45,
-    startingCredits:3,
+    name:          "Free",
+    monthlyCredits: 0,          // free tier does NOT get a monthly allowance
+    maxTickers:    3,
+    cacheMinutes:  15,
+    pulse:         false,
+    tracker:       false,
+    glossary:      true,
+    alpaca:        false,
+    earnings:      false,
+    startingCredits: 3,         // hard cap: 3 credits, reset weekly (see checkWeeklyReset)
   },
   starter: {
-    name:           "Starter",
+    name:          "Starter",
     monthlyCredits: 45,
-    maxTickers:     7,
-    cacheMinutes:   5,
-    pulse:          true,
-    tracker:        false,
-    glossary:       true,
-    alpaca:         false,
-    earnings:       false,
-    maxRollover:    45,
-    price:          9.99,
+    maxTickers:    7,
+    cacheMinutes:  5,
+    pulse:         true,
+    tracker:       false,
+    glossary:      true,
+    alpaca:        false,
+    earnings:      false,
+    maxRollover:   45,
+    price:         9.99,
   },
   pro: {
-    name:           "Pro",
+    name:          "Pro",
     monthlyCredits: 100,
-    maxTickers:     999,
-    cacheMinutes:   1,
-    pulse:          true,
-    tracker:        true,
-    glossary:       true,
-    alpaca:         false,
-    earnings:       false,
-    maxRollover:    45,
-    price:          16.99,
+    maxTickers:    999,
+    cacheMinutes:  1,
+    pulse:         true,
+    tracker:       true,
+    glossary:      true,
+    alpaca:        false,
+    earnings:      false,
+    maxRollover:   45,
+    price:         16.99,
   },
   shark: {
-    name:           "Shark",
+    name:          "Shark",
     monthlyCredits: 145,
-    maxTickers:     999,
-    cacheMinutes:   1,
-    pulse:          true,
-    tracker:        true,
-    glossary:       true,
-    alpaca:         true,
-    earnings:       true,
-    maxRollover:    45,
-    price:          39.99,
+    maxTickers:    999,
+    cacheMinutes:  1,
+    pulse:         true,
+    tracker:       true,
+    glossary:      true,
+    alpaca:        true,
+    earnings:      true,
+    maxRollover:   45,
+    price:         39.99,
   },
 };
 
-// ── SUPABASE CLIENT (injected from server.js) ─────────────────────
-let _supabase = null;
-function setSupabase(client) { _supabase = client; }
-
-// ── SUPABASE TABLE: credits ───────────────────────────────────────
-// Columns: api_key (text, primary key), tier (text), credits (int),
-//          purchased_credits (int), last_reset (text), created_at (text)
-
-async function dbGet(apiKey) {
-  if (!_supabase) return null;
-  try {
-    const { data, error } = await _supabase
-      .from("credits")
-      .select("*")
-      .eq("api_key", apiKey)
-      .single();
-    if (error) return null;
-    return data;
-  } catch(e) { return null; }
-}
-
-async function dbSave(apiKey, record) {
-  if (!_supabase) return;
-  try {
-    await _supabase.from("credits").upsert({
-      api_key:           apiKey,
-      tier:              record.tier,
-      credits:           record.credits,
-      purchased_credits: record.purchasedCredits,
-      last_reset:        record.lastReset,
-      created_at:        record.createdAt || new Date().toISOString(),
-      updated_at:        new Date().toISOString(),
-    }, { onConflict: "api_key" });
-  } catch(e) {
-    console.error("Credit DB save failed:", e.message);
-  }
-}
-
-// ── HELPERS ───────────────────────────────────────────────────────
 function currentMonthKey() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}`;
 }
 
-function currentDayKey() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+// Fixed 7-day buckets since the Unix epoch — simple, timezone-free, and
+// deterministic (no ISO-week edge cases to get wrong). Must match the
+// `floor(extract(epoch from now()) / 604800)` expression used in the SQL.
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+function currentWeekKey() {
+  return Math.floor(Date.now() / WEEK_MS);
 }
 
-function dbRowToRecord(row) {
+function getTotalCredits(user) {
+  return (user.credits || 0) + (user.purchasedCredits || 0);
+}
+
+function statusFromUser(user) {
+  const tierConfig = TIERS[user.tier] || TIERS.free;
   return {
-    tier:             row.tier,
-    credits:          row.credits,
-    purchasedCredits: row.purchased_credits,
-    lastReset:        row.last_reset,
-    lastDailyDrip:    row.last_daily_drip || null,
-    createdAt:        row.created_at,
-  };
-}
-
-// ── MONTHLY / DAILY RESET ─────────────────────────────────────────
-async function checkResets(apiKey, record) {
-  const thisMonth = currentMonthKey();
-  const today     = currentDayKey();
-  let changed     = false;
-
-  // Free tier: 1 credit daily drip
-  if (record.tier === "free") {
-    if (record.lastDailyDrip !== today && record.credits < 1) {
-      record.credits      = 1;
-      record.lastDailyDrip = today;
-      changed = true;
-      console.log(`Free daily drip: 1 credit → ${apiKey}`);
-    }
-    if (changed) await dbSave(apiKey, record);
-    return;
-  }
-
-  // Paid tiers: monthly reset
-  if (record.lastReset !== thisMonth) {
-    const tierConfig    = TIERS[record.tier] || TIERS.free;
-    const unused        = Math.max(0, record.credits);
-    const rollover      = Math.min(unused, 45);
-    record.credits      = rollover + tierConfig.monthlyCredits;
-    record.lastReset    = thisMonth;
-    changed = true;
-    console.log(`Monthly reset ${record.tier}: ${rollover} rolled + ${tierConfig.monthlyCredits} new = ${record.credits}`);
-  }
-
-  if (changed) await dbSave(apiKey, record);
-}
-
-// ── PUBLIC API ────────────────────────────────────────────────────
-async function getUser(apiKey, tier) {
-  tier = tier || "free";
-  let row = await dbGet(apiKey);
-
-  if (!row) {
-    // New user
-    const tierConfig   = TIERS[tier] || TIERS.free;
-    const startCredits = tierConfig.monthlyCredits || tierConfig.startingCredits || 0;
-    const record = {
-      tier,
-      credits:          startCredits,
-      purchasedCredits: 0,
-      lastReset:        currentMonthKey(),
-      createdAt:        new Date().toISOString(),
-    };
-    await dbSave(apiKey, record);
-    console.log(`New ${tier} user: ${startCredits} credits → ${apiKey}`);
-    return record;
-  }
-
-  const record = dbRowToRecord(row);
-
-  // Auto-correct tier if key changed
-  if (record.tier !== tier) {
-    const tierConfig = TIERS[tier] || TIERS.free;
-    record.tier = tier;
-    if (record.credits < (tierConfig.monthlyCredits || 0)) {
-      record.credits = tierConfig.monthlyCredits;
-    }
-    await dbSave(apiKey, record);
-    console.log(`Tier corrected → ${tier} for ${apiKey}`);
-  }
-
-  return record;
-}
-
-function getTotalCredits(record) {
-  return (record.credits || 0) + (record.purchasedCredits || 0);
-}
-
-async function getUserStatus(apiKey, tier) {
-  const record = await getUser(apiKey, tier);
-  await checkResets(apiKey, record);
-  const tierConfig = TIERS[record.tier] || TIERS.free;
-  return {
-    tier:             record.tier,
+    tier:             user.tier,
     tierName:         tierConfig.name,
-    credits:          record.credits,
-    purchasedCredits: record.purchasedCredits,
-    totalCredits:     getTotalCredits(record),
+    credits:          user.credits,
+    purchasedCredits: user.purchasedCredits,
+    totalCredits:     getTotalCredits(user),
     maxTickers:       tierConfig.maxTickers,
     cacheMinutes:     tierConfig.cacheMinutes,
-    features: {
+    features:         {
       pulse:    tierConfig.pulse,
       tracker:  tierConfig.tracker,
       glossary: tierConfig.glossary,
       alpaca:   tierConfig.alpaca,
       earnings: tierConfig.earnings,
     },
-    lastReset: record.lastReset,
+    lastReset:       user.lastReset,
+    lastWeeklyReset: user.lastWeeklyReset,
   };
 }
 
-async function deductCredit(apiKey, count, tier) {
-  const record = await getUser(apiKey, tier);
-  await checkResets(apiKey, record);
-  const total = getTotalCredits(record);
-  if (total < count) return false;
+// ═══════════════════════════════════════════════════════════════════
+// SUPABASE-BACKED STORE (primary — used whenever setSupabase() has
+// been called with a real client)
+// ═══════════════════════════════════════════════════════════════════
 
-  // Deduct purchased first (never expire), then regular
-  let remaining = count;
-  if (record.purchasedCredits >= remaining) {
-    record.purchasedCredits -= remaining;
-  } else {
-    remaining -= record.purchasedCredits;
-    record.purchasedCredits = 0;
-    record.credits -= remaining;
-  }
-  await dbSave(apiKey, record);
+function rowToUser(row) {
+  return {
+    tier:             row.tier,
+    credits:          row.credits,
+    purchasedCredits: row.purchased_credits,
+    lastReset:        row.last_reset,
+    lastWeeklyReset:  row.last_weekly_reset,
+  };
+}
+
+async function rpc(fn, args) {
+  const { data, error } = await supabaseClient.rpc(fn, args);
+  if (error) throw new Error(`credits.${fn} failed: ${error.message}`);
+  return Array.isArray(data) ? data[0] : data;
+}
+
+async function getUserSupabase(apiKey, tier) {
+  const row = await rpc("get_or_create_user_credits", { p_key: apiKey, p_tier: tier || null });
+  return rowToUser(row);
+}
+
+async function deductCreditSupabase(apiKey, count, tier) {
+  const row = await rpc("deduct_user_credit", { p_key: apiKey, p_tier: tier || null, p_count: count });
+  return !!row.success;
+}
+
+async function addPurchasedCreditsSupabase(apiKey, count, tier) {
+  const row = await rpc("add_purchased_credits", { p_key: apiKey, p_tier: tier || null, p_count: count });
+  return getTotalCredits(rowToUser(row));
+}
+
+async function upgradeTierSupabase(apiKey, newTier) {
+  if (!TIERS[newTier]) return false;
+  await rpc("upgrade_user_tier", { p_key: apiKey, p_new_tier: newTier });
   return true;
 }
 
-async function addPurchasedCredits(apiKey, count) {
-  const record = await getUser(apiKey);
-  record.purchasedCredits = (record.purchasedCredits || 0) + count;
-  await dbSave(apiKey, record);
-  return getTotalCredits(record);
+async function setTierSupabase(apiKey, tier) {
+  if (!TIERS[tier]) return false;
+  await rpc("set_user_tier", { p_key: apiKey, p_new_tier: tier });
+  return true;
+}
+
+async function getUserStatusSupabase(apiKey, tier) {
+  const user = await getUserSupabase(apiKey, tier);
+  return statusFromUser(user);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LOCAL FALLBACK STORE (in-memory + JSON file — dev/no-Supabase only,
+// NOT durable on Render's ephemeral disk, see header)
+// ═══════════════════════════════════════════════════════════════════
+
+let creditStore = {};
+
+function loadCreditsLocal() {
+  try {
+    if (fs.existsSync(CREDIT_FILE)) {
+      creditStore = JSON.parse(fs.readFileSync(CREDIT_FILE, "utf8"));
+      console.log(`Local credit store loaded: ${Object.keys(creditStore).length} users`);
+    }
+  } catch(e) {
+    console.error("Local credit store load failed:", e.message);
+    creditStore = {};
+  }
+}
+
+function saveCreditsLocal() {
+  try {
+    fs.writeFileSync(CREDIT_FILE, JSON.stringify(creditStore, null, 2));
+  } catch(e) {
+    console.error("Local credit store save failed:", e.message);
+  }
+}
+
+function getUserLocal(apiKey, tier) {
+  const initTier = (tier && TIERS[tier]) ? tier : "free";
+  if (!creditStore[apiKey]) {
+    creditStore[apiKey] = {
+      tier:             initTier,
+      credits:          TIERS[initTier].startingCredits ?? TIERS[initTier].monthlyCredits,
+      purchasedCredits: 0,
+      lastReset:        currentMonthKey(),
+      lastWeeklyReset:  currentWeekKey(),
+      createdAt:        new Date().toISOString(),
+    };
+    saveCreditsLocal();
+  }
+  const user = creditStore[apiKey];
+  if (tier && TIERS[tier] && user.tier !== tier) {
+    user.tier = tier;
+  }
+  return user;
+}
+
+function checkMonthlyResetLocal(user) {
+  const thisMonth = currentMonthKey();
+  if (user.lastReset === thisMonth) return;
+
+  const tier = TIERS[user.tier] || TIERS.free;
+  const unusedCredits = Math.max(0, user.credits);
+  const rollover      = Math.min(unusedCredits, tier.maxRollover ?? 45);
+
+  user.credits   = rollover + tier.monthlyCredits;
+  user.lastReset = thisMonth;
+  saveCreditsLocal();
+}
+
+function checkWeeklyResetLocal(user) {
+  const thisWeek = currentWeekKey();
+  if (user.lastWeeklyReset === thisWeek) return;
+
+  user.credits         = TIERS.free.startingCredits;
+  user.lastWeeklyReset = thisWeek;
+  saveCreditsLocal();
+}
+
+function checkResetLocal(user) {
+  if (user.tier === "free") checkWeeklyResetLocal(user);
+  else checkMonthlyResetLocal(user);
+}
+
+function deductCreditLocal(apiKey, count, tier) {
+  const user = getUserLocal(apiKey, tier);
+  checkResetLocal(user);
+
+  const total = getTotalCredits(user);
+  if (total < count) return false;
+
+  let remaining = count;
+  if (user.purchasedCredits >= remaining) {
+    user.purchasedCredits -= remaining;
+  } else {
+    remaining -= user.purchasedCredits;
+    user.purchasedCredits = 0;
+    user.credits -= remaining;
+  }
+
+  saveCreditsLocal();
+  return true;
+}
+
+function addPurchasedCreditsLocal(apiKey, count, tier) {
+  const user = getUserLocal(apiKey, tier);
+  user.purchasedCredits = (user.purchasedCredits || 0) + count;
+  saveCreditsLocal();
+  return getTotalCredits(user);
+}
+
+function upgradeTierLocal(apiKey, newTier) {
+  if (!TIERS[newTier]) return false;
+  const user = getUserLocal(apiKey, newTier);
+  user.tier  = newTier;
+  const tier = TIERS[newTier];
+  user.credits   = Math.min(user.credits, tier.maxRollover ?? 45) + tier.monthlyCredits;
+  user.lastReset = currentMonthKey();
+  saveCreditsLocal();
+  return true;
+}
+
+function setTierLocal(apiKey, tier) {
+  if (!TIERS[tier]) return false;
+  const user = getUserLocal(apiKey, tier);
+  user.tier  = tier;
+  saveCreditsLocal();
+  return true;
+}
+
+function getUserStatusLocal(apiKey, tier) {
+  const user = getUserLocal(apiKey, tier);
+  checkResetLocal(user);
+  return statusFromUser(user);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PUBLIC API — dispatches to Supabase when configured, else local
+// fallback. All async so callers (server.js) can treat both the same.
+// ═══════════════════════════════════════════════════════════════════
+
+function loadCredits() {
+  // No-op with Supabase backend — only the local fallback needs a
+  // boot-time load from disk.
+  if (!supabaseClient) loadCreditsLocal();
+}
+
+async function getUser(apiKey, tier) {
+  return supabaseClient ? getUserSupabase(apiKey, tier) : getUserLocal(apiKey, tier);
+}
+
+async function getUserStatus(apiKey, tier) {
+  return supabaseClient ? getUserStatusSupabase(apiKey, tier) : getUserStatusLocal(apiKey, tier);
+}
+
+async function deductCredit(apiKey, count = 1, tier) {
+  return supabaseClient ? deductCreditSupabase(apiKey, count, tier) : deductCreditLocal(apiKey, count, tier);
+}
+
+async function addPurchasedCredits(apiKey, count, tier) {
+  return supabaseClient ? addPurchasedCreditsSupabase(apiKey, count, tier) : addPurchasedCreditsLocal(apiKey, count, tier);
 }
 
 async function upgradeTier(apiKey, newTier) {
-  if (!TIERS[newTier]) return false;
-  const record     = await getUser(apiKey);
-  const tierConfig = TIERS[newTier];
-  record.tier      = newTier;
-  record.credits   = Math.min(record.credits, 45) + tierConfig.monthlyCredits;
-  record.lastReset = currentMonthKey();
-  await dbSave(apiKey, record);
-  return true;
+  return supabaseClient ? upgradeTierSupabase(apiKey, newTier) : upgradeTierLocal(apiKey, newTier);
 }
 
-// Legacy sync stubs (no-ops — everything is now async)
-function loadCredits() { console.log("Credits: using Supabase backend"); }
+// Tier-only sync, no credit change — used on subscription cancellation
+// (downgrade to free, credits preserved). Replaces the old pattern of
+// calling getUser() and mutating .tier directly, which only worked
+// because the local store held plain objects by reference; that doesn't
+// exist over a Supabase RPC, so it needs its own explicit write.
+async function setTier(apiKey, tier) {
+  return supabaseClient ? setTierSupabase(apiKey, tier) : setTierLocal(apiKey, tier);
+}
 
 module.exports = {
   TIERS,
@@ -263,5 +369,6 @@ module.exports = {
   deductCredit,
   addPurchasedCredits,
   upgradeTier,
+  setTier,
   getTotalCredits,
 };

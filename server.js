@@ -98,6 +98,17 @@ async function validateSupabaseToken(token) {
 }
 const app     = express();
 
+// Render sits behind a proxy — trust its X-Forwarded-For so req.ip is the
+// visitor's real address, not Render's internal hop. Needed for anonymous
+// free-tier credit tracking (see getClientIp below).
+app.set("trust proxy", true);
+
+function getClientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (fwd) return fwd.split(",")[0].trim();
+  return req.ip || req.connection?.remoteAddress || "unknown";
+}
+
 app.use(cors());
 
 // IMPORTANT: Stripe webhook needs raw body — must be mounted BEFORE express.json()
@@ -157,7 +168,12 @@ app.use(async (req, res, next) => {
     }
     if (!matchedTier) return res.status(401).json({ error: "Invalid API key" });
     req.userTier   = matchedTier;
-    req.userKey    = provided;
+    // Free tier ships one public secret to every visitor, so the secret
+    // itself can't be the credit key (every anonymous visitor would share
+    // one pool). Key anonymous free-tier users by IP instead — each IP
+    // gets its own 3-credits/week allowance (see credits.js checkWeeklyReset).
+    // Paid tiers reaching this legacy path keep the shared-secret key.
+    req.userKey    = matchedTier === "free" ? `ip:${getClientIp(req)}` : provided;
     req.tierConfig = credits.TIERS[matchedTier];
     return next();
   }
@@ -1120,7 +1136,7 @@ app.get("/status", async (req, res) => {
 app.post("/credits/add", async (req, res) => {
   const { count } = req.body;
   if (!count || count <= 0) return res.status(400).json({ error: "Invalid count" });
-  const newTotal = await credits.addPurchasedCredits(req.userKey, count);
+  const newTotal = await credits.addPurchasedCredits(req.userKey, count, req.userTier);
   res.json({ success: true, totalCredits: newTotal });
 });
 
@@ -1808,11 +1824,13 @@ app.post("/stripe/webhook", async (req, res) => {
       break;
 
     case "customer.subscription.deleted":
-      // Downgrade to free on cancellation — credits remain
+      // Downgrade to free on cancellation — credits remain. Key must
+      // match the sub:<email> convention used everywhere else (auth
+      // middleware, upgradeTier, purchases) — this used to build a
+      // different, never-read key here, so the cancellation never
+      // actually reached the record real requests use.
       if (email && tierInfo) {
-        const userKey = tierInfo.key + ":" + email;
-        const user    = credits.getUser(userKey);
-        user.tier     = "free";
+        await credits.setTier(`sub:${email}`, "free");
         await upsertSubscriber(email, "free", null, null);
         console.log(`Stripe: ${email} cancelled — downgraded to free, credits preserved`);
       }
@@ -1852,8 +1870,14 @@ app.post("/stripe/credits", async (req, res) => {
     const email    = event.data.object.metadata?.email;
     const quantity = parseInt(event.data.object.metadata?.credits || "10");
     if (email) {
-      credits.addPurchasedCredits(req.userKey, quantity);
+      // /stripe/credits is exempted from the auth middleware (it's a
+      // server-to-server Stripe webhook, not a logged-in app request), so
+      // req.userKey is never set here — it must be undefined. Key off the
+      // buyer's email instead, same convention as the subscriber webhook.
+      credits.addPurchasedCredits(`sub:${email}`, quantity);
       console.log(`Credits: added ${quantity} purchased credits for ${email}`);
+    } else {
+      console.error("Credits: payment_intent.succeeded with no email in metadata — cannot attribute purchase");
     }
   }
   res.json({ received: true });

@@ -53,6 +53,7 @@ const TIERS = {
     glossary:      true,
     alpaca:        false,
     earnings:      false,
+    iv:            false,
     startingCredits: 3,         // hard cap: 3 credits, reset weekly (see checkWeeklyReset)
   },
   starter: {
@@ -65,9 +66,14 @@ const TIERS = {
     glossary:      true,
     alpaca:        false,
     earnings:      false,
+    iv:            false,
     maxRollover:   45,
     price:         9.99,
   },
+  // iv is intentionally separate from `alpaca` — alpaca gates Shark's Gate 3
+  // SWING_LEVEL mode and future deep-analytics surface (see alpacaKeys()'s
+  // comment in server.js); Pro getting implied-volatility data for its CSV
+  // export doesn't mean Pro should also pick up Shark's other Alpaca usage.
   pro: {
     name:          "Pro",
     monthlyCredits: 100,
@@ -78,6 +84,7 @@ const TIERS = {
     glossary:      true,
     alpaca:        false,
     earnings:      false,
+    iv:            true,
     maxRollover:   45,
     price:         16.99,
   },
@@ -91,6 +98,7 @@ const TIERS = {
     glossary:      true,
     alpaca:        true,
     earnings:      true,
+    iv:            true,
     maxRollover:   45,
     price:         39.99,
   },
@@ -135,6 +143,7 @@ function statusFromUser(user) {
       glossary: tierConfig.glossary,
       alpaca:   tierConfig.alpaca,
       earnings: tierConfig.earnings,
+      iv:       tierConfig.iv,
     },
     lastReset:       user.lastReset,
     lastWeeklyReset: user.lastWeeklyReset,

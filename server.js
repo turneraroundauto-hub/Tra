@@ -43,25 +43,6 @@ async function fetchWithTimeout(url, opts = {}, ms = 8000) {
 async function getSubscriber(email) {
   if (!supabase || !email) return null;
   try {
-    console.log(`[SUB LOOKUP] Searching for: "${email}" (length ${email.length})`);
-
-    // First: get ALL subscribers to see what's actually in the table
-    const { data: allSubs, error: allErr } = await supabase
-      .from("subscribers")
-      .select("id, email, tier, status");
-
-    if (allErr) {
-      console.error(`[SUB LOOKUP] Error fetching all subscribers:`, allErr.message);
-    } else {
-      console.log(`[SUB LOOKUP] Total rows in subscribers table: ${allSubs?.length || 0}`);
-      if (allSubs && allSubs.length > 0) {
-        allSubs.forEach(s => {
-          console.log(`[SUB LOOKUP]   Row: id=${s.id} email="${s.email}" (len ${s.email?.length}) tier=${s.tier} status=${s.status}`);
-        });
-      }
-    }
-
-    // Now do the actual query
     const { data, error } = await supabase
       .from("subscribers")
       .select("*")
@@ -112,6 +93,40 @@ async function validateSupabaseToken(token) {
     return data.user;
   } catch(e) { return null; }
 }
+
+// validateSupabaseToken() (a Supabase Auth network call) + getSubscriber()
+// (a DB query) together cost two Supabase round trips on EVERY
+// authenticated request. A single page load can fire dozens of concurrent
+// requests carrying the identical token (e.g. the batched ticker-data
+// hydration across a large watchlist) -- without this, each one separately
+// re-validates the same token and re-looks-up the same subscriber, which
+// multiplies real Supabase latency by the request count for no benefit
+// (the same user isn't changing tier mid-burst). Short TTL keeps a real
+// tier change (upgrade/downgrade/cancellation) from staying stale for more
+// than a minute.
+const authCache = new Map(); // token -> { data: {user, tier}, time }
+const AUTH_CACHE_MS = 60 * 1000;
+
+async function resolveAuth(token) {
+  const cached = authCache.get(token);
+  if (cached && Date.now() - cached.time < AUTH_CACHE_MS) return cached.data;
+
+  const user = await validateSupabaseToken(token);
+  if (!user) { authCache.delete(token); return null; }
+
+  const sub = await getSubscriber(user.email);
+  const subStatus = sub ? (sub.status || "").trim().toLowerCase() : "none";
+  const tier = (sub && subStatus === "active") ? sub.tier : "free";
+  console.log(`Auth: ${user.email} → subscriber ${sub ? "found" : "MISSING"} (status: ${subStatus}) → tier: ${tier}`);
+
+  const data = { user, tier };
+  authCache.set(token, { data, time: Date.now() });
+  if (authCache.size > 500) {
+    const oldest = [...authCache.entries()].sort((a, b) => a[1].time - b[1].time).slice(0, 100);
+    oldest.forEach(([k]) => authCache.delete(k));
+  }
+  return data;
+}
 const app     = express();
 
 // Render sits behind a proxy — trust its X-Forwarded-For so req.ip is the
@@ -160,19 +175,13 @@ app.use(async (req, res, next) => {
 
   // ── PATH 1: Supabase token (authenticated users) ──────────────
   if (authToken) {
-    const user = await validateSupabaseToken(authToken);
-    if (!user) return res.status(401).json({ error: "Invalid session token" });
+    const resolved = await resolveAuth(authToken);
+    if (!resolved) return res.status(401).json({ error: "Invalid session token" });
 
-    // Look up subscriber record
-    const sub = await getSubscriber(user.email);
-    const subStatus = sub ? (sub.status || "").trim().toLowerCase() : "none";
-    const tier = (sub && subStatus === "active") ? sub.tier : "free";
-    console.log(`Auth: ${user.email} → subscriber ${sub ? "found" : "MISSING"} (status: ${subStatus}) → tier: ${tier}`);
-
-    req.userEmail  = user.email;
-    req.userTier   = tier;
-    req.userKey    = `sub:${user.email}`;  // stable key — email not JWT
-    req.tierConfig = credits.TIERS[tier];
+    req.userEmail  = resolved.user.email;
+    req.userTier   = resolved.tier;
+    req.userKey    = `sub:${resolved.user.email}`;  // stable key — email not JWT
+    req.tierConfig = credits.TIERS[resolved.tier];
     return next();
   }
 

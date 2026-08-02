@@ -1225,11 +1225,16 @@ app.post("/watchlist", async (req, res) => {
     .slice(0, 1000);
   if (!supabase) return res.json({ success: true, stored: false });
   try {
-    await supabase.from("watchlists").upsert({
+    // supabase-js doesn't throw on a DB-level error (e.g. the watchlists
+    // table not existing yet because the migration hasn't been run) — it
+    // resolves with { error } instead, so this has to be checked explicitly
+    // or a failed write would silently report success:true.
+    const { error } = await supabase.from("watchlists").upsert({
       email:      req.userEmail,
       tickers:    clean,
       updated_at: new Date().toISOString(),
     }, { onConflict: "email" });
+    if (error) { console.error("POST /watchlist:", error.message); return res.status(500).json({ error: error.message, stored: false }); }
     res.json({ success: true, stored: true, count: clean.length });
   } catch(e) {
     console.error("POST /watchlist:", e.message);

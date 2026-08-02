@@ -24,6 +24,22 @@ const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
 // Pass supabase client to credit system
 credits.setSupabase(supabase);
 
+// Wraps fetch with an AbortController-based timeout so a slow/hanging
+// upstream (SEC, Finnhub, Alpaca, Anthropic) fails fast with a clear error
+// instead of leaving a request hanging indefinitely. Every call site below
+// already has its own try/catch fallback (or, for the two /analyze paths,
+// a 500 response) — this just gives those fallbacks a bounded time to kick
+// in instead of one slow provider stalling an entire ticker load.
+async function fetchWithTimeout(url, opts = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getSubscriber(email) {
   if (!supabase || !email) return null;
   try {
@@ -336,9 +352,9 @@ async function getCik(symbol) {
   const now = Date.now();
   if (!tickerCikCache || now - tickerCikCacheAt > 24 * 60 * 60 * 1000) {
     try {
-      const res = await fetch("https://www.sec.gov/files/company_tickers.json", {
+      const res = await fetchWithTimeout("https://www.sec.gov/files/company_tickers.json", {
         headers: { "User-Agent": SEC_USER_AGENT },
-      });
+      }, 8000);
       if (!res.ok) throw new Error(`SEC company_tickers ${res.status}`);
       const data = await res.json();
       const map = {};
@@ -363,7 +379,7 @@ async function searchEdgarFilings(cik, keywords) {
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
     `&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
   try {
-    const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
+    const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
     if (!res.ok) throw new Error(`EDGAR full-text search ${res.status}`);
     const data = await res.json();
     return data?.hits?.hits || [];
@@ -715,12 +731,12 @@ function alpacaKeys() {
 async function alpacaGet(path) {
   const creds = alpacaKeys();
   if (!creds) throw new Error("No ALPACA_KEY/ALPACA_SECRET");
-  const res = await fetch(`https://data.alpaca.markets${path}`, {
+  const res = await fetchWithTimeout(`https://data.alpaca.markets${path}`, {
     headers: {
       "APCA-API-KEY-ID":     creds.key,
       "APCA-API-SECRET-KEY": creds.secret,
     },
-  });
+  }, 8000);
   if (!res.ok) throw new Error(`Alpaca ${res.status}: ${path}`);
   return res.json();
 }
@@ -819,8 +835,8 @@ async function finnhubGet(path) {
   const key = FH_KEY();
   if (!key) throw new Error("No FINNHUB_KEY");
   const sep = path.includes("?") ? "&" : "?";
-  const res = await fetch(`https://finnhub.io/api/v1${path}${sep}token=${key}`,
-    { headers: { "User-Agent": "TradeVerdict/4.0" } });
+  const res = await fetchWithTimeout(`https://finnhub.io/api/v1${path}${sep}token=${key}`,
+    { headers: { "User-Agent": "TradeVerdict/4.0" } }, 8000);
   if (!res.ok) throw new Error(`Finnhub ${res.status}: ${path}`);
   return res.json();
 }
@@ -1158,7 +1174,7 @@ Broad: SPY ${marketData.spy?.change||"?"}, IWM ${marketData.iwm?.change||"?"}
 Write exactly 2 sentences: sector rotation summary for a swing trader.
 `;
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1171,7 +1187,7 @@ Write exactly 2 sentences: sector rotation summary for a swing trader.
         system: PULSE_PROMPT,
         messages: [{ role: "user", content: msg }],
       }),
-    });
+    }, 20000);
     if (!res.ok) throw new Error(`Anthropic ${res.status}`);
     const data = await res.json();
     return data.content?.[0]?.text?.trim() || null;
@@ -1394,8 +1410,20 @@ app.get("/market", async (req, res) => {
 // weekend page load — this splits them so each refetches only when its own
 // underlying reality can actually have changed.
 const newsCache        = new Map(); // symbol -> { data, time }
-const symbolMarketCache = new Map(); // symbol -> { data: {metrics,openingBar,dailyCloses,preGate,proxyRule}, time }
-const NEWS_REFRESH_MS  = 30 * 60 * 1000;
+const symbolMarketCache = new Map(); // symbol -> { data: {metrics,openingBar,dailyCloses,proxyRule}, time }
+// Pre-Gate (SEC filings) is a THIRD clock, slower than either of the above:
+// 10-Q/10-K/8-K filings don't change minute to minute like price does, but
+// it was riding the same short market-data TTL, so Pro tier was re-hitting
+// SEC's full-text search endpoint roughly every minute per ticker during
+// market hours. SEC's endpoint is slower and far more aggressively
+// rate-limited than Finnhub/Alpaca, so a burst of many tickers loading at
+// once (a big watchlist's first load, or Analyze All) could trip its
+// throttling -- almost certainly the real source of the reported ~40s loads
+// and per-ticker timeouts. Its own 24h cache fixes both: far fewer SEC
+// calls overall, and none of them bunched into the same price-driven burst.
+const preGateCache      = new Map(); // symbol -> { data, time }
+const NEWS_REFRESH_MS     = 30 * 60 * 1000;
+const PRE_GATE_REFRESH_MS = 24 * 60 * 60 * 1000;
 
 // News window: 8am-8pm ET, every day of the week (including weekends) —
 // unlike price/trend data, a headline can land any day, so this window is
@@ -1439,7 +1467,18 @@ app.get("/ticker/:symbol", async (req, res) => {
     }
     const news = newsEntry.data;
 
-    // ── MARKET DATA — metrics/opening bar/gate1/pre-gate/proxy rule.
+    // ── PRE-GATE — own 24h cache, fully decoupled from the price clock
+    // below (see the comment on preGateCache above). A symbol with no cache
+    // entry yet always fetches once regardless of age (bootstrap).
+    let preGateEntry = preGateCache.get(symbol);
+    if (!preGateEntry || Date.now() - preGateEntry.time >= PRE_GATE_REFRESH_MS) {
+      const preGate = await evaluatePreGate(symbol);
+      preGateEntry = { data: preGate, time: Date.now() };
+      preGateCache.set(symbol, preGateEntry);
+    }
+    const preGate = preGateEntry.data;
+
+    // ── MARKET DATA — metrics/opening bar/gate1/proxy rule.
     // Shared across every tier requesting this symbol (the underlying data
     // isn't tier-specific), but judged stale against the REQUESTING tier's
     // own cacheMinutes, so a Pro request (1 min) still forces a refresh a
@@ -1453,27 +1492,27 @@ app.get("/ticker/:symbol", async (req, res) => {
     const marketStale = !marketEntry ||
       (isMarketDataWindow() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
     if (marketStale) {
-      const [metricsRes, barRes, gate1Res, preGateRes] = await Promise.allSettled([
+      const [metricsRes, barRes, gate1Res] = await Promise.allSettled([
         fetchTickerMetrics(symbol),
         fetchOpeningBar(symbol),
         fetchGate1Metrics(symbol),
-        evaluatePreGate(symbol),
       ]);
       const metrics     = metricsRes.status === "fulfilled" ? metricsRes.value : null;
       const openingBar  = barRes.status     === "fulfilled" ? barRes.value     : null;
       const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
-      const preGate      = preGateRes.status === "fulfilled" ? preGateRes.value : { status: "GREEN", hardTrigger: false, note: "Pre-Gate check failed — treating as pass-through." };
 
       // Gate 5 — static classification, falling through to the Dynamic Proxy
       // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
       // A Pre-Gate hard trigger forces an off-cycle recompute (Step 6) even if
-      // a cached resolution is still within its quarterly window.
+      // a cached resolution is still within its quarterly window. Uses
+      // whatever preGate was just resolved above (fresh or from its own 24h
+      // cache) — Pre-Gate's own clock doesn't need to line up with this one.
       const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, preGate.hardTrigger);
 
-      marketEntry = { data: { metrics, openingBar, dailyCloses, preGate, proxyRule }, time: Date.now() };
+      marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule }, time: Date.now() };
       symbolMarketCache.set(symbol, marketEntry);
     }
-    const { metrics, openingBar, dailyCloses, preGate, proxyRule } = marketEntry.data;
+    const { metrics, openingBar, dailyCloses, proxyRule } = marketEntry.data;
 
     // Server-enforced Gate 1 — pure/cheap derivation from dailyCloses, so it's
     // recomputed on every request (cache hit or not) rather than stored,
@@ -1662,7 +1701,7 @@ Return only JSON.
 `;
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1675,7 +1714,7 @@ Return only JSON.
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
       }),
-    });
+    }, 25000);
 
     if (!response.ok) {
       const errText = await response.text();

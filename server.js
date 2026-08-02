@@ -840,12 +840,50 @@ async function fetchImpliedVolatility(symbol, price) {
 // ─── FINNHUB HELPERS ──────────────────────────────────────────────
 const FH_KEY = () => process.env.FINNHUB_KEY;
 
-async function finnhubGet(path) {
+// Finnhub's free tier allows 60 calls/minute. fetchTickerMetrics() alone
+// fires 3 Finnhub calls per ticker with no throttling anywhere upstream —
+// a cold market-data cache (a fresh deploy, or any ticker's first request
+// of the day) means every one of those calls actually hits Finnhub instead
+// of being served from symbolMarketCache. A single Pro watchlist's worth of
+// tickers loading at once blows past 60/min in seconds: every call in that
+// burst gets a 429, and since nothing retried, the entire first load after
+// a deploy showed "No quote" everywhere instead of just being slow. This
+// queues every Finnhub call through one shared rolling-window limiter so
+// the burst gets spaced out instead of rejected outright, backed by a
+// retry-with-backoff for any 429 that still slips through (e.g. a call
+// already in flight when the window rolled over).
+const FINNHUB_MAX_PER_MIN = 55;
+const finnhubCallTimes = [];
+let finnhubQueue = Promise.resolve();
+
+function finnhubThrottle() {
+  const turn = finnhubQueue.then(async () => {
+    for (;;) {
+      const now = Date.now();
+      while (finnhubCallTimes.length && now - finnhubCallTimes[0] > 60000) finnhubCallTimes.shift();
+      if (finnhubCallTimes.length < FINNHUB_MAX_PER_MIN) {
+        finnhubCallTimes.push(now);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 60000 - (now - finnhubCallTimes[0]) + 50));
+    }
+  });
+  finnhubQueue = turn.catch(() => {}); // one slow/failed turn must not wedge the queue for everyone behind it
+  return turn;
+}
+
+async function finnhubGet(path, attempt = 0) {
   const key = FH_KEY();
   if (!key) throw new Error("No FINNHUB_KEY");
+  await finnhubThrottle();
   const sep = path.includes("?") ? "&" : "?";
   const res = await fetchWithTimeout(`https://finnhub.io/api/v1${path}${sep}token=${key}`,
     { headers: { "User-Agent": "TradeVerdict/4.0" } }, 8000);
+  if (res.status === 429 && attempt < 2) {
+    const retryAfterMs = Number(res.headers.get("retry-after")) * 1000 || 2000 * (attempt + 1);
+    await new Promise(r => setTimeout(r, retryAfterMs));
+    return finnhubGet(path, attempt + 1);
+  }
   if (!res.ok) throw new Error(`Finnhub ${res.status}: ${path}`);
   return res.json();
 }

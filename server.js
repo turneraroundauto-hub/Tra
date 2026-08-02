@@ -1204,10 +1204,12 @@ app.get("/watchlist", async (req, res) => {
   if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
   if (!supabase) return res.json({ tickers: [] });
   try {
+    // Normalized the same way as the write path below — see the comment
+    // there for why this has to match exactly.
     const { data, error } = await supabase
       .from("watchlists")
       .select("tickers")
-      .eq("email", req.userEmail)
+      .eq("email", req.userEmail.trim().toLowerCase())
       .maybeSingle();
     if (error) { console.error("GET /watchlist:", error.message); return res.json({ tickers: [] }); }
     res.json({ tickers: (data && data.tickers) || [] });
@@ -1216,7 +1218,7 @@ app.get("/watchlist", async (req, res) => {
 
 app.post("/watchlist", async (req, res) => {
   if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
-  const { tickers } = req.body;
+  const { tickers, seed } = req.body;
   if (!Array.isArray(tickers)) return res.status(400).json({ error: "tickers must be an array" });
   // Storage-abuse guard, not a tier-enforcement point — tiers already cap
   // client-side per their own maxTickers before this is ever called.
@@ -1224,16 +1226,32 @@ app.post("/watchlist", async (req, res) => {
     .filter(t => typeof t === "string" && /^[A-Z]{1,6}$/.test(t))
     .slice(0, 1000);
   if (!supabase) return res.json({ success: true, stored: false });
+  // Normalize consistently with the GET lookup above so a case difference
+  // between how Supabase Auth issued this session's email and how it was
+  // stored on an earlier write can never make the two sides miss each other.
+  const emailKey = req.userEmail.trim().toLowerCase();
   try {
     // supabase-js doesn't throw on a DB-level error (e.g. the watchlists
     // table not existing yet because the migration hasn't been run) — it
     // resolves with { error } instead, so this has to be checked explicitly
     // or a failed write would silently report success:true.
+    //
+    // `seed` marks the client's "nothing came back from GET, so push what's
+    // local (tier defaults or pre-login state) instead of starting empty"
+    // call (see shared/watchlist-sync.js). A GET miss there is ambiguous —
+    // it can mean a genuinely new account, but it can just as easily mean a
+    // transient read failure or a race against a write that's still in
+    // flight, and the client can't tell those apart. `ignoreDuplicates`
+    // turns this into an ON CONFLICT DO NOTHING: it seeds a truly-new row
+    // but can never clobber a row that already exists, so a false-negative
+    // GET can no longer destroy real saved data. A normal (non-seed) save —
+    // the user actually adding/removing/reordering — still overwrites, same
+    // as always.
     const { error } = await supabase.from("watchlists").upsert({
-      email:      req.userEmail,
+      email:      emailKey,
       tickers:    clean,
       updated_at: new Date().toISOString(),
-    }, { onConflict: "email" });
+    }, seed ? { onConflict: "email", ignoreDuplicates: true } : { onConflict: "email" });
     if (error) { console.error("POST /watchlist:", error.message); return res.status(500).json({ error: error.message, stored: false }); }
     res.json({ success: true, stored: true, count: clean.length });
   } catch(e) {

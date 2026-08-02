@@ -1384,36 +1384,89 @@ app.get("/market", async (req, res) => {
   }
 });
 
+// ─── TICKER DATA CACHES ─────────────────────────────────────────────
+// Two independent caches with two independent refresh rules, because news
+// and market data go stale on completely different clocks: a headline can
+// drop at 6pm on a Saturday, but a stock's price/opening-bar/trend data
+// cannot move at all while the market's closed. Sharing one cache/TTL
+// between them meant either serving stale news for 15+ minutes during the
+// day, or re-fetching identical Friday-close market data on every single
+// weekend page load — this splits them so each refetches only when its own
+// underlying reality can actually have changed.
+const newsCache        = new Map(); // symbol -> { data, time }
+const symbolMarketCache = new Map(); // symbol -> { data: {metrics,openingBar,dailyCloses,preGate,proxyRule}, time }
+const NEWS_REFRESH_MS  = 30 * 60 * 1000;
+
+// News window: 8am-8pm ET, every day of the week (including weekends) —
+// unlike price/trend data, a headline can land any day, so this window is
+// deliberately NOT gated on isMarketOpen()/weekday like market data below.
+function isNewsWindow() {
+  const et   = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const mins = et.getHours() * 60 + et.getMinutes();
+  return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
+}
+
 // ─── TICKER DATA ──────────────────────────────────────────────────
 app.get("/ticker/:symbol", async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   try {
-    const [metricsRes, newsRes, barRes, gate1Res, preGateRes] = await Promise.allSettled([
-      fetchTickerMetrics(symbol),
-      fetchNews(symbol),
-      fetchOpeningBar(symbol),
-      fetchGate1Metrics(symbol),
-      evaluatePreGate(symbol),
-    ]);
-    const metrics      = metricsRes.status === "fulfilled" ? metricsRes.value : null;
-    const news         = newsRes.status    === "fulfilled" ? newsRes.value    : null;
-    const openingBar   = barRes.status     === "fulfilled" ? barRes.value     : null;
-    const dailyCloses  = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
-    const preGate       = preGateRes.status === "fulfilled" ? preGateRes.value : { status: "GREEN", hardTrigger: false, note: "Pre-Gate check failed — treating as pass-through." };
+    // ── NEWS — own 30-minute cadence, only while inside the 8am-8pm ET
+    // window; outside it (or on a weekend night) the last-fetched headline
+    // is served as-is rather than re-hit every load. A symbol with no cache
+    // entry yet always fetches once regardless of the window (bootstrap).
+    let newsEntry = newsCache.get(symbol);
+    if (!newsEntry || (isNewsWindow() && Date.now() - newsEntry.time >= NEWS_REFRESH_MS)) {
+      const news = await fetchNews(symbol).catch(() => null);
+      newsEntry = { data: news, time: Date.now() };
+      newsCache.set(symbol, newsEntry);
+    }
+    const news = newsEntry.data;
 
-    // Gate 5 — static classification, falling through to the Dynamic Proxy
-    // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
-    // A Pre-Gate hard trigger forces an off-cycle recompute (Step 6) even if
-    // a cached resolution is still within its quarterly window.
-    const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, preGate.hardTrigger);
+    // ── MARKET DATA — metrics/opening bar/gate1/pre-gate/proxy rule.
+    // Shared across every tier requesting this symbol (the underlying data
+    // isn't tier-specific), but judged stale against the REQUESTING tier's
+    // own cacheMinutes, so a Pro request (1 min) still forces a refresh a
+    // Free request (15 min) wouldn't have asked for — everyone just reads
+    // whatever the freshest fetch left behind. Refreshed only while the
+    // market's open: none of this can change overnight or over a weekend,
+    // so outside market hours the cached copy is served regardless of age.
+    const tierCacheMinutes = req.tierConfig?.cacheMinutes ?? 15;
+    let marketEntry = symbolMarketCache.get(symbol);
+    const marketStale = !marketEntry ||
+      (isMarketOpen() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
+    if (marketStale) {
+      const [metricsRes, barRes, gate1Res, preGateRes] = await Promise.allSettled([
+        fetchTickerMetrics(symbol),
+        fetchOpeningBar(symbol),
+        fetchGate1Metrics(symbol),
+        evaluatePreGate(symbol),
+      ]);
+      const metrics     = metricsRes.status === "fulfilled" ? metricsRes.value : null;
+      const openingBar  = barRes.status     === "fulfilled" ? barRes.value     : null;
+      const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
+      const preGate      = preGateRes.status === "fulfilled" ? preGateRes.value : { status: "GREEN", hardTrigger: false, note: "Pre-Gate check failed — treating as pass-through." };
 
-    // Server-enforced Gate 1 — computed once here, passed through untouched by /analyze
+      // Gate 5 — static classification, falling through to the Dynamic Proxy
+      // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
+      // A Pre-Gate hard trigger forces an off-cycle recompute (Step 6) even if
+      // a cached resolution is still within its quarterly window.
+      const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, preGate.hardTrigger);
+
+      marketEntry = { data: { metrics, openingBar, dailyCloses, preGate, proxyRule }, time: Date.now() };
+      symbolMarketCache.set(symbol, marketEntry);
+    }
+    const { metrics, openingBar, dailyCloses, preGate, proxyRule } = marketEntry.data;
+
+    // Server-enforced Gate 1 — pure/cheap derivation from dailyCloses, so it's
+    // recomputed on every request (cache hit or not) rather than stored,
+    // same result either way, passed through untouched by /analyze.
     const gate1 = evaluateGate1(dailyCloses);
 
     // IV — Pro + Shark only (tierConfig.iv), needs metrics.price to pick a
-    // representative contract so it can't run in the Promise.allSettled
-    // batch above; the extra sequential await only happens for the two
-    // tiers that use it, everyone else pays nothing for this.
+    // representative contract. Deliberately left outside both caches above:
+    // it's a narrow, already tier-gated feature, and its own upstream
+    // (Alpaca options snapshots) is a separate cost/staleness profile that
+    // doesn't need to ride on the same invalidation rule as the rest.
     const iv = req.tierConfig?.iv ? await fetchImpliedVolatility(symbol, metrics?.price) : null;
 
     res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, timestamp: new Date().toISOString() });

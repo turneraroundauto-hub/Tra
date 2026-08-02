@@ -1399,9 +1399,26 @@ const NEWS_REFRESH_MS  = 30 * 60 * 1000;
 
 // News window: 8am-8pm ET, every day of the week (including weekends) —
 // unlike price/trend data, a headline can land any day, so this window is
-// deliberately NOT gated on isMarketOpen()/weekday like market data below.
+// deliberately NOT gated on weekday like market data below.
 function isNewsWindow() {
   const et   = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const mins = et.getHours() * 60 + et.getMinutes();
+  return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
+}
+
+// Market-data refresh window: same 8am-8pm ET clock as news, Monday through
+// Sunday, EXCEPT Saturday. That covers pre-market/after-hours prospecting
+// on every weekday (not just the 9:30-4 regular session isMarketOpen() would
+// allow) plus Sunday evening, when futures reopen and next-week positioning
+// starts — but skips Saturday entirely, where nothing about a ticker's price
+// data can realistically move. Outside this window the cached copy is served
+// regardless of age. This is deliberately a different, wider check than
+// isMarketOpen() (which still gates the actual Gate 0 SPY/QQQ trading logic
+// elsewhere in this file) — this one only governs cache-refresh eligibility.
+function isMarketDataWindow() {
+  const et  = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const day = et.getDay(); // 0=Sun, 6=Sat
+  if (day === 6) return false;
   const mins = et.getHours() * 60 + et.getMinutes();
   return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
 }
@@ -1427,13 +1444,14 @@ app.get("/ticker/:symbol", async (req, res) => {
     // isn't tier-specific), but judged stale against the REQUESTING tier's
     // own cacheMinutes, so a Pro request (1 min) still forces a refresh a
     // Free request (15 min) wouldn't have asked for — everyone just reads
-    // whatever the freshest fetch left behind. Refreshed only while the
-    // market's open: none of this can change overnight or over a weekend,
-    // so outside market hours the cached copy is served regardless of age.
+    // whatever the freshest fetch left behind. Refreshed only inside
+    // isMarketDataWindow() (weekdays + Sunday evening, 8am-8pm ET) — outside
+    // that (Saturday, or any night before 8am/after 8pm) the cached copy is
+    // served regardless of age, since nothing about it can have changed.
     const tierCacheMinutes = req.tierConfig?.cacheMinutes ?? 15;
     let marketEntry = symbolMarketCache.get(symbol);
     const marketStale = !marketEntry ||
-      (isMarketOpen() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
+      (isMarketDataWindow() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
     if (marketStale) {
       const [metricsRes, barRes, gate1Res, preGateRes] = await Promise.allSettled([
         fetchTickerMetrics(symbol),

@@ -907,33 +907,38 @@ async function fetchQuote(symbol) {
   }
 }
 
-async function fetchCompanyProfile(symbol) {
-  try {
-    return await finnhubGet(`/stock/profile2?symbol=${symbol}`);
-  } catch(e) { return null; }
-}
+// 52-week high/low, beta, market cap, IPO date, and 20-day-avg volume don't
+// move intraday — they're daily-cadence facts at best (52W range/avgVol) or
+// effectively static (market cap, IPO date). Before this split they still
+// rode the same fetch as live price/quote, which respects each tier's
+// cacheMinutes (as tight as 1 minute for Pro) — so a Pro watchlist re-hit
+// Finnhub for these on every single refresh, all day, for numbers that
+// hadn't actually changed since yesterday. That's most of the per-ticker
+// Finnhub call volume that trips the rate limiter above on a cold cache.
+// Splitting them onto their own 24h cache, decoupled from the price clock,
+// cuts recurring Finnhub calls from 3/ticker down to 1/ticker after the
+// first fetch of the day — same pattern Pre-Gate got in Session Log Part 5.
+const FUNDAMENTALS_REFRESH_MS = 24 * 60 * 60 * 1000;
+const symbolFundamentalsCache = new Map(); // symbol -> { data, time }
 
-async function fetchTickerMetrics(symbol) {
+async function fetchTickerFundamentals(symbol) {
   try {
-    const [quote, metric, profile] = await Promise.allSettled([
-      finnhubGet(`/quote?symbol=${symbol}`),
+    const [metric, profile] = await Promise.allSettled([
       finnhubGet(`/stock/metric?symbol=${symbol}&metric=all`),
-      fetchCompanyProfile(symbol),
+      finnhubGet(`/stock/profile2?symbol=${symbol}`),
     ]);
-    const q = quote.status  === "fulfilled" ? quote.value  : null;
-    const m = metric.status === "fulfilled" ? metric.value : null;
-    const p = profile.status=== "fulfilled" ? profile.value: null;
+    // Both calls run raw here (not through a try/catch-to-null wrapper) so a
+    // genuine Finnhub failure surfaces as "rejected" instead of looking
+    // identical to "fetched fine, Finnhub just has no data for this field" —
+    // the caller needs that distinction to decide whether to commit this
+    // result to the 24h cache or retry on the next request.
+    if (metric.status === "rejected" && profile.status === "rejected") return null;
+    const m = metric.status  === "fulfilled" ? metric.value  : null;
+    const p = profile.status === "fulfilled" ? profile.value : null;
 
-    if (!q?.c) throw new Error("No quote");
-    const price    = q.c;
-    const pct      = q.dp ?? null; // today's %change — Gate 5 Proxy Coherence Check (Patch 4) needs this
     const week52hi = m?.metric?.["52WeekHigh"] || null;
     const week52lo = m?.metric?.["52WeekLow"]  || null;
     const beta     = m?.metric?.beta            || null;
-    let rangePosition = null;
-    if (week52hi && week52lo && week52hi !== week52lo) {
-      rangePosition = Math.round((price - week52lo) / (week52hi - week52lo) * 100);
-    }
     // Fundamentals for Gate 5's Dynamic Proxy fallback loop (Patch 2).
     // marketCap: Finnhub reports profile2.marketCapitalization in millions USD.
     // yearsPublic: derived from profile2.ipo (IPO date string).
@@ -944,15 +949,46 @@ async function fetchTickerMetrics(symbol) {
     const yearsPublic = p?.ipo ? (Date.now() - new Date(p.ipo).getTime()) / (365.25 * 24 * 3600 * 1000) : null;
     const avgVol20d   = m?.metric?.["10DayAverageTradingVolume"]
       ? m.metric["10DayAverageTradingVolume"] * 1e6 : null;
+    return { week52hi, week52lo, beta, marketCap, yearsPublic, avgVol20d, sectorInfo: p };
+  } catch(e) {
+    console.error(`fetchTickerFundamentals ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+async function fetchTickerMetrics(symbol) {
+  try {
+    const q = await finnhubGet(`/quote?symbol=${symbol}`).catch(() => null);
+    if (!q?.c) throw new Error("No quote");
+    const price = q.c;
+    const pct   = q.dp ?? null; // today's %change — Gate 5 Proxy Coherence Check (Patch 4) needs this
+
+    let fundEntry = symbolFundamentalsCache.get(symbol);
+    if (!fundEntry || Date.now() - fundEntry.time >= FUNDAMENTALS_REFRESH_MS) {
+      const fresh = await fetchTickerFundamentals(symbol);
+      // Only commit a SUCCESSFUL fetch to the 24h cache — a transient
+      // Finnhub blip shouldn't blank out 52W/beta/market cap for an entire
+      // day. On failure, serve whatever's cached (even if stale) without
+      // bumping its timestamp, so the very next request tries again.
+      if (fresh) fundEntry = { data: fresh, time: Date.now() };
+      else if (!fundEntry) fundEntry = { data: {}, time: 0 };
+    }
+    const f = fundEntry.data;
+
+    let rangePosition = null;
+    if (f.week52hi && f.week52lo && f.week52hi !== f.week52lo) {
+      rangePosition = Math.round((price - f.week52lo) / (f.week52hi - f.week52lo) * 100);
+    }
+    symbolFundamentalsCache.set(symbol, fundEntry);
     return {
-      price, pct, week52hi, week52lo, beta,
+      price, pct, week52hi: f.week52hi ?? null, week52lo: f.week52lo ?? null, beta: f.beta ?? null,
       rangePosition,
       phaseProxy: rangePosition !== null
         ? rangePosition > 70 ? "PHASE_3"
         : rangePosition > 30 ? "PHASE_2" : "PHASE_1"
         : null,
-      sectorInfo: p,
-      marketCap, yearsPublic, avgVol20d,
+      sectorInfo: f.sectorInfo ?? null,
+      marketCap: f.marketCap ?? null, yearsPublic: f.yearsPublic ?? null, avgVol20d: f.avgVol20d ?? null,
     };
   } catch(e) {
     console.error(`fetchTickerMetrics ${symbol}:`, e.message);

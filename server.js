@@ -1185,6 +1185,58 @@ app.get("/status", async (req, res) => {
   res.json(status);
 });
 
+// ── WATCHLIST SYNC (any authenticated account, any tier) ───────────
+// Keyed by email so the SAME saved list follows a user through tier
+// changes. Deliberately gated on req.userEmail presence, not req.userTier —
+// a lapsed Starter/Pro/Shark subscriber still has req.userEmail (PATH 1
+// Supabase-token auth above; only their *resolved* tier falls to "free"),
+// so this is exactly how a lapsed user keeps their list instead of losing
+// it. Anonymous free-tier visitors (PATH 2, tier-key auth) never get
+// req.userEmail and 401 here — anonymous browsing stays localStorage-only,
+// there's no account to key cloud storage to.
+//
+// Stores the FULL list untruncated — tier caps are enforced client-side per
+// tier (shared/watchlist.js's maxTickers), same as everywhere else in this
+// app. A lapsed Starter user with 7 saved tickers gets all 7 back from here;
+// the free-tier frontend then displays only the first 3 (its own cap) but
+// doesn't destroy the other 4 — they reappear if the user resubscribes.
+app.get("/watchlist", async (req, res) => {
+  if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+  if (!supabase) return res.json({ tickers: [] });
+  try {
+    const { data, error } = await supabase
+      .from("watchlists")
+      .select("tickers")
+      .eq("email", req.userEmail)
+      .maybeSingle();
+    if (error) { console.error("GET /watchlist:", error.message); return res.json({ tickers: [] }); }
+    res.json({ tickers: (data && data.tickers) || [] });
+  } catch(e) { console.error("GET /watchlist:", e.message); res.json({ tickers: [] }); }
+});
+
+app.post("/watchlist", async (req, res) => {
+  if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+  const { tickers } = req.body;
+  if (!Array.isArray(tickers)) return res.status(400).json({ error: "tickers must be an array" });
+  // Storage-abuse guard, not a tier-enforcement point — tiers already cap
+  // client-side per their own maxTickers before this is ever called.
+  const clean = tickers
+    .filter(t => typeof t === "string" && /^[A-Z]{1,6}$/.test(t))
+    .slice(0, 1000);
+  if (!supabase) return res.json({ success: true, stored: false });
+  try {
+    await supabase.from("watchlists").upsert({
+      email:      req.userEmail,
+      tickers:    clean,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "email" });
+    res.json({ success: true, stored: true, count: clean.length });
+  } catch(e) {
+    console.error("POST /watchlist:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── ADD CREDITS (Stripe webhook or manual) ────────────────────────
 app.post("/credits/add", async (req, res) => {
   const { count } = req.body;

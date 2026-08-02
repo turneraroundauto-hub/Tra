@@ -1127,13 +1127,21 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute) {
   if (!forceRecompute) {
     const cached = await getCachedProxyResolution(symbol);
     if (cached) {
+      // Plain-English note, not raw cache internals — this reaches the UI
+      // verbatim via proxyRule.proxy.rationale, and a bare ISO timestamp +
+      // "r=0.928" correlation coefficient read as debug output to a user,
+      // not an explanation. Same info, described instead of dumped.
+      const checkedDate = new Date(cached.computed_at).toLocaleDateString("en-US",
+        { month: "short", day: "numeric", year: "numeric" });
+      const coherencePct = cached.correlation_r != null
+        ? `${Math.round(Number(cached.correlation_r) * 100)}% coherence` : null;
       return buildDynamicProxyRule({
         tier: cached.tier,
         proxy: cached.proxy_symbol,
         r: cached.correlation_r,
-        note: `Cached ${cached.tier} proxy resolution` +
-          (cached.correlation_r != null ? ` (r=${Number(cached.correlation_r).toFixed(3)})` : "") +
-          `, computed ${cached.computed_at}.`,
+        note: `Proxy match confirmed via price correlation` +
+          (coherencePct ? ` (${coherencePct})` : "") +
+          `. Last checked ${checkedDate}.`,
       });
     }
   }

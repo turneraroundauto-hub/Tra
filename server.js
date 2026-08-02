@@ -1319,7 +1319,9 @@ app.get("/watchlist", async (req, res) => {
       .eq("email", req.userEmail.trim().toLowerCase())
       .maybeSingle();
     if (error) { console.error("GET /watchlist:", error.message); return res.json({ tickers: [] }); }
-    res.json({ tickers: (data && data.tickers) || [] });
+    const tickers = (data && data.tickers) || [];
+    console.log(`GET /watchlist: ${req.userEmail.trim().toLowerCase()} -> row ${data ? "found" : "NOT FOUND"}, ${tickers.length} tickers`);
+    res.json({ tickers });
   } catch(e) { console.error("GET /watchlist:", e.message); res.json({ tickers: [] }); }
 });
 
@@ -1360,6 +1362,7 @@ app.post("/watchlist", async (req, res) => {
       updated_at: new Date().toISOString(),
     }, seed ? { onConflict: "email", ignoreDuplicates: true } : { onConflict: "email" });
     if (error) { console.error("POST /watchlist:", error.message); return res.status(500).json({ error: error.message, stored: false }); }
+    console.log(`POST /watchlist: ${emailKey} -> ${seed ? "SEED (ignoreDuplicates)" : "normal overwrite"}, ${clean.length} tickers`);
     res.json({ success: true, stored: true, count: clean.length });
   } catch(e) {
     console.error("POST /watchlist:", e.message);

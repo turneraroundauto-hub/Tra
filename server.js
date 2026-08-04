@@ -2002,10 +2002,10 @@ app.post("/auth/login", async (req, res) => {
 
     // Determine correct app URL for this tier
     const TIER_URLS = {
-      free:    "https://turneraroundauto-hub.github.io/trade-verdict/",
-      starter: "https://turneraroundauto-hub.github.io/trade-verdict/starter/",
-      pro:     "https://turneraroundauto-hub.github.io/trade-verdict/pro/",
-      shark:   "https://turneraroundauto-hub.github.io/trade-verdict/shark/",
+      free:    "https://tradetribunal.app/",
+      starter: "https://tradetribunal.app/starter/",
+      pro:     "https://tradetribunal.app/pro/",
+      shark:   "https://tradetribunal.app/shark/",
     };
     const redirectUrl = TIER_URLS[tier] || TIER_URLS.free;
 
@@ -2052,7 +2052,7 @@ app.post("/auth/reset", async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email required" });
   try {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: "https://turneraroundauto-hub.github.io/trade-verdict/reset",
+      redirectTo: "https://tradetribunal.app/reset",
     });
     if (error) return res.status(400).json({ error: error.message });
     res.json({ message: "Reset link sent" });

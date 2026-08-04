@@ -33,6 +33,12 @@ create index if not exists accuracy_log_email_idx on public.accuracy_log (email)
 -- server-only access via the service_role key.
 alter table public.accuracy_log disable row level security;
 
+-- "RLS disabled" alone is NOT sufficient on this project — confirmed same
+-- day that anon/authenticated ended up with full SELECT/INSERT/UPDATE/
+-- DELETE on this exact table despite RLS being off (their default grants,
+-- never explicitly revoked). This revoke is what actually closes it.
+revoke all on public.accuracy_log from anon, authenticated;
+
 -- Must be added to Data API -> Exposed tables in the Supabase dashboard
 -- (same Apr 2026 breaking change documented in the Build Log for every
 -- other table here — new tables are opt-in unless "Automatically expose

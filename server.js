@@ -1590,21 +1590,63 @@ function isNewsWindow() {
   return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
 }
 
-// Market-data refresh window: same 8am-8pm ET clock as news, Monday through
-// Sunday, EXCEPT Saturday. That covers pre-market/after-hours prospecting
-// on every weekday (not just the 9:30-4 regular session isMarketOpen() would
-// allow) plus Sunday evening, when futures reopen and next-week positioning
-// starts — but skips Saturday entirely, where nothing about a ticker's price
-// data can realistically move. Outside this window the cached copy is served
+// Market-data refresh window: 9:30am-8pm ET, Monday through Sunday, EXCEPT
+// Saturday. That covers after-hours prospecting on every weekday plus Sunday
+// evening, when futures reopen and next-week positioning starts — but skips
+// Saturday entirely, where nothing about a ticker's price data can
+// realistically move. Outside this window the cached copy is served
 // regardless of age. This is deliberately a different, wider check than
 // isMarketOpen() (which still gates the actual Gate 0 SPY/QQQ trading logic
 // elsewhere in this file) — this one only governs cache-refresh eligibility.
+//
+// Starts at 9:30am, NOT 8:00am (Aug 4, 2026 fix): this used to open at 8am
+// to also cover pre-market, but neither of this app's price sources can
+// actually deliver live pre-market data on their current plans — Finnhub's
+// free/basic /quote endpoint doesn't reflect pre-market trades in its `c`
+// field (holds the last regular-session price until 9:30 rolls around), and
+// Alpaca's free tier only has the IEX feed, which has no pre-market data of
+// its own since IEX itself doesn't trade before 9:30. Opening this window
+// at 8am meant the app looked like it was serving live pre-market prices
+// (marketStale correctly triggered a refresh) while actually just re-fetching
+// and re-caching the same stale last-close value over and over, which is
+// worse than honestly holding it — confirmed live (CIFR showing $24.16
+// pre-market against a real $21.80). Revisit if either provider's plan is
+// upgraded to one with genuine extended-hours coverage (Alpaca SIP feed, or
+// equivalent).
 function isMarketDataWindow() {
   const et  = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const day = et.getDay(); // 0=Sun, 6=Sat
   if (day === 6) return false;
   const mins = et.getHours() * 60 + et.getMinutes();
-  return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
+  return mins >= 570 && mins < 1200; // 9:30am–8:00pm ET
+}
+
+// Fetches and stores a fresh symbolMarketCache entry for one ticker —
+// metrics/opening bar/gate1 daily closes/Gate 5 proxy resolution. Factored
+// out of /ticker/:symbol's own staleness check so the market-open warm pass
+// below (marketOpenWarm()) can refresh every already-tracked symbol through
+// the exact same path, instead of a second copy that could drift from it.
+// hardTrigger comes from the caller's own Pre-Gate lookup (its own 24h
+// cache, doesn't need to line up with this function's clock) — defaults to
+// false for callers (like the warm pass) that don't have it handy, same as
+// a symbol with no Pre-Gate history yet would resolve to.
+async function refreshMarketEntry(symbol, hardTrigger = false) {
+  const [metricsRes, barRes, gate1Res] = await Promise.allSettled([
+    fetchTickerMetrics(symbol),
+    fetchOpeningBar(symbol),
+    fetchGate1Metrics(symbol),
+  ]);
+  const metrics     = metricsRes.status === "fulfilled" ? metricsRes.value : null;
+  const openingBar  = barRes.status     === "fulfilled" ? barRes.value     : null;
+  const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
+
+  // Gate 5 — static classification, falling through to the Dynamic Proxy
+  // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
+  const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, hardTrigger);
+
+  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule }, time: Date.now() };
+  symbolMarketCache.set(symbol, marketEntry);
+  return marketEntry;
 }
 
 // ─── TICKER DATA ──────────────────────────────────────────────────
@@ -1640,34 +1682,15 @@ app.get("/ticker/:symbol", async (req, res) => {
     // own cacheMinutes, so a Pro request (1 min) still forces a refresh a
     // Free request (15 min) wouldn't have asked for — everyone just reads
     // whatever the freshest fetch left behind. Refreshed only inside
-    // isMarketDataWindow() (weekdays + Sunday evening, 8am-8pm ET) — outside
-    // that (Saturday, or any night before 8am/after 8pm) the cached copy is
-    // served regardless of age, since nothing about it can have changed.
+    // isMarketDataWindow() (weekdays + Sunday evening, 9:30am-8pm ET) —
+    // outside that the cached copy is served regardless of age, since
+    // nothing about it can have changed (or, pre-9:30am, can't be reliably
+    // fetched live at all — see that function's comment).
     const tierCacheMinutes = req.tierConfig?.cacheMinutes ?? 15;
     let marketEntry = symbolMarketCache.get(symbol);
     const marketStale = !marketEntry ||
       (isMarketDataWindow() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
-    if (marketStale) {
-      const [metricsRes, barRes, gate1Res] = await Promise.allSettled([
-        fetchTickerMetrics(symbol),
-        fetchOpeningBar(symbol),
-        fetchGate1Metrics(symbol),
-      ]);
-      const metrics     = metricsRes.status === "fulfilled" ? metricsRes.value : null;
-      const openingBar  = barRes.status     === "fulfilled" ? barRes.value     : null;
-      const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
-
-      // Gate 5 — static classification, falling through to the Dynamic Proxy
-      // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
-      // A Pre-Gate hard trigger forces an off-cycle recompute (Step 6) even if
-      // a cached resolution is still within its quarterly window. Uses
-      // whatever preGate was just resolved above (fresh or from its own 24h
-      // cache) — Pre-Gate's own clock doesn't need to line up with this one.
-      const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, preGate.hardTrigger);
-
-      marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule }, time: Date.now() };
-      symbolMarketCache.set(symbol, marketEntry);
-    }
+    if (marketStale) marketEntry = await refreshMarketEntry(symbol, preGate.hardTrigger);
     const { metrics, openingBar, dailyCloses, proxyRule } = marketEntry.data;
 
     // Server-enforced Gate 1 — pure/cheap derivation from dailyCloses, so it's
@@ -2283,6 +2306,94 @@ app.post("/stripe/credits", async (req, res) => {
   res.json({ received: true });
 });
 
+// Refreshes marketCache (the fixed SPY/QQQ/BTC/etc. tracked-symbol list
+// backing Gate 0 and the /market overview) via fetchQuote. Factored out so
+// both the boot-time warm and the market-open warm pass below use the same
+// logic instead of two copies drifting apart. Deliberately separate from
+// /market's own handler (which computes gateStatus/gateNote with slightly
+// more granular branching) rather than unifying the two — that's a
+// pre-existing, unrelated duplication not worth touching here.
+async function warmTrackedMarketCache() {
+  const tickers = [
+    { symbol: "SPY",             key: "spy"  },
+    { symbol: "QQQ",             key: "qqq"  },
+    { symbol: "BINANCE:BTCUSDT", key: "btc"  },
+    { symbol: "IWM",             key: "iwm"  },
+    { symbol: "SOXX",            key: "soxx" },
+    { symbol: "XBI",             key: "xbi"  },
+    { symbol: "GLD",             key: "gld"  },
+    { symbol: "USO",             key: "uso"  },
+    { symbol: "IBB",             key: "ibb"  },
+    { symbol: "NVDA",            key: "nvda" },
+    { symbol: "TSM",             key: "tsm"  },
+    { symbol: "MSFT",            key: "msft" },
+  ];
+  const results = await Promise.allSettled(tickers.map(t => fetchQuote(t.symbol)));
+  const data = {};
+  results.forEach((r, i) => {
+    data[tickers[i].key] = r.status === "fulfilled" && r.value
+      ? r.value : { price:"?", change:"?", direction:"flat", pct:0 };
+  });
+  const spyPct = data.spy?.pct || 0;
+  const qqqPct = data.qqq?.pct || 0;
+  const btcPct = data.btc?.pct || 0;
+  const tsmPct = data.tsm?.pct || 0;
+  let gateStatus = "GREEN", gateNote = "SPY and QQQ flat or green — proceed";
+  const gateStrong = spyPct >= 0.5 && qqqPct >= 0.5;
+  if (gateStrong) gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both up >0.5%, strong tailwind`;
+  if (spyPct <= -1 || qqqPct <= -1) { gateStatus = "RED"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, stand down`; }
+  else if (spyPct <= -0.5 || qqqPct <= -0.5) { gateStatus = "YELLOW"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — down >0.5%, cut size 50%`; }
+  let btcSignal = "neutral";
+  if (btcPct >= 2) btcSignal = "full conviction";
+  else if (btcPct <= -5) btcSignal = "stand down";
+  else if (btcPct <= -2) btcSignal = "reduce size";
+  const tsmWarning = tsmPct <= -3 ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, stand down AI/semi names` : null;
+  const marketOpen = isMarketOpen();
+  marketCache = { ...data, gateStatus, gateNote, btcSignal, tsmWarning, marketOpen, pulse: marketCache?.pulse || null, timestamp: new Date().toISOString(), cached: false };
+  cacheTime = Date.now();
+  console.log(`Market cache warmed. Gate: ${gateStatus}. Market open: ${marketOpen}`);
+  generatePulse(data).then(p => {
+    if (p && marketCache) marketCache.pulse = p;
+  }).catch(() => {});
+}
+
+// ─── MARKET-OPEN CACHE WARM ─────────────────────────────────────────
+// The 9:30am ET open is exactly when symbolMarketCache entries most need
+// to be fresh, and exactly when they're least likely to be: isMarketDataWindow()
+// has been closed all morning (see its comment), so nothing has auto-
+// refreshed since the prior close. Without this, whichever ticker a user
+// happens to load first after 9:30 pays for its own refresh individually,
+// and everyone else keeps seeing a stale price until their own next
+// request happens to land. This proactively refreshes the fixed tracked
+// list AND every symbol currently sitting in symbolMarketCache (i.e.
+// anything any tier's watchlist has touched recently) the moment the bell
+// rings, so real traffic ramping up right after open finds already-fresh
+// data instead of triggering the refresh itself. Fires once per trading
+// day, in a 5-minute window starting at 9:30 (not a single instant) so a
+// missed tick from event-loop load doesn't just skip the day entirely.
+let lastOpenWarmDate = null;
+setInterval(async () => {
+  const et  = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const day = et.getDay(); // 0=Sun, 6=Sat
+  if (day === 0 || day === 6) return; // no 9:30 open on Sat/Sun
+  const mins = et.getHours() * 60 + et.getMinutes();
+  const dateKey = et.toISOString().slice(0, 10);
+  if (mins < 570 || mins >= 575 || lastOpenWarmDate === dateKey) return;
+  lastOpenWarmDate = dateKey;
+  console.log("Market open — warming cache for all tracked symbols...");
+  try {
+    await warmTrackedMarketCache();
+    const watchlistSymbols = Array.from(symbolMarketCache.keys());
+    await Promise.allSettled(watchlistSymbols.map(s => {
+      const hardTrigger = preGateCache.get(s)?.data?.hardTrigger || false;
+      return refreshMarketEntry(s, hardTrigger).catch(e => console.error(`Market open warm ${s}:`, e.message));
+    }));
+    console.log(`Market open cache warm complete: ${watchlistSymbols.length} watchlist symbol(s) refreshed.`);
+  } catch(e) {
+    console.error("Market open cache warm failed:", e.message);
+  }
+}, 60 * 1000);
+
 // ─── START ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 credits.loadCredits(); // no-op with Supabase backend
@@ -2304,51 +2415,7 @@ app.listen(PORT, async () => {
   // Pre-warm market data cache on startup so first user request is instant
   console.log(`Pre-warming market data cache...`);
   try {
-    const tickers = [
-      { symbol: "SPY",             key: "spy"  },
-      { symbol: "QQQ",             key: "qqq"  },
-      { symbol: "BINANCE:BTCUSDT", key: "btc"  },
-      { symbol: "IWM",             key: "iwm"  },
-      { symbol: "SOXX",            key: "soxx" },
-      { symbol: "XBI",             key: "xbi"  },
-      { symbol: "GLD",             key: "gld"  },
-      { symbol: "USO",             key: "uso"  },
-      { symbol: "IBB",             key: "ibb"  },
-      { symbol: "NVDA",            key: "nvda" },
-      { symbol: "TSM",             key: "tsm"  },
-      { symbol: "MSFT",            key: "msft" },
-    ];
-    const results = await Promise.allSettled(tickers.map(t => fetchQuote(t.symbol)));
-    const data = {};
-    results.forEach((r, i) => {
-      data[tickers[i].key] = r.status === "fulfilled" && r.value
-        ? r.value : { price:"?", change:"?", direction:"flat", pct:0 };
-    });
-    const spyPct = data.spy?.pct || 0;
-    const qqqPct = data.qqq?.pct || 0;
-    const btcPct = data.btc?.pct || 0;
-    const tsmPct = data.tsm?.pct || 0;
-    let gateStatus = "GREEN", gateNote = "SPY and QQQ flat or green — proceed";
-    // Detect strong tailwind for confidence boosting
-    const gateStrong = spyPct >= 0.5 && qqqPct >= 0.5;
-    if (gateStrong) gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both up >0.5%, strong tailwind`;
-    if (spyPct <= -1 || qqqPct <= -1) { gateStatus = "RED"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, stand down`; }
-    else if (spyPct <= -0.5 || qqqPct <= -0.5) { gateStatus = "YELLOW"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — down >0.5%, cut size 50%`; }
-    let btcSignal = "neutral";
-    if (btcPct >= 2) btcSignal = "full conviction";
-    else if (btcPct <= -5) btcSignal = "stand down";
-    else if (btcPct <= -2) btcSignal = "reduce size";
-    const tsmWarning = tsmPct <= -3 ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, stand down AI/semi names` : null;
-    const marketOpen = isMarketOpen();
-    const pulse = null; // Generated async below
-    marketCache = { ...data, gateStatus, gateNote, btcSignal, tsmWarning, marketOpen, pulse, timestamp: new Date().toISOString(), cached: false };
-    cacheTime = Date.now();
-    console.log(`Market cache warmed. Gate: ${gateStatus}. Market open: ${marketOpen}`);
-
-    // Generate pulse async after cache is set
-    generatePulse(data).then(p => {
-      if(p && marketCache) marketCache.pulse = p;
-    }).catch(() => {});
+    await warmTrackedMarketCache();
   } catch(e) {
     console.error("Cache warm-up failed:", e.message);
   }

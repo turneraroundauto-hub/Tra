@@ -271,7 +271,7 @@ const PROXY_RULES = [
                "IREN","CIFR","CORZ","WULF","BTDR","ARM","TSM","ASML","LRCX","KLAC"],
     proxy:    { name:"TSM + KOSPI (Taiwan/Korea Semis)",
                 symbols:["TSM"],
-                rationale:"AI/semi names lag Taiwan (TSM) and Korean (Samsung/SK Hynix) by 1-3 sessions. TSM drop >3% = stand down." },
+                rationale:"AI/semi names lag Taiwan (TSM) and Korean (Samsung/SK Hynix) by 1-3 sessions. TSM drop >3% = risk-off." },
   },
   {
     category: "Software/Cloud",
@@ -1665,7 +1665,7 @@ app.get("/market", async (req, res) => {
     if (spyPct <= -1 && qqqPct <= -1) {
       // Both down hard — broad market failure
       gateStatus = "RED";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, broad market failure, stand down`;
+      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, broad market failure, risk-off`;
     } else if (spyPct <= -1 || qqqPct <= -1) {
       // One index hard down — sector rotation, caution
       gateStatus = "YELLOW";
@@ -1694,12 +1694,12 @@ app.get("/market", async (req, res) => {
 
     // TSM drop >3% = global AI/semi warning
     const tsmWarning = tsmPct <= -3
-      ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, stand down AI/semi names`
+      ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, risk-off on AI/semi names`
       : null;
 
     let btcSignal = "neutral";
     if      (btcPct >=  2) btcSignal = "full conviction";
-    else if (btcPct <= -5) btcSignal = "stand down";
+    else if (btcPct <= -5) btcSignal = "risk-off";
     else if (btcPct <= -2) btcSignal = "reduce size";
 
     const marketOpen = isMarketOpen();
@@ -2558,13 +2558,13 @@ async function warmTrackedMarketCache() {
   let gateStatus = "GREEN", gateNote = "SPY and QQQ flat or green — proceed";
   const gateStrong = spyPct >= 0.5 && qqqPct >= 0.5;
   if (gateStrong) gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both up >0.5%, strong tailwind`;
-  if (spyPct <= -1 || qqqPct <= -1) { gateStatus = "RED"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, stand down`; }
+  if (spyPct <= -1 || qqqPct <= -1) { gateStatus = "RED"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, risk-off`; }
   else if (spyPct <= -0.5 || qqqPct <= -0.5) { gateStatus = "YELLOW"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — down >0.5%, cut size 50%`; }
   let btcSignal = "neutral";
   if (btcPct >= 2) btcSignal = "full conviction";
-  else if (btcPct <= -5) btcSignal = "stand down";
+  else if (btcPct <= -5) btcSignal = "risk-off";
   else if (btcPct <= -2) btcSignal = "reduce size";
-  const tsmWarning = tsmPct <= -3 ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, stand down AI/semi names` : null;
+  const tsmWarning = tsmPct <= -3 ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, risk-off on AI/semi names` : null;
   const marketOpen = isMarketOpen();
   marketCache = { ...data, gateStatus, gateNote, btcSignal, tsmWarning, marketOpen, pulse: marketCache?.pulse || null, timestamp: new Date().toISOString(), cached: false };
   cacheTime = Date.now();

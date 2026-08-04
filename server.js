@@ -17,12 +17,42 @@ const gx        = require("./gates-extended");
 const { createClient } = require("@supabase/supabase-js");
 
 // ── SUPABASE CLIENT ───────────────────────────────────────────────
+// This is the ONLY client that should ever be used for service_role-
+// privileged work (credits.rpc(), subscribers, watchlist/track-record
+// sync). persistSession:false is deliberate — see authClient() below for
+// why this client must never accumulate a signed-in session.
 const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
   : null;
 
 // Pass supabase client to credit system
 credits.setSupabase(supabase);
+
+// Public anon key — safe to keep in source, it's already public in every
+// tier's page source (see e.g. pro/app.js's SUPABASE_ANON constant).
+// Overridable via env if it's ever rotated.
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY
+  || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9pbm9tY2lrZHlpc3JiZmVlaXJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2NzM3NzgsImV4cCI6MjEwMDI0OTc3OH0.PiMDYsSZjNd4Iw-0wbQH4niDvUmW8ymycmiyb5Raf1w";
+
+// A FRESH client, never reused or stored in a module-level variable — see
+// call sites (/auth/login, /auth/signup). signInWithPassword/signUp
+// persist a session onto whatever client instance they're called on, and
+// that instance's own .from()/.rpc() calls then send the session's
+// access_token instead of the key it was constructed with. `supabase`
+// above is shared across every concurrent request in this process; if
+// login/signup ran on it, the moment any one user logged in, every other
+// in-flight or subsequent request's privileged calls (credits included)
+// would silently start executing as THAT user's `authenticated` role
+// instead of `service_role` — confirmed as the root cause of the Aug 4,
+// 2026 credits RLS mystery (see CLAUDE.md: revoking anon/authenticated
+// grants broke production instantly, even though service_role's own
+// grants were untouched and a SQL-editor `set role service_role` test
+// worked fine). A throwaway client here has no session to leak.
+function authClient() {
+  return createClient(process.env.SUPABASE_URL, SUPABASE_ANON_KEY);
+}
 
 // Wraps fetch with an AbortController-based timeout so a slow/hanging
 // upstream (SEC, Finnhub, Alpaca, Anthropic) fails fast with a clear error
@@ -2227,7 +2257,7 @@ app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await authClient().auth.signInWithPassword({ email, password });
     if (error) return res.status(401).json({ error: error.message });
     const sub = await getSubscriber(data.user.email);
     const subStatus = sub ? (sub.status || "").trim().toLowerCase() : "none";
@@ -2260,7 +2290,7 @@ app.post("/auth/signup", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
-    const { data, error } = await supabase.auth.signUp({ email, password });
+    const { data, error } = await authClient().auth.signUp({ email, password });
     if (error) return res.status(400).json({ error: error.message });
     // Create free subscriber record
     await upsertSubscriber(email, "free", null, null);

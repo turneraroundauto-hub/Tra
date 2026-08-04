@@ -737,15 +737,55 @@ function alpacaKeys() {
   return key && secret ? { key, secret } : null;
 }
 
-async function alpacaGet(path) {
+// Alpaca's free plan allows 200 requests/minute, and every one of
+// fetchOpeningBar/fetchDailyCloses/fetchImpliedVolatility/
+// fetchExtendedHoursPrice calls through alpacaGet() with no throttling
+// upstream — a full watchlist's worth of tickers (cards + PRE + Heat Map
+// each independently triggering /ticker/:symbol for the same and different
+// symbols) fires 2-3 Alpaca calls per ticker concurrently, blowing past
+// 200/min in seconds. Confirmed live (Aug 4, 2026): a burst of 429s across
+// fetchDailyCloses/fetchOpeningBar/fetchImpliedVolatility, several for the
+// same symbol within milliseconds of each other. Unlike a slow response,
+// these failures aren't cosmetic — fetchDailyCloses failing to null
+// degrades Gate 1's evaluation silently, not just "shows nothing." Same
+// fix as Finnhub's throttle (Aug 3): one shared rolling-window limiter plus
+// retry-with-backoff on 429, centralized in alpacaGet() so every call site
+// gets it for free instead of needing its own copy.
+const ALPACA_MAX_PER_MIN = 180;
+const alpacaCallTimes = [];
+let alpacaQueue = Promise.resolve();
+
+function alpacaThrottle() {
+  const turn = alpacaQueue.then(async () => {
+    for (;;) {
+      const now = Date.now();
+      while (alpacaCallTimes.length && now - alpacaCallTimes[0] > 60000) alpacaCallTimes.shift();
+      if (alpacaCallTimes.length < ALPACA_MAX_PER_MIN) {
+        alpacaCallTimes.push(now);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 60000 - (now - alpacaCallTimes[0]) + 50));
+    }
+  });
+  alpacaQueue = turn.catch(() => {}); // one slow/failed turn must not wedge the queue for everyone behind it
+  return turn;
+}
+
+async function alpacaGet(path, attempt = 0) {
   const creds = alpacaKeys();
   if (!creds) throw new Error("No ALPACA_KEY/ALPACA_SECRET");
+  await alpacaThrottle();
   const res = await fetchWithTimeout(`https://data.alpaca.markets${path}`, {
     headers: {
       "APCA-API-KEY-ID":     creds.key,
       "APCA-API-SECRET-KEY": creds.secret,
     },
   }, 8000);
+  if (res.status === 429 && attempt < 2) {
+    const retryAfterMs = Number(res.headers.get("retry-after")) * 1000 || 2000 * (attempt + 1);
+    await new Promise(r => setTimeout(r, retryAfterMs));
+    return alpacaGet(path, attempt + 1);
+  }
   if (!res.ok) throw new Error(`Alpaca ${res.status}: ${path}`);
   return res.json();
 }

@@ -197,6 +197,7 @@ app.use(async (req, res, next) => {
   if (req.path === "/auth/login") return next();
   if (req.path === "/auth/signup") return next();
   if (req.path === "/auth/reset") return next();
+  if (req.path === "/auth/reset-confirm") return next();
   if (req.path === "/stripe/webhook") return next();
   if (req.path === "/stripe/credits") return next();
 
@@ -2319,6 +2320,44 @@ app.post("/auth/reset", async (req, res) => {
     });
     if (error) return res.status(400).json({ error: error.message });
     res.json({ message: "Reset link sent" });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Consume a password-recovery link (from /reset/) and set a new password.
+// Handles both Supabase recovery-link shapes: the classic implicit-grant
+// hash (#access_token=...&type=recovery) and the newer OTP-style query
+// param (?token_hash=...&type=recovery) — reset/index.html forwards
+// whichever one it parsed out of the URL. This existed in the trade-verdict
+// mirror (PR #16, Aug 1) but was never ported here — the actual deploy
+// target — so every real reset attempt 401'd with "No API key or session
+// token provided" (this path wasn't in the auth-middleware's exemption
+// list above either, on top of the route itself not existing).
+//
+// getUser(accessToken) and verifyOtp() both go through authClient(), not
+// the shared admin `supabase` client — verifyOtp establishes a session
+// exactly like signInWithPassword/signUp do, so running it on the admin
+// client would reintroduce the same session-contamination bug fixed
+// elsewhere in this file (see authClient()'s comment above). Only the
+// actual privileged write (admin.updateUserById) needs service_role.
+app.post("/auth/reset-confirm", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Auth not configured" });
+  const { accessToken, tokenHash, password } = req.body;
+  if (!password || password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  if (!accessToken && !tokenHash) return res.status(400).json({ error: "Missing or expired reset link" });
+  try {
+    let userId = null;
+    if (accessToken) {
+      const { data, error } = await authClient().auth.getUser(accessToken);
+      if (error || !data?.user) return res.status(401).json({ error: "This reset link is invalid or has expired" });
+      userId = data.user.id;
+    } else {
+      const { data, error } = await authClient().auth.verifyOtp({ token_hash: tokenHash, type: "recovery" });
+      if (error || !data?.user) return res.status(401).json({ error: "This reset link is invalid or has expired" });
+      userId = data.user.id;
+    }
+    const { error: updateErr } = await supabase.auth.admin.updateUserById(userId, { password });
+    if (updateErr) return res.status(400).json({ error: updateErr.message });
+    res.json({ message: "Password updated" });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 

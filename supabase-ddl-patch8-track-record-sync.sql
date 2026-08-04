@@ -12,6 +12,8 @@
 -- entries array shared/track-record.js already builds. Pro-only for now —
 -- only pro/app.js calls initTrackRecordSync() (shared/track-record-sync.js);
 -- Free/Starter/Shark are untouched and stay localStorage-only.
+
+-- ── STEP 1 — run this first ─────────────────────────────────────────
 create table if not exists public.accuracy_log (
   id          bigint generated always as identity primary key,
   email       text not null unique,
@@ -22,7 +24,12 @@ create table if not exists public.accuracy_log (
 
 create index if not exists accuracy_log_email_idx on public.accuracy_log (email);
 
--- RLS disabled to match subscribers/credits/watchlists/proxy_resolution —
+-- ── STEP 2 — run this SECOND, as its own separate execution ────────
+-- Confirmed on this project (Aug 4, 2026, patch8): bundling this in the
+-- same script/run as the CREATE TABLE above does not reliably stick —
+-- the table still shows RLS-enabled/"Restricted" afterward. Running it
+-- as its own statement, after the table already exists, is what actually
+-- disables it. Match subscribers/credits/watchlists/proxy_resolution —
 -- server-only access via the service_role key.
 alter table public.accuracy_log disable row level security;
 

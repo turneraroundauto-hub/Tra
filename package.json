@@ -1,7 +1,7 @@
 {
   "name": "trade-verdict-api",
   "version": "4.2.0",
-  "description": "Trade Verdict CRF Analysis API",
+  "description": "Trade Tribunal CRF Analysis API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

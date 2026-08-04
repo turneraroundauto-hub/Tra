@@ -1,6 +1,6 @@
 
 // ═══════════════════════════════════════════════════════════════════
-// CREDIT SYSTEM — Trade Verdict
+// CREDIT SYSTEM — Trade Tribunal
 // ═══════════════════════════════════════════════════════════════════
 // Storage: Supabase (the existing public.credits table + RPC functions
 // added on top of it, see supabase-ddl-patch5-credits.sql), with every

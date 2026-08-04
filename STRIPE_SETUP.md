@@ -1,26 +1,26 @@
-# Trade Verdict — Stripe Setup Guide
+# Trade Tribunal — Stripe Setup Guide
 
 ## Step 1 — Create Stripe Products
 
 In Stripe Dashboard → Products → Add Product:
 
-### Product 1: Trade Verdict Starter
-- Name: `Trade Verdict Starter`
+### Product 1: Trade Tribunal Starter
+- Name: `Trade Tribunal Starter`
 - Price: `$9.99` recurring monthly
 - Copy the **Price ID** (looks like `price_xxx`) — you'll need it
 
-### Product 2: Trade Verdict Pro  
-- Name: `Trade Verdict Pro`
+### Product 2: Trade Tribunal Pro  
+- Name: `Trade Tribunal Pro`
 - Price: `$16.99` recurring monthly
 - Copy the **Price ID**
 
-### Product 3: Trade Verdict Shark
-- Name: `Trade Verdict Shark`
+### Product 3: Trade Tribunal Shark
+- Name: `Trade Tribunal Shark`
 - Price: `$39.99` recurring monthly
 - Copy the **Price ID**
 
 ### Product 4: Credits Pack (one-time)
-- Name: `Trade Verdict Credits — 10 pack`
+- Name: `Trade Tribunal Credits — 10 pack`
 - Price: `$0.99` one-time
 - Copy the **Price ID**
 

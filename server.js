@@ -350,7 +350,7 @@ const PRE_GATE_FORMS = "8-K,10-Q,10-K";
 const PRE_GATE_LOOKBACK_DAYS = 45;
 const PRE_GATE_ESCALATION_WINDOW_DAYS = 30;
 const PRE_GATE_ESCALATION_COUNT = 2;
-const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeVerdict research contact@example.com";
+const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeTribunal research contact@example.com";
 
 // Ticker -> CIK map, refreshed daily. SEC's full-text search filters by CIK,
 // not ticker symbol, so this is required to scope a search to one company.
@@ -878,7 +878,7 @@ async function finnhubGet(path, attempt = 0) {
   await finnhubThrottle();
   const sep = path.includes("?") ? "&" : "?";
   const res = await fetchWithTimeout(`https://finnhub.io/api/v1${path}${sep}token=${key}`,
-    { headers: { "User-Agent": "TradeVerdict/4.0" } }, 8000);
+    { headers: { "User-Agent": "TradeTribunal/4.0" } }, 8000);
   if (res.status === 429 && attempt < 2) {
     const retryAfterMs = Number(res.headers.get("retry-after")) * 1000 || 2000 * (attempt + 1);
     await new Promise(r => setTimeout(r, retryAfterMs));
@@ -2225,7 +2225,7 @@ app.post("/stripe/credits", async (req, res) => {
 const PORT = process.env.PORT || 3001;
 credits.loadCredits(); // no-op with Supabase backend
 app.listen(PORT, async () => {
-  console.log(`Trade Verdict API v4.0.0 on port ${PORT}`);
+  console.log(`Trade Tribunal API v4.0.0 on port ${PORT}`);
   console.log(`Anthropic: ${!!process.env.ANTHROPIC_API_KEY}`);
   console.log(`Finnhub:   ${!!process.env.FINNHUB_KEY}`);
   console.log(`Alpaca:    ${!!(process.env.ALPACA_KEY && process.env.ALPACA_SECRET)}`);

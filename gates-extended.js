@@ -1,6 +1,6 @@
 'use strict';
 /**
- * gates-extended.js — Trade Verdict Patch 4
+ * gates-extended.js — Trade Tribunal Patch 4
  * Self-contained. Additive. No edits required to existing server.js internals.
  *
  *   1. evaluateGate1Sessions()   — Gate 1 with session/calendar ambiguity RESOLVED to sessions

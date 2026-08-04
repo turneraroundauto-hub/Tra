@@ -110,9 +110,9 @@ After a user subscribes, email them their pro URL:
 
 | Tier | URL |
 |---|---|
-| Starter | `https://turneraroundauto-hub.github.io/trade-verdict/starter/` |
-| Pro | `https://turneraroundauto-hub.github.io/trade-verdict/pro/` |
-| Shark | `https://turneraroundauto-hub.github.io/trade-verdict/shark/` |
+| Starter | `https://tradetribunal.app/starter/` |
+| Pro | `https://tradetribunal.app/pro/` |
+| Shark | `https://tradetribunal.app/shark/` |
 
 Their APP_SECRET (tier key) is baked into each HTML file.
 

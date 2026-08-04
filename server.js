@@ -1137,7 +1137,7 @@ function evaluateGate1(closesAscending) {
 
 const MAX_NEWS_AGE_HOURS = 300; // 14 days / last business week
 
-async function fetchNews(symbol) {
+async function fetchFinnhubNews(symbol) {
   try {
     const now    = new Date();
     const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
@@ -1161,6 +1161,67 @@ async function fetchNews(symbol) {
       ageHours: ageHrs,
     };
   } catch(e) { return null; }
+}
+
+// Second news source, Alpaca's /v1beta1/news (Benzinga-sourced, same
+// account/throttle as every other Alpaca call here via alpacaGet()).
+// Queried alongside Finnhub every time, not only as an empty-result
+// fallback -- confirmed live (Aug 4, 2026, BB) that Finnhub can return a
+// real, non-empty article that's simply older than a materially newer
+// story it doesn't have at all, so "Finnhub returned something" isn't
+// sufficient on its own to call the coverage current.
+//
+// UNVERIFIED AGAINST LIVE ALPACA NEWS ENTITLEMENT -- written from Alpaca's
+// documented v1beta1/news response shape (id, headline, summary, url,
+// source, created_at, symbols); Alpaca's free plan is documented to
+// include News API access at the same 200/min as market data, but there's
+// no way to confirm the exact field names/behavior against a real account
+// from this sandbox. Fails safe (null) on any error including a 403 if the
+// account genuinely lacks the entitlement -- confirm after deploy that a
+// real symbol returns a real headline, not just silent nulls.
+async function fetchAlpacaNews(symbol) {
+  if (!alpacaKeys()) return null;
+  try {
+    const now    = new Date();
+    const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
+    const data   = await alpacaGet(
+      `/v1beta1/news?symbols=${symbol}&start=${cutoff.toISOString()}&end=${now.toISOString()}&limit=10&sort=desc`
+    );
+    const articles = data?.news;
+    if (!Array.isArray(articles) || !articles.length) return null;
+    const item     = articles[0]; // sort=desc -> most recent first
+    const itemTime = new Date(item.created_at);
+    const ageHrs   = Math.round((now - itemTime) / 3600000);
+    if (!(ageHrs <= MAX_NEWS_AGE_HOURS)) return null; // guards against a bad/missing created_at too (NaN comparisons are always false)
+    return {
+      headline: item.headline,
+      url:      item.url,
+      source:   item.source || "Benzinga",
+      ageLabel: ageHrs < 1 ? "just now"
+        : ageHrs < 24 ? `${ageHrs}h ago`
+        : `${Math.floor(ageHrs / 24)}d ago`,
+      ageHours: ageHrs,
+    };
+  } catch(e) {
+    console.error(`fetchAlpacaNews ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+// Queries both sources concurrently and returns whichever headline is
+// actually more recent, rather than only falling back to Alpaca when
+// Finnhub comes back completely empty (see fetchAlpacaNews's comment for
+// why that distinction mattered in practice).
+async function fetchNews(symbol) {
+  const [fh, al] = await Promise.allSettled([
+    fetchFinnhubNews(symbol),
+    fetchAlpacaNews(symbol),
+  ]);
+  const finnhub = fh.status === "fulfilled" ? fh.value : null;
+  const alpaca  = al.status === "fulfilled" ? al.value : null;
+  if (!finnhub) return alpaca;
+  if (!alpaca) return finnhub;
+  return alpaca.ageHours <= finnhub.ageHours ? alpaca : finnhub;
 }
 
 // ─── EVALUATE PROXY STATUS ────────────────────────────────────────

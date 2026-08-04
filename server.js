@@ -1370,6 +1370,68 @@ app.post("/watchlist", async (req, res) => {
   }
 });
 
+// ── TRACK RECORD SYNC (Pro only for now) ──────────────────────────
+// Mirrors /watchlist above exactly -- same auth gating (req.userEmail,
+// any signed-in tier, though only pro/app.js actually calls
+// initTrackRecordSync() as of this writing -- see shared/track-record-sync.js)
+// and the same seed/ignoreDuplicates write semantics, for the same reason:
+// a GET miss is ambiguous between "genuinely new account" and "transient
+// read failure/race," so a seed write can only insert, never clobber.
+//
+// Stores the full, already-capped entries array shared/track-record.js
+// builds (capped at 200 client-side); re-capped server-side too as a
+// storage-abuse guard, not because the client cap can't be trusted -- same
+// posture as /watchlist's tickers cap.
+app.get("/track", async (req, res) => {
+  if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+  if (!supabase) return res.json({ entries: [] });
+  try {
+    const { data, error } = await supabase
+      .from("accuracy_log")
+      .select("entries")
+      .eq("email", req.userEmail.trim().toLowerCase())
+      .maybeSingle();
+    if (error) { console.error("GET /track:", error.message); return res.json({ entries: [] }); }
+    const entries = (data && data.entries) || [];
+    console.log(`GET /track: ${req.userEmail.trim().toLowerCase()} -> row ${data ? "found" : "NOT FOUND"}, ${entries.length} entries`);
+    res.json({ entries });
+  } catch(e) { console.error("GET /track:", e.message); res.json({ entries: [] }); }
+});
+
+const TRACK_VERDICTS = new Set(["UP", "DOWN", "FLAT"]);
+app.post("/track", async (req, res) => {
+  if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+  const { entries, seed } = req.body;
+  if (!Array.isArray(entries)) return res.status(400).json({ error: "entries must be an array" });
+  const clean = entries
+    .filter(e => e && typeof e === "object"
+      && typeof e.ticker === "string" && /^[A-Z]{1,6}$/.test(e.ticker)
+      && TRACK_VERDICTS.has(e.verdict)
+      && typeof e.correct === "boolean"
+      && typeof e.ts === "string" && !isNaN(Date.parse(e.ts))
+      && typeof e.session === "string")
+    .map(e => ({
+      ticker: e.ticker, verdict: e.verdict, correct: e.correct, ts: e.ts, session: e.session,
+      ...(typeof e.trigger === "string" ? { trigger: e.trigger } : {}),
+    }))
+    .slice(-200);
+  if (!supabase) return res.json({ success: true, stored: false });
+  const emailKey = req.userEmail.trim().toLowerCase();
+  try {
+    const { error } = await supabase.from("accuracy_log").upsert({
+      email:      emailKey,
+      entries:    clean,
+      updated_at: new Date().toISOString(),
+    }, seed ? { onConflict: "email", ignoreDuplicates: true } : { onConflict: "email" });
+    if (error) { console.error("POST /track:", error.message); return res.status(500).json({ error: error.message, stored: false }); }
+    console.log(`POST /track: ${emailKey} -> ${seed ? "SEED (ignoreDuplicates)" : "normal overwrite"}, ${clean.length} entries`);
+    res.json({ success: true, stored: true, count: clean.length });
+  } catch(e) {
+    console.error("POST /track:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── ADD CREDITS (Stripe webhook or manual) ────────────────────────
 app.post("/credits/add", async (req, res) => {
   const { count } = req.body;

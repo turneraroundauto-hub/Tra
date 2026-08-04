@@ -784,6 +784,29 @@ async function fetchOpeningBar(symbol) {
   }
 }
 
+// Latest IEX trade price via Alpaca — used by fetchTickerMetrics() only
+// during isExtendedHoursWindow() (8-9:30am / 4-8pm ET), when Finnhub's free
+// /quote holds the last regular-session price instead of tracking live
+// trades. IEX runs its own formal pre/post-market sessions, and this
+// endpoint's default feed (feed=iex) includes those prints — thinner
+// liquidity than the regular consolidated tape (IEX is one exchange among
+// many), so treat this as a real but imprecise read, not equivalent to a
+// regular-session quote. Returns null (never throws) on a quiet name with
+// no recent IEX print, or if Alpaca isn't configured — callers fall back to
+// Finnhub's value in that case.
+async function fetchExtendedHoursPrice(symbol) {
+  if (!alpacaKeys()) return null;
+  try {
+    const data  = await alpacaGet(`/v2/stocks/${symbol}/trades/latest?feed=iex`);
+    const trade = data.trade;
+    if (!trade || typeof trade.p !== "number") return null;
+    return { price: trade.p, timestamp: trade.t };
+  } catch(e) {
+    console.error(`fetchExtendedHoursPrice ${symbol}:`, e.message);
+    return null;
+  }
+}
+
 // ─── IMPLIED VOLATILITY (Pro + Shark, gated by tierConfig.iv) ──────
 // IV isn't a stock metric — it's derived from options prices, and
 // Finnhub's free tier (this app's main data provider) doesn't offer it at
@@ -960,8 +983,22 @@ async function fetchTickerMetrics(symbol) {
   try {
     const q = await finnhubGet(`/quote?symbol=${symbol}`).catch(() => null);
     if (!q?.c) throw new Error("No quote");
-    const price = q.c;
-    const pct   = q.dp ?? null; // today's %change — Gate 5 Proxy Coherence Check (Patch 4) needs this
+    let price = q.c;
+    let pct   = q.dp ?? null; // today's %change — Gate 5 Proxy Coherence Check (Patch 4) needs this
+
+    // Pre/post-market: Finnhub's `c`/`dp` above are frozen at the last
+    // regular-session values (see isExtendedHoursWindow()'s comment) —
+    // substitute Alpaca's live IEX print when one's available, recomputing
+    // %change against Finnhub's `pc` (previous close, reliable at any hour
+    // since it doesn't need to track live trades). Falls back to Finnhub's
+    // own (stale but non-null) values if Alpaca has nothing for this name.
+    if (isExtendedHoursWindow()) {
+      const ext = await fetchExtendedHoursPrice(symbol);
+      if (ext && typeof q.pc === "number" && q.pc > 0) {
+        price = ext.price;
+        pct   = ((ext.price - q.pc) / q.pc) * 100;
+      }
+    }
 
     let fundEntry = symbolFundamentalsCache.get(symbol);
     if (!fundEntry || Date.now() - fundEntry.time >= FUNDAMENTALS_REFRESH_MS) {
@@ -1590,35 +1627,45 @@ function isNewsWindow() {
   return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
 }
 
-// Market-data refresh window: 9:30am-8pm ET, Monday through Sunday, EXCEPT
-// Saturday. That covers after-hours prospecting on every weekday plus Sunday
-// evening, when futures reopen and next-week positioning starts — but skips
-// Saturday entirely, where nothing about a ticker's price data can
+// Market-data refresh window: 8am-8pm ET, Monday through Sunday, EXCEPT
+// Saturday. That covers pre-market/after-hours prospecting on every weekday
+// (not just the 9:30-4 regular session isMarketOpen() would allow) plus
+// Sunday evening, when futures reopen and next-week positioning starts —
+// but skips Saturday entirely, where nothing about a ticker's price data can
 // realistically move. Outside this window the cached copy is served
 // regardless of age. This is deliberately a different, wider check than
 // isMarketOpen() (which still gates the actual Gate 0 SPY/QQQ trading logic
 // elsewhere in this file) — this one only governs cache-refresh eligibility.
 //
-// Starts at 9:30am, NOT 8:00am (Aug 4, 2026 fix): this used to open at 8am
-// to also cover pre-market, but neither of this app's price sources can
-// actually deliver live pre-market data on their current plans — Finnhub's
-// free/basic /quote endpoint doesn't reflect pre-market trades in its `c`
-// field (holds the last regular-session price until 9:30 rolls around), and
-// Alpaca's free tier only has the IEX feed, which has no pre-market data of
-// its own since IEX itself doesn't trade before 9:30. Opening this window
-// at 8am meant the app looked like it was serving live pre-market prices
-// (marketStale correctly triggered a refresh) while actually just re-fetching
-// and re-caching the same stale last-close value over and over, which is
-// worse than honestly holding it — confirmed live (CIFR showing $24.16
-// pre-market against a real $21.80). Revisit if either provider's plan is
-// upgraded to one with genuine extended-hours coverage (Alpaca SIP feed, or
-// equivalent).
+// Briefly narrowed to 9:30am-8pm on Aug 4, 2026 after finding Finnhub's
+// free /quote doesn't reflect pre-market trades in its `c` field (holds the
+// last regular-session price until 9:30) — confirmed live (CIFR showing
+// $24.16 pre-market against a real $21.80). Reverted the same day: IEX
+// Exchange runs its own formal pre-market (4:00am-9:30am ET) and post-market
+// (4:00pm-8:00pm ET) sessions, and Alpaca's bars/latest-trade endpoints
+// (feed=iex, already used elsewhere in this file) include those IEX prints
+// by default. So the fix isn't to stop refreshing during extended hours —
+// it's to source the price from Alpaca instead of Finnhub during them. See
+// isExtendedHoursWindow() and fetchExtendedHoursPrice().
 function isMarketDataWindow() {
   const et  = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const day = et.getDay(); // 0=Sun, 6=Sat
   if (day === 6) return false;
   const mins = et.getHours() * 60 + et.getMinutes();
-  return mins >= 570 && mins < 1200; // 9:30am–8:00pm ET
+  return mins >= 480 && mins < 1200; // 8:00am–8:00pm ET
+}
+
+// The sub-window of isMarketDataWindow() where Finnhub's free /quote can't
+// be trusted for price: IEX's own pre-market (4:00am-9:30am ET) and
+// post-market (4:00pm-8:00pm ET) sessions, minus the part that overlaps
+// isMarketDataWindow's 8am floor (pre-8am IEX pre-market isn't covered by
+// either window, consistent with this app's existing 8am prospecting
+// convention). Regular session (9:30-4:00) is excluded here — Finnhub is
+// confirmed accurate then, no need to route it through the thinner IEX tape.
+function isExtendedHoursWindow() {
+  const et   = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const mins = et.getHours() * 60 + et.getMinutes();
+  return (mins >= 480 && mins < 570) || (mins >= 960 && mins < 1200); // 8-9:30am or 4-8pm ET
 }
 
 // Fetches and stores a fresh symbolMarketCache entry for one ticker —
@@ -1682,10 +1729,10 @@ app.get("/ticker/:symbol", async (req, res) => {
     // own cacheMinutes, so a Pro request (1 min) still forces a refresh a
     // Free request (15 min) wouldn't have asked for — everyone just reads
     // whatever the freshest fetch left behind. Refreshed only inside
-    // isMarketDataWindow() (weekdays + Sunday evening, 9:30am-8pm ET) —
-    // outside that the cached copy is served regardless of age, since
-    // nothing about it can have changed (or, pre-9:30am, can't be reliably
-    // fetched live at all — see that function's comment).
+    // isMarketDataWindow() (weekdays + Sunday evening, 8am-8pm ET) — outside
+    // that the cached copy is served regardless of age, since nothing about
+    // it can have changed. fetchTickerMetrics() internally routes the price
+    // itself through Alpaca instead of Finnhub during isExtendedHoursWindow().
     const tierCacheMinutes = req.tierConfig?.cacheMinutes ?? 15;
     let marketEntry = symbolMarketCache.get(symbol);
     const marketStale = !marketEntry ||

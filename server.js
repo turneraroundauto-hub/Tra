@@ -405,30 +405,74 @@ const PRE_GATE_ESCALATION_WINDOW_DAYS = 30;
 const PRE_GATE_ESCALATION_COUNT = 2;
 const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeTribunal research contact@example.com";
 
+// SEC's fair-access policy caps requests at 10/sec. Unlike Finnhub/Alpaca
+// (see finnhubThrottle/alpacaThrottle below), nothing paced calls to SEC at
+// all — every /ticker/:symbol request awaits evaluatePreGate() before it can
+// return anything, and both the CIK map and the per-symbol Pre-Gate result
+// live in plain in-memory Maps/vars that go cold on every deploy. A burst of
+// concurrent requests for many *different* symbols right after a cold start
+// (a fresh deploy, or simply a large watchlist's first load of the day) fires
+// one full-text-search call per symbol with nothing pacing them — the exact
+// failure shape the Finnhub throttle exists to prevent, just against a
+// stricter per-second limit instead of per-minute, and on the one path with
+// no queue in front of it at all.
+const SEC_MAX_PER_SEC = 8;
+const secCallTimes = [];
+let secQueue = Promise.resolve();
+
+function secThrottle() {
+  const turn = secQueue.then(async () => {
+    for (;;) {
+      const now = Date.now();
+      while (secCallTimes.length && now - secCallTimes[0] > 1000) secCallTimes.shift();
+      if (secCallTimes.length < SEC_MAX_PER_SEC) {
+        secCallTimes.push(now);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 1000 - (now - secCallTimes[0]) + 20));
+    }
+  });
+  secQueue = turn.catch(() => {}); // one slow/failed turn must not wedge the queue for everyone behind it
+  return turn;
+}
+
 // Ticker -> CIK map, refreshed daily. SEC's full-text search filters by CIK,
 // not ticker symbol, so this is required to scope a search to one company.
+// tickerCikInFlight mirrors authInFlight above: without it, every concurrent
+// request landing while the map is cold (null, or >24h old) independently
+// re-fetches and re-parses the entire SEC ticker list instead of the whole
+// burst sharing one fetch.
 let tickerCikCache = null;
 let tickerCikCacheAt = 0;
+let tickerCikInFlight = null;
 
 async function getCik(symbol) {
   const now = Date.now();
   if (!tickerCikCache || now - tickerCikCacheAt > 24 * 60 * 60 * 1000) {
-    try {
-      const res = await fetchWithTimeout("https://www.sec.gov/files/company_tickers.json", {
-        headers: { "User-Agent": SEC_USER_AGENT },
-      }, 8000);
-      if (!res.ok) throw new Error(`SEC company_tickers ${res.status}`);
-      const data = await res.json();
-      const map = {};
-      Object.values(data).forEach(row => {
-        map[String(row.ticker).toUpperCase()] = String(row.cik_str).padStart(10, "0");
-      });
-      tickerCikCache = map;
-      tickerCikCacheAt = now;
-    } catch (e) {
-      console.error("getCik ticker map fetch:", e.message);
-      if (!tickerCikCache) return null;
+    if (!tickerCikInFlight) {
+      tickerCikInFlight = (async () => {
+        try {
+          await secThrottle();
+          const res = await fetchWithTimeout("https://www.sec.gov/files/company_tickers.json", {
+            headers: { "User-Agent": SEC_USER_AGENT },
+          }, 8000);
+          if (!res.ok) throw new Error(`SEC company_tickers ${res.status}`);
+          const data = await res.json();
+          const map = {};
+          Object.values(data).forEach(row => {
+            map[String(row.ticker).toUpperCase()] = String(row.cik_str).padStart(10, "0");
+          });
+          tickerCikCache = map;
+          tickerCikCacheAt = Date.now();
+        } catch (e) {
+          console.error("getCik ticker map fetch:", e.message);
+        } finally {
+          tickerCikInFlight = null;
+        }
+      })();
     }
+    await tickerCikInFlight;
+    if (!tickerCikCache) return null;
   }
   return tickerCikCache[symbol.toUpperCase()] || null;
 }
@@ -441,6 +485,7 @@ async function searchEdgarFilings(cik, keywords) {
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
     `&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
   try {
+    await secThrottle();
     const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
     if (!res.ok) throw new Error(`EDGAR full-text search ${res.status}`);
     const data = await res.json();

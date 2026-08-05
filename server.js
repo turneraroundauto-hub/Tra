@@ -137,25 +137,47 @@ async function validateSupabaseToken(token) {
 const authCache = new Map(); // token -> { data: {user, tier}, time }
 const AUTH_CACHE_MS = 60 * 1000;
 
+// The time-based cache above only helps requests that land AFTER an earlier
+// one already finished and populated it. A burst of concurrent requests
+// carrying the identical token (exactly the watchlist-hydration case the
+// comment above describes) all check the cache before any of them has had
+// time to fill it, so every single one independently re-runs both Supabase
+// round trips — the cache does nothing for the burst that motivated it in
+// the first place. Track the in-flight promise per token, same pattern as
+// the frontend's shared/ticker-cache.js inFlight map, so concurrent callers
+// share one real lookup instead of each starting their own.
+const authInFlight = new Map(); // token -> Promise
+
 async function resolveAuth(token) {
   const cached = authCache.get(token);
   if (cached && Date.now() - cached.time < AUTH_CACHE_MS) return cached.data;
 
-  const user = await validateSupabaseToken(token);
-  if (!user) { authCache.delete(token); return null; }
+  const inFlight = authInFlight.get(token);
+  if (inFlight) return inFlight;
 
-  const sub = await getSubscriber(user.email);
-  const subStatus = sub ? (sub.status || "").trim().toLowerCase() : "none";
-  const tier = (sub && subStatus === "active") ? sub.tier : "free";
-  console.log(`Auth: ${user.email} → subscriber ${sub ? "found" : "MISSING"} (status: ${subStatus}) → tier: ${tier}`);
+  const p = (async () => {
+    try {
+      const user = await validateSupabaseToken(token);
+      if (!user) { authCache.delete(token); return null; }
 
-  const data = { user, tier };
-  authCache.set(token, { data, time: Date.now() });
-  if (authCache.size > 500) {
-    const oldest = [...authCache.entries()].sort((a, b) => a[1].time - b[1].time).slice(0, 100);
-    oldest.forEach(([k]) => authCache.delete(k));
-  }
-  return data;
+      const sub = await getSubscriber(user.email);
+      const subStatus = sub ? (sub.status || "").trim().toLowerCase() : "none";
+      const tier = (sub && subStatus === "active") ? sub.tier : "free";
+      console.log(`Auth: ${user.email} → subscriber ${sub ? "found" : "MISSING"} (status: ${subStatus}) → tier: ${tier}`);
+
+      const data = { user, tier };
+      authCache.set(token, { data, time: Date.now() });
+      if (authCache.size > 500) {
+        const oldest = [...authCache.entries()].sort((a, b) => a[1].time - b[1].time).slice(0, 100);
+        oldest.forEach(([k]) => authCache.delete(k));
+      }
+      return data;
+    } finally {
+      authInFlight.delete(token);
+    }
+  })();
+  authInFlight.set(token, p);
+  return p;
 }
 const app     = express();
 

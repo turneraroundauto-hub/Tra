@@ -1899,28 +1899,37 @@ async function refreshMarketEntry(symbol, hardTrigger = false) {
 app.get("/ticker/:symbol", async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   try {
-    // ── NEWS — own 30-minute cadence, only while inside the 8am-8pm ET
-    // window; outside it (or on a weekend night) the last-fetched headline
-    // is served as-is rather than re-hit every load. A symbol with no cache
-    // entry yet always fetches once regardless of the window (bootstrap).
-    let newsEntry = newsCache.get(symbol);
-    if (!newsEntry || (isNewsWindow() && Date.now() - newsEntry.time >= NEWS_REFRESH_MS)) {
-      const news = await fetchNews(symbol).catch(() => null);
-      newsEntry = { data: news, time: Date.now() };
-      newsCache.set(symbol, newsEntry);
-    }
-    const news = newsEntry.data;
-
-    // ── PRE-GATE — own 24h cache, fully decoupled from the price clock
-    // below (see the comment on preGateCache above). A symbol with no cache
-    // entry yet always fetches once regardless of age (bootstrap).
-    let preGateEntry = preGateCache.get(symbol);
-    if (!preGateEntry || Date.now() - preGateEntry.time >= PRE_GATE_REFRESH_MS) {
-      const preGate = await evaluatePreGate(symbol);
-      preGateEntry = { data: preGate, time: Date.now() };
-      preGateCache.set(symbol, preGateEntry);
-    }
-    const preGate = preGateEntry.data;
+    // ── NEWS + PRE-GATE — run concurrently, not sequentially. Neither
+    // depends on the other (or on anything else in this handler) — News is
+    // its own 30-minute cadence, Pre-Gate its own 24h cache (see the
+    // comment on preGateCache above) — but they used to run one after the
+    // other anyway, so a cold Pre-Gate cache (SEC-throttled, can be the
+    // slowest thing in this whole request) delayed News for no reason, and
+    // both delayed the market-data fetch below from even starting. This
+    // doesn't change what either computes, just removes serial waiting
+    // that had no correctness reason behind it — market data's real
+    // dependency on preGate.hardTrigger (see resolveGate5 below) still
+    // gets the fully-resolved, fresh value, same as before.
+    const [news, preGate] = await Promise.all([
+      (async () => {
+        let newsEntry = newsCache.get(symbol);
+        if (!newsEntry || (isNewsWindow() && Date.now() - newsEntry.time >= NEWS_REFRESH_MS)) {
+          const newsData = await fetchNews(symbol).catch(() => null);
+          newsEntry = { data: newsData, time: Date.now() };
+          newsCache.set(symbol, newsEntry);
+        }
+        return newsEntry.data;
+      })(),
+      (async () => {
+        let preGateEntry = preGateCache.get(symbol);
+        if (!preGateEntry || Date.now() - preGateEntry.time >= PRE_GATE_REFRESH_MS) {
+          const preGateData = await evaluatePreGate(symbol);
+          preGateEntry = { data: preGateData, time: Date.now() };
+          preGateCache.set(symbol, preGateEntry);
+        }
+        return preGateEntry.data;
+      })(),
+    ]);
 
     // ── MARKET DATA — metrics/opening bar/gate1/proxy rule.
     // Shared across every tier requesting this symbol (the underlying data

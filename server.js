@@ -2122,7 +2122,7 @@ XBI ${sectorContext?.xbi||"?"}, IBB ${sectorContext?.ibb||"?"}, SOXX ${sectorCon
 TSM ${sectorContext?.tsm||"?"}, MSFT ${sectorContext?.msft||"?"}
 GLD ${sectorContext?.gld||"?"}, USO ${sectorContext?.uso||"?"}
 BTC signal: ${sectorContext?.btcSignal||"neutral"}
-Today: ${new Date().toLocaleDateString("en-US",{weekday:"long",month:"short",day:"numeric",year:"numeric"})}
+Today: ${new Date().toLocaleDateString("en-US",{weekday:"long",month:"short",day:"numeric",year:"numeric",timeZone:"America/New_York"})}
 
 Ticker metrics: ${metricsContext}
 News context: ${newsContext}

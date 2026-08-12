@@ -545,7 +545,73 @@ async function getCikFromFundMap(symbol) {
   return fundTickerCikCache[symbol.toUpperCase()] || null;
 }
 
+// Follow-up (Aug 12, 2026): the company_tickers_mf.json fallback above
+// did NOT fix DRAM -- confirmed live, no change to its Pre-Gate note.
+// Most likely explanation, per further research (still can't fetch
+// sec.gov directly from this sandbox to confirm outright): that file's
+// "mf" naming isn't incidental -- it appears to cover traditional
+// NAV-priced open-end mutual funds specifically, not exchange-traded
+// funds, so an ETF like DRAM was never going to show up there regardless
+// of any staleness/coverage-lag theory. Two more tiers added below,
+// specifically so this doesn't just become "one more guess that might
+// not work for the next ticker either":
+//
+// Tier 3 (KNOWN_CIK_OVERRIDES): a small, explicit, hand-confirmed map for
+// tickers already proven to have a real CIK the automated lookups above
+// miss. Not meant to scale by itself -- it's a guaranteed, zero-risk fix
+// for specifically-reported cases (starting with DRAM, CIK 1976517 /
+// Roundhill ETF Trust, confirmed via SEC's own EDGAR filing URLs
+// referencing it directly) while tier 4 below is the actual general fix.
+//
+// Tier 4 (getCikFromEdgarSearch): SEC's own live company/ticker search --
+// the same mechanism that powers EDGAR's search box -- queried only when
+// every static file above misses. Unlike the static ticker-file tiers,
+// this hits SEC's current database directly rather than a periodically-
+// cached snapshot, so it should catch genuinely new listings (DRAM
+// itself only started trading Apr 2, 2026) without needing a hardcoded
+// override for every future one. SEC's classic browse-edgar endpoint
+// accepts a ticker directly in its CIK parameter (well-documented,
+// long-standing SEC behavior -- this is literally how EDGAR's own search
+// box resolves a typed ticker), and its atom output wraps a match in a
+// <company-info><cik> element. UNVERIFIED against a live response, same
+// sandbox limitation as everything else SEC-related in this file --
+// parsed defensively (primary <cik> tag match, loose numeric fallback)
+// and fails safe to null. Its own small 24h cache (edgarSearchCikCache)
+// exists because this is the slowest tier and, unlike the bulk map
+// fetches above, isn't naturally cached in one shared object -- without
+// it, the same recurring miss would re-hit SEC on every single request
+// for that ticker instead of once a day.
+const KNOWN_CIK_OVERRIDES = {
+  DRAM: "0001976517", // Roundhill Memory ETF / Roundhill ETF Trust
+};
+
+const edgarSearchCikCache = new Map(); // symbol -> { cik, time }
+
+async function getCikFromEdgarSearch(symbol) {
+  const cached = edgarSearchCikCache.get(symbol);
+  if (cached && Date.now() - cached.time < 24 * 60 * 60 * 1000) return cached.cik;
+  try {
+    await secThrottle();
+    const url = `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${encodeURIComponent(symbol)}&type=&dateb=&owner=include&count=10&output=atom`;
+    const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
+    if (!res.ok) throw new Error(`SEC browse-edgar ${res.status}`);
+    const text = await res.text();
+    // Tag match first (atom output); "CIK#:" label second (SEC's actual
+    // documented label text on the HTML company page, deliberately NOT a
+    // bare "CIK=" match -- that would false-positive on the request URL's
+    // own query string being echoed back into the response somewhere).
+    const m = text.match(/<cik>(\d+)<\/cik>/i) || text.match(/CIK#:\s*(\d{1,10})/i);
+    const cik = m ? m[1].padStart(10, "0") : null;
+    edgarSearchCikCache.set(symbol, { cik, time: Date.now() });
+    return cik;
+  } catch (e) {
+    console.error(`getCikFromEdgarSearch ${symbol}:`, e.message);
+    return null;
+  }
+}
+
 async function getCik(symbol) {
+  const sym = symbol.toUpperCase();
   const now = Date.now();
   if (!tickerCikCache || now - tickerCikCacheAt > 24 * 60 * 60 * 1000) {
     if (!tickerCikInFlight) {
@@ -571,10 +637,13 @@ async function getCik(symbol) {
       })();
     }
     await tickerCikInFlight;
-    if (!tickerCikCache) return getCikFromFundMap(symbol);
   }
-  const primary = tickerCikCache[symbol.toUpperCase()] || null;
-  return primary || getCikFromFundMap(symbol);
+  const primary = tickerCikCache ? (tickerCikCache[sym] || null) : null;
+  if (primary) return primary;
+  if (KNOWN_CIK_OVERRIDES[sym]) return KNOWN_CIK_OVERRIDES[sym];
+  const fundCik = await getCikFromFundMap(sym);
+  if (fundCik) return fundCik;
+  return getCikFromEdgarSearch(sym);
 }
 
 async function searchEdgarFilings(cik, keywords) {

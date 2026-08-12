@@ -271,6 +271,26 @@ function isMarketOpen() {
   return mins >= 570 && mins < 960; // 9:30am–4:00pm ET
 }
 
+// Today's weekday in ET (0=Sun..6=Sat) — shared by every day-of-week check
+// in this file so they can't drift from each other on the timezone
+// conversion itself, only on what they each do with the resulting number.
+function etWeekday() {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
+}
+
+// Gate 3's weekly-carryover decay label for today, or null on Mon/Fri/
+// weekend (those days keep their own same-day overlay rule instead — see
+// fetchWeeklyCarryover's comment). Sessions-since-Monday is just today's
+// ET weekday minus Monday's (1): Tue=1, Wed=2, Thu=3.
+function carryoverDecayLabel() {
+  const day = etWeekday();
+  const sessionsSinceMonday = day - 1;
+  if (sessionsSinceMonday === 1) return { sessionsSinceMonday, weight: 'MODERATE' };
+  if (sessionsSinceMonday === 2) return { sessionsSinceMonday, weight: 'REDUCED' };
+  if (sessionsSinceMonday === 3) return { sessionsSinceMonday, weight: 'MINIMAL — largely faded' };
+  return null; // Mon, Fri, or weekend
+}
+
 // ─── SMART PROXY ALGORITHM ────────────────────────────────────────
 // Classifies any ticker into a proxy category using Finnhub sector data
 // Never returns N/A — every ticker gets a meaningful proxy
@@ -704,6 +724,25 @@ Swing level interpretation:
 - No touch detected yet = YELLOW-SCANNING, sequence not triggered
 
 Mon/Fri overlay applies in both modes. Monday touch + 3-bar conviction = maximum Gate 3 weight.
+
+WEEKLY CARRYOVER (Tue/Wed/Thu, both modes) — this is additional context
+alongside the same-day Mon/Fri overlay above, not a replacement for it.
+The Friday close -> weekend -> Monday reaction is part of the broader
+week's narrative, not an isolated same-day event, so it keeps informing
+Gate 3 for the rest of that week on a fixed decay schedule:
+- Tuesday (1 session removed): MODERATE weight — Monday's reaction still
+  meaningfully shapes today's read. A CONFIRMED_UP/DOWN reaction leans
+  today's sequence read the same direction; a FLAT reaction is neutral.
+- Wednesday (2 sessions removed): REDUCED weight — treat it as one input
+  among several, not a thumb on the scale the way Tuesday gets.
+- Thursday (3 sessions removed): MINIMAL weight, largely faded — mention
+  it only if today's own 3-bar sequence is otherwise ambiguous/YELLOW and
+  the carryover would help break the tie; never let it override a clear
+  same-day signal.
+Use the "Gate 3 weekly carryover" context block provided below. If it says
+data is unavailable, treat that as no additional signal — do not assume a
+direction. This never applies on Monday or Friday themselves (those keep
+the same-day rule above), nor on weekends/holidays.
 
 GATE 4 — PHASE
 Phase 1 (range <30%): GREEN — discovery phase, full size entry appropriate
@@ -1200,6 +1239,62 @@ async function fetchDailyCloses(symbol, lookbackDays = 130) {
     return bars.map(b => b.c);
   } catch (e) {
     console.error(`fetchDailyCloses ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+// ─── GATE 3 WEEKLY CARRYOVER (Tue/Wed/Thu decay context) ──────────
+// Gate 3's Mon/Fri overlay only ever fired as a same-day flag -- "today
+// happens to be Monday" / "today happens to be Friday" -- with nothing
+// carrying Monday's reaction to Friday's move into the rest of the week,
+// even though the framework's own intent (confirmed directly, Aug 12,
+// 2026) is that the Friday -> weekend -> Monday sequence is part of the
+// broader week's narrative, not an isolated same-day event.
+//
+// Deliberately a SEPARATE small fetch, not a derivation from
+// fetchDailyCloses's array above -- that array is bare closes with no
+// dates attached and is explicitly indexed positionally, not by calendar
+// date (see the "Do NOT date-anchor" comment on it, and the Gate 1 Patch 4
+// story in CLAUDE.md about exactly this class of bug). Finding "last
+// Friday" and "the Monday after it" needs real dates, so this fetches its
+// own short window of bars WITH timestamps and locates them by actual
+// weekday rather than by guessing array offsets from today's weekday --
+// robust to holidays and to whatever ambiguity exists around whether
+// today's own in-progress bar is included. Only ~10 days requested (vs
+// dailyCloses's 130), and callers only invoke this on Tue/Wed/Thu (see
+// refreshMarketEntry) since Monday/Friday already have their own same-day
+// rule and don't need it.
+async function fetchWeeklyCarryover(symbol) {
+  if (!alpacaKeys()) return null;
+  try {
+    const end   = new Date();
+    const start = new Date(end.getTime() - 10 * 24 * 60 * 60 * 1000);
+    const data = await alpacaGet(
+      `/v2/stocks/${symbol}/bars?timeframe=1Day&start=${start.toISOString().split("T")[0]}&end=${end.toISOString().split("T")[0]}&limit=15&feed=iex&adjustment=split`
+    );
+    const bars = data.bars || [];
+    if (bars.length < 2) return null;
+
+    const etDay = (isoTime) =>
+      new Date(new Date(isoTime).toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
+
+    // Walk backward looking for a Monday bar immediately preceded (in this
+    // trading-day series) by a Friday bar -- true regardless of any
+    // Thu/holiday gaps elsewhere in the window.
+    for (let i = bars.length - 1; i >= 1; i--) {
+      if (etDay(bars[i].t) !== 1) continue;       // Monday
+      if (etDay(bars[i - 1].t) !== 5) continue;   // immediately preceded by Friday
+      const fridayClose = bars[i - 1].c, mondayClose = bars[i].c;
+      const reactionPct = Math.round(((mondayClose - fridayClose) / fridayClose) * 10000) / 100;
+      return {
+        fridayClose, mondayClose, reactionPct,
+        reaction: reactionPct > 0.3 ? 'CONFIRMED_UP' : reactionPct < -0.3 ? 'CONFIRMED_DOWN' : 'FLAT',
+        mondayDate: new Date(bars[i].t).toISOString().split('T')[0],
+      };
+    }
+    return null;
+  } catch (e) {
+    console.error(`fetchWeeklyCarryover ${symbol}:`, e.message);
     return null;
   }
 }
@@ -1802,7 +1897,7 @@ app.get("/market", async (req, res) => {
 // weekend page load — this splits them so each refetches only when its own
 // underlying reality can actually have changed.
 const newsCache        = new Map(); // symbol -> { data, time }
-const symbolMarketCache = new Map(); // symbol -> { data: {metrics,openingBar,dailyCloses,proxyRule}, time }
+const symbolMarketCache = new Map(); // symbol -> { data: {metrics,openingBar,dailyCloses,proxyRule,weeklyCarryover}, time }
 // Pre-Gate (SEC filings) is a THIRD clock, slower than either of the above:
 // 10-Q/10-K/8-K filings don't change minute to minute like price does, but
 // it was riding the same short market-data TTL, so Pro tier was re-hitting
@@ -1877,20 +1972,27 @@ function isExtendedHoursWindow() {
 // false for callers (like the warm pass) that don't have it handy, same as
 // a symbol with no Pre-Gate history yet would resolve to.
 async function refreshMarketEntry(symbol, hardTrigger = false) {
-  const [metricsRes, barRes, gate1Res] = await Promise.allSettled([
+  // Weekly carryover only matters Tue/Wed/Thu (see carryoverDecayLabel) —
+  // Mon/Fri keep their own same-day overlay and don't need it, so this
+  // skips the extra Alpaca call entirely on 4 of 7 days, weekends included.
+  const wantCarryover = carryoverDecayLabel() !== null;
+
+  const [metricsRes, barRes, gate1Res, carryoverRes] = await Promise.allSettled([
     fetchTickerMetrics(symbol),
     fetchOpeningBar(symbol),
     fetchGate1Metrics(symbol),
+    wantCarryover ? fetchWeeklyCarryover(symbol) : Promise.resolve(null),
   ]);
   const metrics     = metricsRes.status === "fulfilled" ? metricsRes.value : null;
   const openingBar  = barRes.status     === "fulfilled" ? barRes.value     : null;
   const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
+  const weeklyCarryover = carryoverRes.status === "fulfilled" ? carryoverRes.value : null;
 
   // Gate 5 — static classification, falling through to the Dynamic Proxy
   // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
   const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, hardTrigger);
 
-  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule }, time: Date.now() };
+  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover }, time: Date.now() };
   symbolMarketCache.set(symbol, marketEntry);
   return marketEntry;
 }
@@ -1946,7 +2048,7 @@ app.get("/ticker/:symbol", async (req, res) => {
     const marketStale = !marketEntry ||
       (isMarketDataWindow() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
     if (marketStale) marketEntry = await refreshMarketEntry(symbol, preGate.hardTrigger);
-    const { metrics, openingBar, dailyCloses, proxyRule } = marketEntry.data;
+    const { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover } = marketEntry.data;
 
     // Server-enforced Gate 1 — pure/cheap derivation from dailyCloses, so it's
     // recomputed on every request (cache hit or not) rather than stored,
@@ -1960,7 +2062,7 @@ app.get("/ticker/:symbol", async (req, res) => {
     // doesn't need to ride on the same invalidation rule as the rest.
     const iv = req.tierConfig?.iv ? await fetchImpliedVolatility(symbol, metrics?.price) : null;
 
-    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, timestamp: new Date().toISOString() });
+    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, timestamp: new Date().toISOString() });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -1990,7 +2092,7 @@ function setCache(key, data) {
 
 // ─── ANALYZE ──────────────────────────────────────────────────────
 app.post("/analyze", async (req, res) => {
-  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData } = req.body;
+  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData } = req.body;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
@@ -2084,6 +2186,22 @@ Check SESSION CONTEXT for additional bar data provided by user.`;
     }
   }
 
+  // ── BUILD WEEKLY CARRYOVER CONTEXT (Gate 3 Tue/Wed/Thu decay) ──────
+  // Decay weight is computed server-side from today's real ET weekday
+  // (carryoverDecayLabel), same reasoning as the "Today:" line below —
+  // never trust the client for what day it is. The underlying Friday/
+  // Monday closes (weeklyCarryoverData) are also server-sourced, just
+  // relayed through the client from its earlier /ticker/:symbol response
+  // (same pattern as gate1Data/proxyRule/openingBarData above).
+  let carryoverContext = "N/A — Monday/Friday keep their own same-day overlay rule instead.";
+  const decay = carryoverDecayLabel();
+  if (decay && weeklyCarryoverData) {
+    const wc = weeklyCarryoverData;
+    carryoverContext = `Last Friday closed $${wc.fridayClose}, the following Monday (${wc.mondayDate}) closed $${wc.mondayClose} (${wc.reactionPct > 0 ? '+' : ''}${wc.reactionPct}%, ${wc.reaction}). ${decay.sessionsSinceMonday} session(s) removed from that Monday — carryover weight: ${decay.weight}.`;
+  } else if (decay) {
+    carryoverContext = `Weekly carryover data unavailable this run — treat as no additional signal (do not assume a direction).`;
+  }
+
   // ── BUILD METRICS CONTEXT ─────────────────────────────────────────
   let metricsContext = "No metrics data — estimate from training knowledge.";
   if (metricsData) {
@@ -2128,6 +2246,7 @@ Ticker metrics: ${metricsContext}
 News context: ${newsContext}
 Gate 3 bar mode: ${barMode}
 Opening bar context: ${barContext}
+Gate 3 weekly carryover: ${carryoverContext}
 Additional context: ${marketContext || "None"}
 
 Run Gates 2, 3, 4 only. Pre-Gate, Gate 0, Gate 1, and Gate 5 are provided above — copy them exactly.

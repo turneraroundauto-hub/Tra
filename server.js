@@ -419,7 +419,16 @@ const PRE_GATE_TRIGGERS = {
     ],
   },
 };
-const PRE_GATE_FORMS = "8-K,10-Q,10-K";
+// 8-K/10-Q/10-K alone is an operating-company-disclosure-only view. A real
+// coverage gap for the "dilution" category above (Aug 12, 2026): an ATM
+// program, shelf registration, or registered-direct offering is disclosed
+// via a registration statement (S-1/S-3) or its prospectus supplement
+// (424B2/3/4/5) -- these don't always also get a fresh 8-K, especially a
+// periodic draw under an ATM program already set up under an existing
+// shelf. Solvency/guidance-cut language can show up in these forms too
+// (e.g. a going-concern risk factor in a new S-1), so widening the form
+// list benefits every trigger category, not just dilution.
+const PRE_GATE_FORMS = "8-K,10-Q,10-K,S-1,S-3,424B2,424B3,424B4,424B5";
 const PRE_GATE_LOOKBACK_DAYS = 45;
 const PRE_GATE_ESCALATION_WINDOW_DAYS = 30;
 const PRE_GATE_ESCALATION_COUNT = 2;

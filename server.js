@@ -466,6 +466,85 @@ let tickerCikCache = null;
 let tickerCikCacheAt = 0;
 let tickerCikInFlight = null;
 
+// Secondary ticker->CIK map, built from SEC's fund-specific ticker file
+// (company_tickers_mf.json). "mf" = mutual fund, but it maps by the same
+// series/class registration structure most ETFs use too, and covers
+// entries the primary company_tickers.json map above sometimes misses.
+// Root-caused live (Aug 12, 2026): DRAM (Roundhill Memory ETF) kept
+// showing "No SEC CIK found," but it has a real, findable CIK -- 1976517,
+// Roundhill ETF Trust (confirmed via SEC's own EDGAR filing URLs
+// referencing DRAM directly, e.g. an 8-A Cert PDF under
+// /Archives/edgar/data/1976517/.../8A_Cert_DRAM.pdf). DRAM only started
+// trading Apr 2, 2026 -- plausible the primary file's per-ticker coverage
+// for a fund that recently-launched, sharing a trust CIK with many other
+// Roundhill funds, simply hasn't caught up, or was never reliable for
+// this class of security to begin with.
+//
+// Fetched LAZILY -- only the first time a primary-map lookup misses, not
+// eagerly alongside it -- since the overwhelming majority of tickers
+// resolve through the primary map, and eagerly fetching this second,
+// larger, fund-specific file on every cold cache would be pure waste for
+// those.
+//
+// UNVERIFIED against SEC's actual live file -- this sandbox's egress
+// proxy blocks sec.gov outright (confirmed via curl 403 and WebFetch
+// EGRESS_BLOCKED), so this was researched via web search rather than by
+// fetching and inspecting the file directly. Parsed defensively against
+// the documented {fields:[...], data:[[...]]} array shape (same shape as
+// the sibling company_tickers_exchange.json) by looking up field
+// positions by NAME rather than hardcoding indices, and fails safe to
+// null on any shape mismatch. Also worth knowing: PRE_GATE_FORMS is
+// "8-K,10-Q,10-K" -- operating-company forms a fund like DRAM will never
+// file -- so fixing the CIK lookup changes the note from "No SEC CIK
+// found" to "No solvency/dilution/guidance-cut language found," not to
+// an active RED/YELLOW trigger. That's expected: Pre-Gate's trigger
+// categories are operating-company risk concepts that don't really apply
+// to a passively-tracked ETF, so a clean GREEN pass-through is the
+// realistic outcome, not a sign the fix didn't work. Check Render logs
+// for "getCikFromFundMap" errors, or confirm live that DRAM's Pre-Gate
+// note changes after this deploys.
+let fundTickerCikCache = null;
+let fundTickerCikCacheAt = 0;
+let fundTickerCikInFlight = null;
+
+async function getCikFromFundMap(symbol) {
+  const now = Date.now();
+  if (!fundTickerCikCache || now - fundTickerCikCacheAt > 24 * 60 * 60 * 1000) {
+    if (!fundTickerCikInFlight) {
+      fundTickerCikInFlight = (async () => {
+        try {
+          await secThrottle();
+          const res = await fetchWithTimeout("https://www.sec.gov/files/company_tickers_mf.json", {
+            headers: { "User-Agent": SEC_USER_AGENT },
+          }, 8000);
+          if (!res.ok) throw new Error(`SEC company_tickers_mf ${res.status}`);
+          const data = await res.json();
+          const fields = Array.isArray(data.fields) ? data.fields : [];
+          const rows   = Array.isArray(data.data)   ? data.data   : [];
+          const cikIdx    = fields.indexOf("cik");
+          const symbolIdx = fields.indexOf("symbol");
+          const map = {};
+          if (cikIdx !== -1 && symbolIdx !== -1) {
+            rows.forEach(row => {
+              const ticker = row[symbolIdx];
+              if (ticker) map[String(ticker).toUpperCase()] = String(row[cikIdx]).padStart(10, "0");
+            });
+          }
+          fundTickerCikCache = map;
+          fundTickerCikCacheAt = Date.now();
+        } catch (e) {
+          console.error("getCikFromFundMap fetch:", e.message);
+        } finally {
+          fundTickerCikInFlight = null;
+        }
+      })();
+    }
+    await fundTickerCikInFlight;
+    if (!fundTickerCikCache) return null;
+  }
+  return fundTickerCikCache[symbol.toUpperCase()] || null;
+}
+
 async function getCik(symbol) {
   const now = Date.now();
   if (!tickerCikCache || now - tickerCikCacheAt > 24 * 60 * 60 * 1000) {
@@ -492,9 +571,10 @@ async function getCik(symbol) {
       })();
     }
     await tickerCikInFlight;
-    if (!tickerCikCache) return null;
+    if (!tickerCikCache) return getCikFromFundMap(symbol);
   }
-  return tickerCikCache[symbol.toUpperCase()] || null;
+  const primary = tickerCikCache[symbol.toUpperCase()] || null;
+  return primary || getCikFromFundMap(symbol);
 }
 
 async function searchEdgarFilings(cik, keywords) {

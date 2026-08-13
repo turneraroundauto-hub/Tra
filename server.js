@@ -1664,25 +1664,60 @@ function parsePctString(s) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Normalizes a marketData[symbol] entry into {pct, change}. Handles both
+// shapes actually seen in this codebase: a real {price,change,pct,direction}
+// object (the server's own internal marketCache, e.g. generatePulse's input)
+// and a bare "+1.23%"/"-4.5%" string (what every tier's client actually
+// sends as sectorContext[symbol] -- see the parsePctString comment above).
+// Returns null when neither shape yields a usable number, so the caller can
+// filter it out the same way a missing symbol already was.
+function normalizeMarketReading(raw) {
+  if (raw == null) return null;
+  if (typeof raw === "string") {
+    const pct = parsePctString(raw);
+    return pct === null ? null : { pct, change: raw };
+  }
+  if (typeof raw === "object" && typeof raw.pct === "number") {
+    return { pct: raw.pct, change: raw.change };
+  }
+  return null;
+}
+
 // ─── EVALUATE PROXY STATUS ────────────────────────────────────────
+// BUG FIX (Aug 13, 2026): this previously read marketData[symbol].pct
+// directly, assuming an object shape. Every tier's client actually sends
+// sectorContext[symbol] as a bare formatted `.change` string (confirmed
+// while building Proposal 4 -- see CLAUDE.md) -- so `.pct` was always
+// undefined, avgPct was always 0, and this function could NEVER return RED
+// or YELLOW through /analyze, for any ticker, regardless of how far TSM/
+// KOSPI/XBI/etc had actually moved. That's not just Proposal 2's coherence
+// check failing to run (a downstream symptom) -- it means Gate 5's RED
+// hard-trigger itself has never fired via /analyze in production. Fixed by
+// normalizing each reading through normalizeMarketReading() above, which
+// parses the real string wire format (and still accepts an object, so
+// nothing that already passed real objects here breaks). Also fixed a
+// second, smaller latent bug in the same function: changeStr rebuilt symbol
+// labels by re-indexing the post-filter `readings` array against the
+// pre-filter `symbols` array, which mislabels a reading whenever an earlier
+// symbol in a multi-symbol rule (e.g. the TSM+KOSPI combined rule) fails to
+// resolve -- symbol and reading are now kept paired together instead.
 function evaluateProxyStatus(proxyRule, marketData) {
   const symbols = proxyRule.proxy.symbols;
-  const readings = symbols.map(s => {
-    const key = s.toLowerCase();
-    return marketData[key] || null;
-  }).filter(Boolean);
+  const readings = symbols
+    .map(s => ({ symbol: s, reading: normalizeMarketReading(marketData[s.toLowerCase()]) }))
+    .filter(x => x.reading);
 
   if (!readings.length) return { status: "GREEN", note: proxyRule.proxy.rationale };
 
-  const avgPct = readings.reduce((a, b) => a + (b.pct || 0), 0) / readings.length;
-  const anyRedFlag = readings.some(r => (r.pct || 0) <= -3);
+  const avgPct = readings.reduce((a, x) => a + x.reading.pct, 0) / readings.length;
+  const anyRedFlag = readings.some(x => x.reading.pct <= -3);
 
   let status = "GREEN";
   if (anyRedFlag || avgPct <= -3)      status = "RED";
   else if (avgPct <= -1)               status = "YELLOW";
 
-  const changeStr = readings.map((r, i) =>
-    `${symbols[i]} ${r.change || "?"}`).join(", ");
+  const changeStr = readings.map(x =>
+    `${x.symbol} ${x.reading.change || "?"}`).join(", ");
 
   return {
     status,
@@ -2461,6 +2496,30 @@ Current price: $${metricsData.price || "?"}
 `;
   }
 
+  // ── TICKER/PROXY SESSION % CHANGE ───────────────────────────────────
+  // Shared by the Gate 5 Proxy Coherence Check (Proposal 2) below and the
+  // Session Context buildup-pattern check (Proposal 4) further down --
+  // computed once here rather than twice. Deliberately do NOT read
+  // metricsData.pct / sectorContext.<sym>.pct -- every tier's client only
+  // ever sends sectorContext[sym] as the formatted `.change` string (e.g.
+  // "+1.23%"), never a raw `.pct` number, and metricsData never carries a
+  // `.pct` field either, so both are always null/undefined in practice.
+  // That's the BUG FIX (Aug 13, 2026) documented on evaluateProxyStatus()
+  // above -- this is the second half of it: the Coherence Check read the
+  // same two always-null fields, so it never ran either, silently falling
+  // through to the plain forceDown branch every time. Sourced instead from
+  // openingBarData's own bar-1 open->close and a parse of sectorContext's
+  // change strings via parsePctString(), both of which are actually
+  // populated.
+  const tickerPct = (openingBarData && openingBarData.open)
+    ? (openingBarData.close - openingBarData.open) / openingBarData.open * 100
+    : null;
+  const proxyPct = (() => {
+    const syms = (rule.proxy?.symbols || []).map(s => s.toLowerCase());
+    const vals = syms.map(s => parsePctString(sectorContext?.[s])).filter(v => v !== null);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  })();
+
   // ── SESSION CONTEXT CORROBORATION (Proposal 4) ─────────────────────
   // Only runs when the user actually typed something -- see the fetch
   // functions above for why that keeps this free on every other analysis.
@@ -2471,25 +2530,6 @@ Current price: $${metricsData.price || "?"}
       fetchEarningsCalendarFlag(ticker),
     ]);
     const newsMatch = newsBodies.some(body => gx.contextTextMatches(marketContext, body));
-
-    // tickerPct/proxyPct for the buildup pattern's "outperformance" signal
-    // deliberately do NOT reuse metricsData.pct / sectorContext.<sym>.pct --
-    // every tier's client only ever sends sectorContext[sym] as the
-    // formatted `.change` string (e.g. "+1.23%"), never a raw `.pct` number,
-    // so those two fields are always null/undefined in practice. (This also
-    // means the existing Proxy Coherence Check block below, which reads the
-    // same two fields, is dead code today -- a pre-existing bug, not
-    // introduced or fixed by this change, flagged separately.) Sourced
-    // instead from openingBarData's own bar-1 open->close and a parse of
-    // sectorContext's change strings, both of which are actually populated.
-    const tickerPct = (openingBarData && openingBarData.open)
-      ? (openingBarData.close - openingBarData.open) / openingBarData.open * 100
-      : null;
-    const proxyPct = (() => {
-      const syms = (rule.proxy?.symbols || []).map(s => s.toLowerCase());
-      const vals = syms.map(s => parsePctString(sectorContext?.[s])).filter(v => v !== null);
-      return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-    })();
 
     const buildup = gx.buildupPatternCheck({
       volRatio: typeof openingBarData?.volRatio === "number" ? openingBarData.volRatio : null,
@@ -2661,8 +2701,15 @@ Return only JSON.
         // Korea/Taiwan case, run the Proxy Coherence Check (Proposal 2)
         // first — a decoupled/lagging ticker downgrades to an unconfirmed
         // label instead of forcing DOWN blind.
-        if (tickerGating.length && metricsData?.pct != null && sectorContext?.tsm?.pct != null) {
-          const coherence = gx.proxyCoherenceCheck(metricsData.pct, sectorContext.tsm.pct);
+        // BUG FIX (Aug 13, 2026): this condition/call used to read
+        // metricsData.pct and sectorContext.tsm.pct directly — both are
+        // always null/undefined given the real client payload shape (see
+        // the tickerPct/proxyPct comment above), so this branch never
+        // actually ran; every RED-and-authorized case fell through to the
+        // plain forceDown else below instead. Now uses tickerPct/proxyPct,
+        // computed once above from data that's actually populated.
+        if (tickerGating.length && tickerPct != null && proxyPct != null) {
+          const coherence = gx.proxyCoherenceCheck(tickerPct, proxyPct);
           // proxyCoherenceCheck() returns 'HOLD' for case 3 (possible
           // decoupling) — the project's terminology rule restricts the
           // verdict field to UP|DOWN|FLAT only, so map it here. The fuller

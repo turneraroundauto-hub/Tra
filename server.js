@@ -1778,6 +1778,82 @@ async function saveProxyResolution(symbol, resolved, trigger) {
   }
 }
 
+// ─── PROPOSAL 3 — FIXED-PROXY REGIME VALIDATION (Aug 13, 2026) ────────
+// gates-extended.js's regimeValidation()/resolveFixedProxyBreak() have
+// existed since Patch 4 but were never wired up -- they need a place to
+// persist state on a weekly cadence (lighter than Patch 2's quarterly
+// dynamic-proxy recompute above, since this is a health check on the fixed
+// Taiwan/Korea proxy assignment itself, not a full re-derivation). Same
+// shape as proxy_resolution above: gracefully no-ops (always returns null,
+// meaning "no regime signal, proceed normally" to hasForceDownAuthority) if
+// Supabase isn't configured or the table doesn't exist yet.
+const REGIME_RECOMPUTE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // weekly
+
+async function getCachedRegimeState(symbol) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from("proxy_regime_state")
+      .select("*")
+      .eq("ticker", symbol)
+      .maybeSingle();
+    if (error || !data) return null;
+    const ageMs = Date.now() - new Date(data.computed_at).getTime();
+    if (ageMs > REGIME_RECOMPUTE_MAX_AGE_MS) return null;
+    return data;
+  } catch (e) {
+    console.error(`getCachedRegimeState ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+async function saveRegimeState(symbol, result) {
+  if (!supabase) return;
+  try {
+    await supabase.from("proxy_regime_state").upsert({
+      ticker:      symbol,
+      state:       result.state,
+      action:      result.action,
+      rolling_r:   result.rolling ?? null,
+      baseline_r:  result.baseline ?? null,
+      computed_at: new Date().toISOString(),
+    }, { onConflict: "ticker" });
+  } catch (e) {
+    console.error(`saveRegimeState ${symbol}:`, e.message);
+  }
+}
+
+// Caller (refreshMarketEntry) only invokes this for tickers whose STATIC
+// classification is the fixed Taiwan/Korea rule -- a dynamically-resolved
+// proxy already gets re-validated on its own quarterly cadence
+// (resolveGate5's GATE5_RECOMPUTE_MAX_AGE_MS above), so this doesn't apply
+// there. tickerCloses is the ticker's own ascending daily closes (already
+// fetched by refreshMarketEntry for Gate 1 -- reused here, no extra fetch);
+// the proxy's own closes (TSM) are fetched fresh only on a cache miss, so
+// this adds an Alpaca call at most once a week per gated ticker, never on
+// every /ticker/:symbol refresh.
+async function resolveProxyRegime(symbol, tickerCloses) {
+  if (!tickerCloses) return null;
+
+  const cached = await getCachedRegimeState(symbol);
+  if (cached) {
+    const checkedDate = new Date(cached.computed_at).toLocaleDateString("en-US",
+      { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" });
+    return {
+      state: cached.state, action: cached.action,
+      rolling: cached.rolling_r, baseline: cached.baseline_r,
+      note: `Cached weekly regime check (${checkedDate}): ${cached.state}.`,
+    };
+  }
+
+  const proxyCloses = await fetchDailyCloses("TSM", 130);
+  if (!proxyCloses) return null;
+
+  const result = gx.regimeValidation(tickerCloses, proxyCloses);
+  if (result.state !== "UNKNOWN") await saveRegimeState(symbol, result);
+  return result;
+}
+
 // Maps a resolveFixedProxyBreak()-shaped result (fresh or reconstructed from
 // a cached row) into a proxyRule-compatible object: evaluateProxyStatus() can
 // consume it unchanged (reads rule.proxy.symbols/name/rationale), and /analyze
@@ -1814,9 +1890,21 @@ function buildDynamicProxyRule(resolved) {
   };
 }
 
-async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute) {
+// regime (optional 5th param, Proposal 3, Aug 13 2026): the caller's
+// already-resolved weekly regime check for a fixed Taiwan/Korea ticker (null
+// for every other ticker's classification). A BROKEN regime strips the
+// static rule's authority to stay fixed -- falls through to the Dynamic
+// Proxy Resolution Algorithm below exactly like a DEFAULT_PROXY ticker,
+// instead of returning the static rule unconditionally. This is the
+// "graduates into the dynamic system, triggered by breakdown instead of
+// onboarding" fallback the proposal describes. Every other static category
+// (Biotech/XBI, Defense/LMT, etc.) has no regime tracking at all -- Proposal
+// 3 only ever validates the Taiwan/Korea rule -- so `regime` is always null
+// for them and this is a no-op.
+async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regime) {
   const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
-  if (staticRule !== DEFAULT_PROXY) {
+  const regimeBroken = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor" && regime?.state === "BROKEN";
+  if (staticRule !== DEFAULT_PROXY && !regimeBroken) {
     return { ...staticRule, tier: "primary", forceDownAuthority: false, dynamicallyResolved: false };
   }
 
@@ -2270,11 +2358,21 @@ async function refreshMarketEntry(symbol, hardTrigger = false) {
   const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
   const weeklyCarryover = carryoverRes.status === "fulfilled" ? carryoverRes.value : null;
 
-  // Gate 5 — static classification, falling through to the Dynamic Proxy
-  // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
-  const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, hardTrigger);
+  // Proposal 3 — weekly health check on a FIXED Taiwan/Korea proxy
+  // assignment (no-op / null for every other ticker's classification).
+  // Computed BEFORE resolveGate5 below so a BROKEN regime can steer that
+  // function's own static-vs-dynamic branch, and so both the response and
+  // resolveGate5 share one regime value instead of resolving it twice.
+  const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
+  const isFixedTaiwanKorea = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor";
+  const regime = isFixedTaiwanKorea ? await resolveProxyRegime(symbol, dailyCloses) : null;
 
-  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover }, time: Date.now() };
+  // Gate 5 — static classification, falling through to the Dynamic Proxy
+  // Resolution Algorithm (correlation + fundamentals loop) when ambiguous,
+  // or when the regime check above says the fixed proxy has gone BROKEN.
+  const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, hardTrigger, regime);
+
+  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover, regime }, time: Date.now() };
   symbolMarketCache.set(symbol, marketEntry);
   return marketEntry;
 }
@@ -2330,7 +2428,7 @@ app.get("/ticker/:symbol", async (req, res) => {
     const marketStale = !marketEntry ||
       (isMarketDataWindow() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
     if (marketStale) marketEntry = await refreshMarketEntry(symbol, preGate.hardTrigger);
-    const { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover } = marketEntry.data;
+    const { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover, regime } = marketEntry.data;
 
     // Server-enforced Gate 1 — pure/cheap derivation from dailyCloses, so it's
     // recomputed on every request (cache hit or not) rather than stored,
@@ -2344,7 +2442,7 @@ app.get("/ticker/:symbol", async (req, res) => {
     // doesn't need to ride on the same invalidation rule as the rest.
     const iv = req.tierConfig?.iv ? await fetchImpliedVolatility(symbol, metrics?.price) : null;
 
-    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, timestamp: new Date().toISOString() });
+    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, regime, timestamp: new Date().toISOString() });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -2374,7 +2472,7 @@ function setCache(key, data) {
 
 // ─── ANALYZE ──────────────────────────────────────────────────────
 app.post("/analyze", async (req, res) => {
-  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData } = req.body;
+  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData } = req.body;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
@@ -2677,11 +2775,14 @@ Return only JSON.
       // together — KOSPI itself isn't in the /market tracked symbol set, so
       // in practice only the Taiwan (TSM) leg is checkable; Korea gating is
       // registered for when a live KOSPI feed is wired.
-      // Proposal 3 (regimeValidation) is NOT wired yet — it needs its own
-      // weekly-cadence persistence layer (flagged, not built, this pass).
-      // regime stays null; hasForceDownAuthority treats that as "no regime
-      // signal, proceed normally."
-      const regime = null;
+      // Proposal 3 (Aug 13, 2026): regimeData is computed server-side once
+      // in refreshMarketEntry()/resolveProxyRegime() on a weekly cadence
+      // (proxy_regime_state table) and relayed through here untouched, same
+      // pattern as gate1Data/weeklyCarryoverData above — never recalculated
+      // by the LLM. null (no regime signal, e.g. a non-fixed-proxy ticker,
+      // or Supabase not configured) is treated by hasForceDownAuthority()
+      // as "proceed normally," same as before this was wired up.
+      const regime = regimeData || null;
       const tickerGating = (!rule.dynamicallyResolved && rule.category === "AI/Semiconductor")
         ? ["ai-semi-gated", "korea-gated"]
         : [];

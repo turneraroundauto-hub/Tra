@@ -838,6 +838,12 @@ Step 3: Check congruency with ticker classification:
 Step 4: Fund performance reviews, general market commentary, and index rebalancing
   reports are NOT company-specific catalysts. Treat as NEUTRAL unless they contain
   specific guidance or material information about the ticker.
+Step 5: A "Session Context corroboration" block is provided below (Proposal 4,
+  Aug 13 2026). This is server-computed, not your own judgment call — copy its
+  conclusion exactly. If it says CONTEXT-CORROBORATED, treat the user-typed
+  Session Context as real Gate 2 evidence, weighted the same as the news
+  catalyst above. If it says uncorroborated, the typed context is informational
+  only — do not let it move your GREEN/YELLOW/RED classification.
 
 GATE 3 — MEAN REVERSION + 3-BAR SEQUENCE
 
@@ -1575,25 +1581,143 @@ async function fetchNews(symbol) {
   return alpaca.ageHours <= finnhub.ageHours ? alpaca : finnhub;
 }
 
+// ─── PROPOSAL 4 — CONTEXT-WEIGHTED GATE 2 CORROBORATION (Aug 13, 2026) ────
+// Session Context (the free-text textarea every tier already sends as
+// marketContext) previously had zero backend awareness at all -- purely a
+// client-side keyword-highlight cosmetic (shared/context-highlight.js).
+// Both functions below are only ever called when the user actually typed
+// something into it (see the /analyze corroboration block), so they add
+// zero extra Alpaca/Finnhub call volume on the common case of an analysis
+// run with Session Context left blank -- same "lazy, cost only on real use"
+// posture as the SEC CIK fallback tiers.
+
+function stripHtmlForCorroboration(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ");
+}
+
+// Full-body article text for the news-content-match corroboration source --
+// fetchNews()/newsData above only ever carries a headline, too short for a
+// reliable 2-distinct-word overlap match. Queries both sources directly
+// (not the newsData already on the request, which is headline-only) and
+// pools every recent article's text rather than just the single newest one,
+// since the corroborating article need not be the most recent headline.
+// UNVERIFIED AGAINST LIVE ALPACA ENTITLEMENT for the `content` field
+// specifically -- same posture as fetchAlpacaNews above; falls back to
+// `summary`/headline on any shape mismatch, never throws.
+async function fetchNewsBodiesForCorroboration(symbol) {
+  const now    = new Date();
+  const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
+  const bodies = [];
+  try {
+    if (alpacaKeys()) {
+      const data = await alpacaGet(
+        `/v1beta1/news?symbols=${symbol}&start=${cutoff.toISOString()}&end=${now.toISOString()}&limit=10&sort=desc`
+      );
+      const articles = Array.isArray(data?.news) ? data.news : [];
+      articles.forEach(a => {
+        const text = stripHtmlForCorroboration(a.content || a.summary || a.headline || "");
+        if (text.trim()) bodies.push(text);
+      });
+    }
+  } catch (e) { console.error(`fetchNewsBodiesForCorroboration alpaca ${symbol}:`, e.message); }
+  try {
+    const from = cutoff.toISOString().split("T")[0];
+    const to   = now.toISOString().split("T")[0];
+    const data = await finnhubGet(`/company-news?symbol=${symbol}&from=${from}&to=${to}`);
+    if (Array.isArray(data)) {
+      data.forEach(a => {
+        const text = stripHtmlForCorroboration(a.summary || a.headline || "");
+        if (text.trim()) bodies.push(text);
+      });
+    }
+  } catch (e) { console.error(`fetchNewsBodiesForCorroboration finnhub ${symbol}:`, e.message); }
+  return bodies;
+}
+
+// Corroboration source 3: a real dated calendar event. Silent/boolean only
+// -- true if the ticker has an earnings date within a window around today,
+// false if the call succeeds with none, null on any fetch error (treated as
+// "not corroborated" by corroborateSessionContext, never as a false
+// positive). Routed through finnhubGet()/finnhubThrottle() like every other
+// Finnhub call in this file.
+async function fetchEarningsCalendarFlag(symbol) {
+  try {
+    const now  = new Date();
+    const from = new Date(now.getTime() - 3 * 86400000).toISOString().split("T")[0];
+    const to   = new Date(now.getTime() + 14 * 86400000).toISOString().split("T")[0];
+    const data = await finnhubGet(`/calendar/earnings?symbol=${symbol}&from=${from}&to=${to}`);
+    const items = data?.earningsCalendar;
+    return Array.isArray(items) && items.length > 0;
+  } catch (e) {
+    console.error(`fetchEarningsCalendarFlag ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+// Parses a formatted "+1.23%"/"-4.5%" string (the shape sectorContext's
+// per-symbol fields actually arrive in from every tier's client -- see the
+// corroboration block in /analyze for why this is used instead of the
+// .pct-object shape some existing code elsewhere assumes) into a number.
+function parsePctString(s) {
+  if (typeof s !== "string") return null;
+  const n = parseFloat(s.replace("%", ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Normalizes a marketData[symbol] entry into {pct, change}. Handles both
+// shapes actually seen in this codebase: a real {price,change,pct,direction}
+// object (the server's own internal marketCache, e.g. generatePulse's input)
+// and a bare "+1.23%"/"-4.5%" string (what every tier's client actually
+// sends as sectorContext[symbol] -- see the parsePctString comment above).
+// Returns null when neither shape yields a usable number, so the caller can
+// filter it out the same way a missing symbol already was.
+function normalizeMarketReading(raw) {
+  if (raw == null) return null;
+  if (typeof raw === "string") {
+    const pct = parsePctString(raw);
+    return pct === null ? null : { pct, change: raw };
+  }
+  if (typeof raw === "object" && typeof raw.pct === "number") {
+    return { pct: raw.pct, change: raw.change };
+  }
+  return null;
+}
+
 // ─── EVALUATE PROXY STATUS ────────────────────────────────────────
+// BUG FIX (Aug 13, 2026): this previously read marketData[symbol].pct
+// directly, assuming an object shape. Every tier's client actually sends
+// sectorContext[symbol] as a bare formatted `.change` string (confirmed
+// while building Proposal 4 -- see CLAUDE.md) -- so `.pct` was always
+// undefined, avgPct was always 0, and this function could NEVER return RED
+// or YELLOW through /analyze, for any ticker, regardless of how far TSM/
+// KOSPI/XBI/etc had actually moved. That's not just Proposal 2's coherence
+// check failing to run (a downstream symptom) -- it means Gate 5's RED
+// hard-trigger itself has never fired via /analyze in production. Fixed by
+// normalizing each reading through normalizeMarketReading() above, which
+// parses the real string wire format (and still accepts an object, so
+// nothing that already passed real objects here breaks). Also fixed a
+// second, smaller latent bug in the same function: changeStr rebuilt symbol
+// labels by re-indexing the post-filter `readings` array against the
+// pre-filter `symbols` array, which mislabels a reading whenever an earlier
+// symbol in a multi-symbol rule (e.g. the TSM+KOSPI combined rule) fails to
+// resolve -- symbol and reading are now kept paired together instead.
 function evaluateProxyStatus(proxyRule, marketData) {
   const symbols = proxyRule.proxy.symbols;
-  const readings = symbols.map(s => {
-    const key = s.toLowerCase();
-    return marketData[key] || null;
-  }).filter(Boolean);
+  const readings = symbols
+    .map(s => ({ symbol: s, reading: normalizeMarketReading(marketData[s.toLowerCase()]) }))
+    .filter(x => x.reading);
 
   if (!readings.length) return { status: "GREEN", note: proxyRule.proxy.rationale };
 
-  const avgPct = readings.reduce((a, b) => a + (b.pct || 0), 0) / readings.length;
-  const anyRedFlag = readings.some(r => (r.pct || 0) <= -3);
+  const avgPct = readings.reduce((a, x) => a + x.reading.pct, 0) / readings.length;
+  const anyRedFlag = readings.some(x => x.reading.pct <= -3);
 
   let status = "GREEN";
   if (anyRedFlag || avgPct <= -3)      status = "RED";
   else if (avgPct <= -1)               status = "YELLOW";
 
-  const changeStr = readings.map((r, i) =>
-    `${symbols[i]} ${r.change || "?"}`).join(", ");
+  const changeStr = readings.map(x =>
+    `${x.symbol} ${x.reading.change || "?"}`).join(", ");
 
   return {
     status,
@@ -1654,6 +1778,82 @@ async function saveProxyResolution(symbol, resolved, trigger) {
   }
 }
 
+// ─── PROPOSAL 3 — FIXED-PROXY REGIME VALIDATION (Aug 13, 2026) ────────
+// gates-extended.js's regimeValidation()/resolveFixedProxyBreak() have
+// existed since Patch 4 but were never wired up -- they need a place to
+// persist state on a weekly cadence (lighter than Patch 2's quarterly
+// dynamic-proxy recompute above, since this is a health check on the fixed
+// Taiwan/Korea proxy assignment itself, not a full re-derivation). Same
+// shape as proxy_resolution above: gracefully no-ops (always returns null,
+// meaning "no regime signal, proceed normally" to hasForceDownAuthority) if
+// Supabase isn't configured or the table doesn't exist yet.
+const REGIME_RECOMPUTE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // weekly
+
+async function getCachedRegimeState(symbol) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from("proxy_regime_state")
+      .select("*")
+      .eq("ticker", symbol)
+      .maybeSingle();
+    if (error || !data) return null;
+    const ageMs = Date.now() - new Date(data.computed_at).getTime();
+    if (ageMs > REGIME_RECOMPUTE_MAX_AGE_MS) return null;
+    return data;
+  } catch (e) {
+    console.error(`getCachedRegimeState ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+async function saveRegimeState(symbol, result) {
+  if (!supabase) return;
+  try {
+    await supabase.from("proxy_regime_state").upsert({
+      ticker:      symbol,
+      state:       result.state,
+      action:      result.action,
+      rolling_r:   result.rolling ?? null,
+      baseline_r:  result.baseline ?? null,
+      computed_at: new Date().toISOString(),
+    }, { onConflict: "ticker" });
+  } catch (e) {
+    console.error(`saveRegimeState ${symbol}:`, e.message);
+  }
+}
+
+// Caller (refreshMarketEntry) only invokes this for tickers whose STATIC
+// classification is the fixed Taiwan/Korea rule -- a dynamically-resolved
+// proxy already gets re-validated on its own quarterly cadence
+// (resolveGate5's GATE5_RECOMPUTE_MAX_AGE_MS above), so this doesn't apply
+// there. tickerCloses is the ticker's own ascending daily closes (already
+// fetched by refreshMarketEntry for Gate 1 -- reused here, no extra fetch);
+// the proxy's own closes (TSM) are fetched fresh only on a cache miss, so
+// this adds an Alpaca call at most once a week per gated ticker, never on
+// every /ticker/:symbol refresh.
+async function resolveProxyRegime(symbol, tickerCloses) {
+  if (!tickerCloses) return null;
+
+  const cached = await getCachedRegimeState(symbol);
+  if (cached) {
+    const checkedDate = new Date(cached.computed_at).toLocaleDateString("en-US",
+      { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" });
+    return {
+      state: cached.state, action: cached.action,
+      rolling: cached.rolling_r, baseline: cached.baseline_r,
+      note: `Cached weekly regime check (${checkedDate}): ${cached.state}.`,
+    };
+  }
+
+  const proxyCloses = await fetchDailyCloses("TSM", 130);
+  if (!proxyCloses) return null;
+
+  const result = gx.regimeValidation(tickerCloses, proxyCloses);
+  if (result.state !== "UNKNOWN") await saveRegimeState(symbol, result);
+  return result;
+}
+
 // Maps a resolveFixedProxyBreak()-shaped result (fresh or reconstructed from
 // a cached row) into a proxyRule-compatible object: evaluateProxyStatus() can
 // consume it unchanged (reads rule.proxy.symbols/name/rationale), and /analyze
@@ -1690,9 +1890,21 @@ function buildDynamicProxyRule(resolved) {
   };
 }
 
-async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute) {
+// regime (optional 5th param, Proposal 3, Aug 13 2026): the caller's
+// already-resolved weekly regime check for a fixed Taiwan/Korea ticker (null
+// for every other ticker's classification). A BROKEN regime strips the
+// static rule's authority to stay fixed -- falls through to the Dynamic
+// Proxy Resolution Algorithm below exactly like a DEFAULT_PROXY ticker,
+// instead of returning the static rule unconditionally. This is the
+// "graduates into the dynamic system, triggered by breakdown instead of
+// onboarding" fallback the proposal describes. Every other static category
+// (Biotech/XBI, Defense/LMT, etc.) has no regime tracking at all -- Proposal
+// 3 only ever validates the Taiwan/Korea rule -- so `regime` is always null
+// for them and this is a no-op.
+async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regime) {
   const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
-  if (staticRule !== DEFAULT_PROXY) {
+  const regimeBroken = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor" && regime?.state === "BROKEN";
+  if (staticRule !== DEFAULT_PROXY && !regimeBroken) {
     return { ...staticRule, tier: "primary", forceDownAuthority: false, dynamicallyResolved: false };
   }
 
@@ -2146,11 +2358,21 @@ async function refreshMarketEntry(symbol, hardTrigger = false) {
   const dailyCloses = gate1Res.status   === "fulfilled" ? gate1Res.value   : null; // ascending closes, Patch 4
   const weeklyCarryover = carryoverRes.status === "fulfilled" ? carryoverRes.value : null;
 
-  // Gate 5 — static classification, falling through to the Dynamic Proxy
-  // Resolution Algorithm (correlation + fundamentals loop) when ambiguous.
-  const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, hardTrigger);
+  // Proposal 3 — weekly health check on a FIXED Taiwan/Korea proxy
+  // assignment (no-op / null for every other ticker's classification).
+  // Computed BEFORE resolveGate5 below so a BROKEN regime can steer that
+  // function's own static-vs-dynamic branch, and so both the response and
+  // resolveGate5 share one regime value instead of resolving it twice.
+  const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
+  const isFixedTaiwanKorea = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor";
+  const regime = isFixedTaiwanKorea ? await resolveProxyRegime(symbol, dailyCloses) : null;
 
-  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover }, time: Date.now() };
+  // Gate 5 — static classification, falling through to the Dynamic Proxy
+  // Resolution Algorithm (correlation + fundamentals loop) when ambiguous,
+  // or when the regime check above says the fixed proxy has gone BROKEN.
+  const proxyRule = await resolveGate5(symbol, metrics, dailyCloses, hardTrigger, regime);
+
+  const marketEntry = { data: { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover, regime }, time: Date.now() };
   symbolMarketCache.set(symbol, marketEntry);
   return marketEntry;
 }
@@ -2206,7 +2428,7 @@ app.get("/ticker/:symbol", async (req, res) => {
     const marketStale = !marketEntry ||
       (isMarketDataWindow() && Date.now() - marketEntry.time >= tierCacheMinutes * 60 * 1000);
     if (marketStale) marketEntry = await refreshMarketEntry(symbol, preGate.hardTrigger);
-    const { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover } = marketEntry.data;
+    const { metrics, openingBar, dailyCloses, proxyRule, weeklyCarryover, regime } = marketEntry.data;
 
     // Server-enforced Gate 1 — pure/cheap derivation from dailyCloses, so it's
     // recomputed on every request (cache hit or not) rather than stored,
@@ -2220,7 +2442,7 @@ app.get("/ticker/:symbol", async (req, res) => {
     // doesn't need to ride on the same invalidation rule as the rest.
     const iv = req.tierConfig?.iv ? await fetchImpliedVolatility(symbol, metrics?.price) : null;
 
-    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, timestamp: new Date().toISOString() });
+    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, regime, timestamp: new Date().toISOString() });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -2250,7 +2472,7 @@ function setCache(key, data) {
 
 // ─── ANALYZE ──────────────────────────────────────────────────────
 app.post("/analyze", async (req, res) => {
-  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData } = req.body;
+  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData } = req.body;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
@@ -2372,6 +2594,50 @@ Current price: $${metricsData.price || "?"}
 `;
   }
 
+  // ── TICKER/PROXY SESSION % CHANGE ───────────────────────────────────
+  // Shared by the Gate 5 Proxy Coherence Check (Proposal 2) below and the
+  // Session Context buildup-pattern check (Proposal 4) further down --
+  // computed once here rather than twice. Deliberately do NOT read
+  // metricsData.pct / sectorContext.<sym>.pct -- every tier's client only
+  // ever sends sectorContext[sym] as the formatted `.change` string (e.g.
+  // "+1.23%"), never a raw `.pct` number, and metricsData never carries a
+  // `.pct` field either, so both are always null/undefined in practice.
+  // That's the BUG FIX (Aug 13, 2026) documented on evaluateProxyStatus()
+  // above -- this is the second half of it: the Coherence Check read the
+  // same two always-null fields, so it never ran either, silently falling
+  // through to the plain forceDown branch every time. Sourced instead from
+  // openingBarData's own bar-1 open->close and a parse of sectorContext's
+  // change strings via parsePctString(), both of which are actually
+  // populated.
+  const tickerPct = (openingBarData && openingBarData.open)
+    ? (openingBarData.close - openingBarData.open) / openingBarData.open * 100
+    : null;
+  const proxyPct = (() => {
+    const syms = (rule.proxy?.symbols || []).map(s => s.toLowerCase());
+    const vals = syms.map(s => parsePctString(sectorContext?.[s])).filter(v => v !== null);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  })();
+
+  // ── SESSION CONTEXT CORROBORATION (Proposal 4) ─────────────────────
+  // Only runs when the user actually typed something -- see the fetch
+  // functions above for why that keeps this free on every other analysis.
+  let contextCorroboration = null;
+  if (marketContext && marketContext.trim().length > 0) {
+    const [newsBodies, hasEarningsEvent] = await Promise.all([
+      fetchNewsBodiesForCorroboration(ticker),
+      fetchEarningsCalendarFlag(ticker),
+    ]);
+    const newsMatch = newsBodies.some(body => gx.contextTextMatches(marketContext, body));
+
+    const buildup = gx.buildupPatternCheck({
+      volRatio: typeof openingBarData?.volRatio === "number" ? openingBarData.volRatio : null,
+      tickerPct, proxyPct,
+      hasFreshNews: !!(newsData && newsData.ageHours <= 24),
+    });
+
+    contextCorroboration = gx.corroborateSessionContext({ newsMatch, buildup, hasEarningsEvent });
+  }
+
   const userMessage = `
 Analyze ${ticker.toUpperCase()}.
 
@@ -2406,6 +2672,7 @@ Gate 3 bar mode: ${barMode}
 Opening bar context: ${barContext}
 Gate 3 weekly carryover: ${carryoverContext}
 Additional context: ${marketContext || "None"}
+Session Context corroboration: ${contextCorroboration ? contextCorroboration.note : "N/A — no Session Context provided."}
 
 Run Gates 2, 3, 4 only. Pre-Gate, Gate 0, Gate 1, and Gate 5 are provided above — copy them exactly.
 Return only JSON.
@@ -2451,6 +2718,20 @@ Return only JSON.
       // ── SERVER ENFORCEMENT: Gate 5 ────────────────────────────────
       parsed.gates.g5_korea = { status: gate5Result.status, note: gate5Result.note };
 
+      // ── SERVER ENFORCEMENT: Session Context corroboration (Proposal 4) ──
+      // Corroboration state is server-computed (not left to the model's own
+      // judgment, same "PRE-DETERMINED, copy exactly" posture as the gates
+      // above) and attached to the response as its own field, plus appended
+      // to Gate 2's note so it's visible with zero frontend change -- every
+      // tier's card already renders gate.note verbatim.
+      if (contextCorroboration && parsed.gates?.g2_catalyst) {
+        parsed.contextCorroboration = contextCorroboration;
+        const tag = contextCorroboration.corroborated
+          ? ` [Session Context: CONTEXT-CORROBORATED, ${contextCorroboration.matchCount}/3]`
+          : ` [Session Context: uncorroborated, informational only]`;
+        parsed.gates.g2_catalyst.note = (parsed.gates.g2_catalyst.note || "") + tag;
+      }
+
       // ── SERVER ENFORCEMENT: Pre-Gate forceDown ────────────────────
       // No corroboration required — solvency/dilution/guidance-cut risk has
       // override authority equivalent to Gate 0 RED. This is a hard
@@ -2494,11 +2775,14 @@ Return only JSON.
       // together — KOSPI itself isn't in the /market tracked symbol set, so
       // in practice only the Taiwan (TSM) leg is checkable; Korea gating is
       // registered for when a live KOSPI feed is wired.
-      // Proposal 3 (regimeValidation) is NOT wired yet — it needs its own
-      // weekly-cadence persistence layer (flagged, not built, this pass).
-      // regime stays null; hasForceDownAuthority treats that as "no regime
-      // signal, proceed normally."
-      const regime = null;
+      // Proposal 3 (Aug 13, 2026): regimeData is computed server-side once
+      // in refreshMarketEntry()/resolveProxyRegime() on a weekly cadence
+      // (proxy_regime_state table) and relayed through here untouched, same
+      // pattern as gate1Data/weeklyCarryoverData above — never recalculated
+      // by the LLM. null (no regime signal, e.g. a non-fixed-proxy ticker,
+      // or Supabase not configured) is treated by hasForceDownAuthority()
+      // as "proceed normally," same as before this was wired up.
+      const regime = regimeData || null;
       const tickerGating = (!rule.dynamicallyResolved && rule.category === "AI/Semiconductor")
         ? ["ai-semi-gated", "korea-gated"]
         : [];
@@ -2518,8 +2802,15 @@ Return only JSON.
         // Korea/Taiwan case, run the Proxy Coherence Check (Proposal 2)
         // first — a decoupled/lagging ticker downgrades to an unconfirmed
         // label instead of forcing DOWN blind.
-        if (tickerGating.length && metricsData?.pct != null && sectorContext?.tsm?.pct != null) {
-          const coherence = gx.proxyCoherenceCheck(metricsData.pct, sectorContext.tsm.pct);
+        // BUG FIX (Aug 13, 2026): this condition/call used to read
+        // metricsData.pct and sectorContext.tsm.pct directly — both are
+        // always null/undefined given the real client payload shape (see
+        // the tickerPct/proxyPct comment above), so this branch never
+        // actually ran; every RED-and-authorized case fell through to the
+        // plain forceDown else below instead. Now uses tickerPct/proxyPct,
+        // computed once above from data that's actually populated.
+        if (tickerGating.length && tickerPct != null && proxyPct != null) {
+          const coherence = gx.proxyCoherenceCheck(tickerPct, proxyPct);
           // proxyCoherenceCheck() returns 'HOLD' for case 3 (possible
           // decoupling) — the project's terminology rule restricts the
           // verdict field to UP|DOWN|FLAT only, so map it here. The fuller

@@ -282,6 +282,92 @@ function hasForceDownAuthority(gateKey, tickerGating, regime) {
   return { authorized: true, reason: entry.reason };
 }
 
+/* ---------- 6. Proposal 4 — Context-Weighted Gate 2 Corroboration ---------- */
+
+// Same word set and 2-distinct-word-overlap threshold as
+// shared/context-highlight.js's highlightContextMatches() on the frontend --
+// kept in lockstep on purpose so "corroborated" here and "highlighted" there
+// always agree on what counts as a real topical match, not two independently
+// tuned heuristics that can silently drift apart.
+const CONTEXT_STOPWORDS = new Set(['a','an','the','and','or','but','if','of','in','on','for','to','with','at','by','from','as',
+  'is','are','was','were','be','been','being','it','its','this','that','these','those','after','before','over','under',
+  'into','out','up','down','than','then','so','not','no','yes','has','have','had','will','would','could','should','can',
+  'may','might','must','more','most','also','still','just','now','new','via','their','his','her','your','you','we','our']);
+
+function tokenizeContext(text) {
+  return (text || '').toLowerCase().match(/[a-z0-9$%]+/g) || [];
+}
+
+function contextTextMatches(contextText, bodyText) {
+  const ctxWords = new Set(tokenizeContext(contextText).filter(function (w) { return w.length > 2 && !CONTEXT_STOPWORDS.has(w); }));
+  if (ctxWords.size < 2) return false;
+  const bodyWords = new Set(tokenizeContext(bodyText));
+  let matches = 0;
+  bodyWords.forEach(function (w) { if (ctxWords.has(w)) matches++; });
+  return matches >= 2;
+}
+
+/**
+ * "Pre-Catalyst Buildup" composite, per Proposal 4's own definition: sustained
+ * volume 1.5x+, sector-proxy outperformance, no fresh material news yet
+ * priced, and clean earnings-reaction history. The last of those has no data
+ * source anywhere in this app -- no per-ticker earnings-day price-reaction
+ * history is tracked -- so it's deliberately NOT faked or approximated here;
+ * this checks only the first three. Requires every one of THOSE that's
+ * actually computable to agree, and at least 2 of the 3 to be computable at
+ * all, so a single available signal (most often just "no fresh news," which
+ * is true on most days regardless of any real buildup) can never carry the
+ * pattern by itself.
+ */
+function buildupPatternCheck(input) {
+  input = input || {};
+  const signals = [];
+  if (typeof input.volRatio === 'number') signals.push(input.volRatio >= 1.5);
+  if (typeof input.tickerPct === 'number' && typeof input.proxyPct === 'number') {
+    // "Outperformance" read as magnitude, not direction: the ticker's own
+    // session move exceeds its resolved Gate 5 proxy's move -- i.e.
+    // something ticker-specific is in play beyond generic sector drift.
+    signals.push(Math.abs(input.tickerPct) > Math.abs(input.proxyPct));
+  }
+  signals.push(!input.hasFreshNews);
+  const usable = signals.length;
+  const confirmed = signals.filter(Boolean).length;
+  const ok = usable >= 2 && confirmed === usable;
+  return {
+    ok: ok, usable: usable, confirmed: confirmed,
+    note: 'Buildup pattern: ' + confirmed + '/' + usable + ' available signal(s) agree' +
+          (usable < 2 ? ' (insufficient data for this ticker)' : '') + '. ' +
+          'Earnings-reaction-history sub-signal omitted -- no historical data source exists for it yet.'
+  };
+}
+
+const CONTEXT_CORROBORATION_THRESHOLD = 2;
+
+/**
+ * Session Context is an unverified user claim, not a fact. >=2 of 3
+ * independent sources agreeing promotes it to a CONTEXT-CORROBORATED
+ * modifier on Gate 2; fewer than 2 leaves it visible (existing client-side
+ * highlight behavior unchanged) but verdict-inert.
+ */
+function corroborateSessionContext(input) {
+  input = input || {};
+  const sources = [
+    { key: 'news_content_match',      ok: !!input.newsMatch },
+    { key: 'gate3_buildup_pattern',   ok: !!(input.buildup && input.buildup.ok) },
+    { key: 'earnings_calendar_event', ok: input.hasEarningsEvent === true }
+  ];
+  const matchCount = sources.filter(function (s) { return s.ok; }).length;
+  const corroborated = matchCount >= CONTEXT_CORROBORATION_THRESHOLD;
+  const matchedLabels = sources.filter(function (s) { return s.ok; }).map(function (s) { return s.key; });
+  return {
+    corroborated: corroborated, matchCount: matchCount, sources: sources, matchedLabels: matchedLabels,
+    modifier: corroborated ? 'CONTEXT-CORROBORATED' : null,
+    note: corroborated
+      ? 'Session Context CONTEXT-CORROBORATED (' + matchCount + '/3: ' + matchedLabels.join(', ') + ').'
+      : 'Session Context uncorroborated (' + matchCount + '/3) -- informational only, not weighted in verdict.'
+  };
+}
+
 module.exports = {
   evaluateGate1Sessions: evaluateGate1Sessions,
   proxyCoherenceCheck: proxyCoherenceCheck,
@@ -292,5 +378,9 @@ module.exports = {
   pearson: pearson,
   FORCEDOWN_EXEMPT: FORCEDOWN_EXEMPT,
   GATE1_LONG_SESSIONS: GATE1_LONG_SESSIONS,
-  GATE1_SHORT_SESSIONS: GATE1_SHORT_SESSIONS
+  GATE1_SHORT_SESSIONS: GATE1_SHORT_SESSIONS,
+  contextTextMatches: contextTextMatches,
+  buildupPatternCheck: buildupPatternCheck,
+  corroborateSessionContext: corroborateSessionContext,
+  CONTEXT_CORROBORATION_THRESHOLD: CONTEXT_CORROBORATION_THRESHOLD
 };

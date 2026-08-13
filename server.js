@@ -838,6 +838,12 @@ Step 3: Check congruency with ticker classification:
 Step 4: Fund performance reviews, general market commentary, and index rebalancing
   reports are NOT company-specific catalysts. Treat as NEUTRAL unless they contain
   specific guidance or material information about the ticker.
+Step 5: A "Session Context corroboration" block is provided below (Proposal 4,
+  Aug 13 2026). This is server-computed, not your own judgment call — copy its
+  conclusion exactly. If it says CONTEXT-CORROBORATED, treat the user-typed
+  Session Context as real Gate 2 evidence, weighted the same as the news
+  catalyst above. If it says uncorroborated, the typed context is informational
+  only — do not let it move your GREEN/YELLOW/RED classification.
 
 GATE 3 — MEAN REVERSION + 3-BAR SEQUENCE
 
@@ -1573,6 +1579,89 @@ async function fetchNews(symbol) {
   if (!finnhub) return alpaca;
   if (!alpaca) return finnhub;
   return alpaca.ageHours <= finnhub.ageHours ? alpaca : finnhub;
+}
+
+// ─── PROPOSAL 4 — CONTEXT-WEIGHTED GATE 2 CORROBORATION (Aug 13, 2026) ────
+// Session Context (the free-text textarea every tier already sends as
+// marketContext) previously had zero backend awareness at all -- purely a
+// client-side keyword-highlight cosmetic (shared/context-highlight.js).
+// Both functions below are only ever called when the user actually typed
+// something into it (see the /analyze corroboration block), so they add
+// zero extra Alpaca/Finnhub call volume on the common case of an analysis
+// run with Session Context left blank -- same "lazy, cost only on real use"
+// posture as the SEC CIK fallback tiers.
+
+function stripHtmlForCorroboration(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ");
+}
+
+// Full-body article text for the news-content-match corroboration source --
+// fetchNews()/newsData above only ever carries a headline, too short for a
+// reliable 2-distinct-word overlap match. Queries both sources directly
+// (not the newsData already on the request, which is headline-only) and
+// pools every recent article's text rather than just the single newest one,
+// since the corroborating article need not be the most recent headline.
+// UNVERIFIED AGAINST LIVE ALPACA ENTITLEMENT for the `content` field
+// specifically -- same posture as fetchAlpacaNews above; falls back to
+// `summary`/headline on any shape mismatch, never throws.
+async function fetchNewsBodiesForCorroboration(symbol) {
+  const now    = new Date();
+  const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
+  const bodies = [];
+  try {
+    if (alpacaKeys()) {
+      const data = await alpacaGet(
+        `/v1beta1/news?symbols=${symbol}&start=${cutoff.toISOString()}&end=${now.toISOString()}&limit=10&sort=desc`
+      );
+      const articles = Array.isArray(data?.news) ? data.news : [];
+      articles.forEach(a => {
+        const text = stripHtmlForCorroboration(a.content || a.summary || a.headline || "");
+        if (text.trim()) bodies.push(text);
+      });
+    }
+  } catch (e) { console.error(`fetchNewsBodiesForCorroboration alpaca ${symbol}:`, e.message); }
+  try {
+    const from = cutoff.toISOString().split("T")[0];
+    const to   = now.toISOString().split("T")[0];
+    const data = await finnhubGet(`/company-news?symbol=${symbol}&from=${from}&to=${to}`);
+    if (Array.isArray(data)) {
+      data.forEach(a => {
+        const text = stripHtmlForCorroboration(a.summary || a.headline || "");
+        if (text.trim()) bodies.push(text);
+      });
+    }
+  } catch (e) { console.error(`fetchNewsBodiesForCorroboration finnhub ${symbol}:`, e.message); }
+  return bodies;
+}
+
+// Corroboration source 3: a real dated calendar event. Silent/boolean only
+// -- true if the ticker has an earnings date within a window around today,
+// false if the call succeeds with none, null on any fetch error (treated as
+// "not corroborated" by corroborateSessionContext, never as a false
+// positive). Routed through finnhubGet()/finnhubThrottle() like every other
+// Finnhub call in this file.
+async function fetchEarningsCalendarFlag(symbol) {
+  try {
+    const now  = new Date();
+    const from = new Date(now.getTime() - 3 * 86400000).toISOString().split("T")[0];
+    const to   = new Date(now.getTime() + 14 * 86400000).toISOString().split("T")[0];
+    const data = await finnhubGet(`/calendar/earnings?symbol=${symbol}&from=${from}&to=${to}`);
+    const items = data?.earningsCalendar;
+    return Array.isArray(items) && items.length > 0;
+  } catch (e) {
+    console.error(`fetchEarningsCalendarFlag ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+// Parses a formatted "+1.23%"/"-4.5%" string (the shape sectorContext's
+// per-symbol fields actually arrive in from every tier's client -- see the
+// corroboration block in /analyze for why this is used instead of the
+// .pct-object shape some existing code elsewhere assumes) into a number.
+function parsePctString(s) {
+  if (typeof s !== "string") return null;
+  const n = parseFloat(s.replace("%", ""));
+  return Number.isFinite(n) ? n : null;
 }
 
 // ─── EVALUATE PROXY STATUS ────────────────────────────────────────
@@ -2372,6 +2461,45 @@ Current price: $${metricsData.price || "?"}
 `;
   }
 
+  // ── SESSION CONTEXT CORROBORATION (Proposal 4) ─────────────────────
+  // Only runs when the user actually typed something -- see the fetch
+  // functions above for why that keeps this free on every other analysis.
+  let contextCorroboration = null;
+  if (marketContext && marketContext.trim().length > 0) {
+    const [newsBodies, hasEarningsEvent] = await Promise.all([
+      fetchNewsBodiesForCorroboration(ticker),
+      fetchEarningsCalendarFlag(ticker),
+    ]);
+    const newsMatch = newsBodies.some(body => gx.contextTextMatches(marketContext, body));
+
+    // tickerPct/proxyPct for the buildup pattern's "outperformance" signal
+    // deliberately do NOT reuse metricsData.pct / sectorContext.<sym>.pct --
+    // every tier's client only ever sends sectorContext[sym] as the
+    // formatted `.change` string (e.g. "+1.23%"), never a raw `.pct` number,
+    // so those two fields are always null/undefined in practice. (This also
+    // means the existing Proxy Coherence Check block below, which reads the
+    // same two fields, is dead code today -- a pre-existing bug, not
+    // introduced or fixed by this change, flagged separately.) Sourced
+    // instead from openingBarData's own bar-1 open->close and a parse of
+    // sectorContext's change strings, both of which are actually populated.
+    const tickerPct = (openingBarData && openingBarData.open)
+      ? (openingBarData.close - openingBarData.open) / openingBarData.open * 100
+      : null;
+    const proxyPct = (() => {
+      const syms = (rule.proxy?.symbols || []).map(s => s.toLowerCase());
+      const vals = syms.map(s => parsePctString(sectorContext?.[s])).filter(v => v !== null);
+      return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    })();
+
+    const buildup = gx.buildupPatternCheck({
+      volRatio: typeof openingBarData?.volRatio === "number" ? openingBarData.volRatio : null,
+      tickerPct, proxyPct,
+      hasFreshNews: !!(newsData && newsData.ageHours <= 24),
+    });
+
+    contextCorroboration = gx.corroborateSessionContext({ newsMatch, buildup, hasEarningsEvent });
+  }
+
   const userMessage = `
 Analyze ${ticker.toUpperCase()}.
 
@@ -2406,6 +2534,7 @@ Gate 3 bar mode: ${barMode}
 Opening bar context: ${barContext}
 Gate 3 weekly carryover: ${carryoverContext}
 Additional context: ${marketContext || "None"}
+Session Context corroboration: ${contextCorroboration ? contextCorroboration.note : "N/A — no Session Context provided."}
 
 Run Gates 2, 3, 4 only. Pre-Gate, Gate 0, Gate 1, and Gate 5 are provided above — copy them exactly.
 Return only JSON.
@@ -2450,6 +2579,20 @@ Return only JSON.
 
       // ── SERVER ENFORCEMENT: Gate 5 ────────────────────────────────
       parsed.gates.g5_korea = { status: gate5Result.status, note: gate5Result.note };
+
+      // ── SERVER ENFORCEMENT: Session Context corroboration (Proposal 4) ──
+      // Corroboration state is server-computed (not left to the model's own
+      // judgment, same "PRE-DETERMINED, copy exactly" posture as the gates
+      // above) and attached to the response as its own field, plus appended
+      // to Gate 2's note so it's visible with zero frontend change -- every
+      // tier's card already renders gate.note verbatim.
+      if (contextCorroboration && parsed.gates?.g2_catalyst) {
+        parsed.contextCorroboration = contextCorroboration;
+        const tag = contextCorroboration.corroborated
+          ? ` [Session Context: CONTEXT-CORROBORATED, ${contextCorroboration.matchCount}/3]`
+          : ` [Session Context: uncorroborated, informational only]`;
+        parsed.gates.g2_catalyst.note = (parsed.gates.g2_catalyst.note || "") + tag;
+      }
 
       // ── SERVER ENFORCEMENT: Pre-Gate forceDown ────────────────────
       // No corroboration required — solvency/dilution/guidance-cut risk has

@@ -3015,7 +3015,11 @@ app.post("/auth/signup", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
-    const { data, error } = await authClient().auth.signUp({ email, password });
+    const { data, error } = await authClient().auth.signUp({
+      email,
+      password,
+      options: { emailRedirectTo: "https://tradetribunal.app/" },
+    });
     if (error) return res.status(400).json({ error: error.message });
     // Create free subscriber record
     await upsertSubscriber(email, "free", null, null);

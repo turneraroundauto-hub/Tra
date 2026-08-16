@@ -10,12 +10,23 @@
  *   5. hasForceDownAuthority()   — Proposal 1: corroboration-exemption registry
  */
 
+/** @typedef {import('./types.js').GateResult} GateResult */
+
+/**
+ * @param {number[]} closes
+ * @returns {number[]}
+ */
 function dailyReturns(closes) {
   const out = [];
   for (let i = 1; i < closes.length; i++) out.push(closes[i] / closes[i - 1] - 1);
   return out;
 }
 
+/**
+ * @param {number[]} a
+ * @param {number[]} b
+ * @returns {number|null}
+ */
 function pearson(a, b) {
   const n = Math.min(a.length, b.length);
   if (n < 2) return null;
@@ -36,6 +47,16 @@ function pearson(a, b) {
 const GATE1_LONG_SESSIONS = 60;
 const GATE1_SHORT_SESSIONS = 14;
 
+/**
+ * Returns `color`/`sizing` as plain `string` rather than GateResult's
+ * tighter status/sizing unions on purpose — Object.assign(base, {...})
+ * below builds this incrementally per-branch, and TS doesn't narrow a
+ * spread literal's string properties to a union through that pattern.
+ * evaluateGate1() (server.js) maps `color`/`sizing` onto the real,
+ * narrower GateResult it returns to /analyze.
+ * @param {number[]} closes
+ * @returns {{ok:boolean, unit:string, forceDown:boolean, note:string, branch?:string, color?:string, sizing?:string, change60?:number, change14?:number, requiresConfirmedHigherLow?:boolean}}
+ */
 function evaluateGate1Sessions(closes) {
   if (!Array.isArray(closes) || closes.length < GATE1_LONG_SESSIONS + 1) {
     return {
@@ -100,6 +121,16 @@ function evaluateGate1Sessions(closes) {
 const COHERENCE_FLAT_BAND_PCT = 1.0;
 const COHERENCE_DECOUPLE_PCT = 2.0;
 
+/**
+ * tickerPct/proxyPct must be real numbers, already parsed — the Aug 13,
+ * 2026 Gate 5 bug (see CLAUDE.md) was exactly this call site being fed a
+ * formatted "+1.23%" *string* instead, so `proxyPct < 0` and every other
+ * numeric comparison here silently evaluated against a string. Callers must
+ * parse via parsePctString()/normalizeMarketReading() (server.js) first.
+ * @param {number} tickerPct
+ * @param {number} proxyPct
+ * @returns {{case:1|2|3, verdict:"DOWN"|"HOLD", forceDown:boolean, triggerRevalidation:boolean, label:string, note:string}}
+ */
 function proxyCoherenceCheck(tickerPct, proxyPct) {
   const proxyDown = proxyPct < 0;
 
@@ -146,6 +177,9 @@ const REGIME_BROKEN_CEILING = 0.0;
  * CIEN's 20-day correlation to TSM rose +0.283 -> +0.728 during the AI-capex selloff.
  * This check will rarely return BROKEN during a crisis. Its useful detection window is
  * CALM markets. It is NOT a crisis safeguard — do not rely on it as one.
+ * @param {number[]} tickerCloses
+ * @param {number[]} proxyCloses
+ * @returns {{state:"UNKNOWN"|"BROKEN"|"DEGRADING"|"INTACT", rolling:(number|null), baseline:(number|null), delta:(number|null), action:string, note:string}}
  */
 function regimeValidation(tickerCloses, proxyCloses) {
   const tr = dailyReturns(tickerCloses);
@@ -188,6 +222,12 @@ function regimeValidation(tickerCloses, proxyCloses) {
 const PROXY_PRIMARY_FLOOR = 0.6;
 const PROXY_SECONDARY_FLOOR = 0.4;
 
+/**
+ * @param {number[]} tickerCloses
+ * @param {Object<string, number[]>} candidateBasket
+ * @param {{yearsPublic?:number, marketCap?:number, avgVol20d?:number, ivRank?:number}|null} [fundamentals]
+ * @returns {{tier:string, proxy:(string|null), r:(number|null), sizing:string, forceDownAuthority:boolean, confirmed?:number, ranked:Array<{sym:string, r:(number|null)}>, autoExecuteStop?:boolean, elevatedCapCeiling?:boolean, note:string}}
+ */
 function resolveFixedProxyBreak(tickerCloses, candidateBasket, fundamentals) {
   const tr = dailyReturns(tickerCloses);
   const scored = Object.keys(candidateBasket)
@@ -252,6 +292,12 @@ const FORCEDOWN_EXEMPT = {
   TAIWAN_PROXY: { scope: 'ai-semi-gated', reason: 'TSM drop >3%. (Proposal 1, Jul 29 2026)' }
 };
 
+/**
+ * @param {string} gateKey
+ * @param {string[]} [tickerGating]
+ * @param {{state:string, rolling:(number|null)}|null} [regime]
+ * @returns {{authorized:boolean, reason:string, requiresReresolve?:boolean, requiresCoherenceCheck?:boolean}}
+ */
 function hasForceDownAuthority(gateKey, tickerGating, regime) {
   tickerGating = tickerGating || [];
   regime = regime || null;
@@ -294,10 +340,19 @@ const CONTEXT_STOPWORDS = new Set(['a','an','the','and','or','but','if','of','in
   'into','out','up','down','than','then','so','not','no','yes','has','have','had','will','would','could','should','can',
   'may','might','must','more','most','also','still','just','now','new','via','their','his','her','your','you','we','our']);
 
+/**
+ * @param {string} text
+ * @returns {string[]}
+ */
 function tokenizeContext(text) {
   return (text || '').toLowerCase().match(/[a-z0-9$%]+/g) || [];
 }
 
+/**
+ * @param {string} contextText
+ * @param {string} bodyText
+ * @returns {boolean}
+ */
 function contextTextMatches(contextText, bodyText) {
   const ctxWords = new Set(tokenizeContext(contextText).filter(function (w) { return w.length > 2 && !CONTEXT_STOPWORDS.has(w); }));
   if (ctxWords.size < 2) return false;
@@ -318,6 +373,8 @@ function contextTextMatches(contextText, bodyText) {
  * all, so a single available signal (most often just "no fresh news," which
  * is true on most days regardless of any real buildup) can never carry the
  * pattern by itself.
+ * @param {{volRatio?:(number|null), tickerPct?:(number|null), proxyPct?:(number|null), hasFreshNews?:boolean}} [input]
+ * @returns {{ok:boolean, usable:number, confirmed:number, note:string}}
  */
 function buildupPatternCheck(input) {
   input = input || {};
@@ -348,6 +405,8 @@ const CONTEXT_CORROBORATION_THRESHOLD = 2;
  * independent sources agreeing promotes it to a CONTEXT-CORROBORATED
  * modifier on Gate 2; fewer than 2 leaves it visible (existing client-side
  * highlight behavior unchanged) but verdict-inert.
+ * @param {{newsMatch?:boolean, buildup?:{ok:boolean}, hasEarningsEvent?:(boolean|null)}} [input]
+ * @returns {{corroborated:boolean, matchCount:number, sources:Array<{key:string, ok:boolean}>, matchedLabels:string[], modifier:(string|null), note:string}}
  */
 function corroborateSessionContext(input) {
   input = input || {};

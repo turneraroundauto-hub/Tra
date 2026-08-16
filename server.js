@@ -994,6 +994,11 @@ CONFIDENCE:
 HIGH: Gate 0 GREEN-STRONG + 4+ gates GREEN + congruency confirmed
 MEDIUM: Gate 0 GREEN-NEUTRAL + 3 gates GREEN + minor incongruency
 LOW: Any YELLOW in critical gates, or congruency conflict present
+"Congruency confirmed" means the ticker's own price action (opening bar
+direction) and its sector/proxy's price action both point the same way as
+the verdict — not just that the pre-determined gate statuses happen to be
+green. If the ticker's own price and its proxy disagree with each other,
+that is a congruency conflict even if no individual gate is RED.
 
 Return ONLY:
 {
@@ -1662,6 +1667,46 @@ function parsePctString(s) {
   if (typeof s !== "string") return null;
   const n = parseFloat(s.replace("%", ""));
   return Number.isFinite(n) ? n : null;
+}
+
+// Same tolerance gates-extended.ts's proxyCoherenceCheck() already uses
+// (COHERENCE_FLAT_BAND_PCT) to decide a move is real, not noise -- kept as
+// its own local constant rather than importing that one, since exporting a
+// value tuned for one specific check to double as a generic threshold here
+// would couple the two for no real reason.
+const CONFIDENCE_NEGLIGIBLE_MOVE_PCT = 1.0;
+
+// Confidence reflects whether the ticker's own observed price move AND its
+// sector/proxy's observed price move independently confirm the direction a
+// hard server-side override is asserting -- not just "did a rule fire."
+// (Aug 16, 2026 -- direct product decision, replacing a blanket MEDIUM/LOW
+// every override branch used to apply regardless of how corroborated its
+// own trigger actually was.)
+//   HIGH   -- both the ticker's own move and its proxy's move agree with
+//             the asserted direction. Two independent signals confirming
+//             each other is the actual bar for high confidence.
+//   MEDIUM -- the trigger is real and clean on its own terms, but there's
+//             no independent price data available to confirm or deny it
+//             (missing tickerPct/proxyPct, or a move too small to read as
+//             a real signal either way) -- unconfirmed, not contradicted.
+//   LOW    -- either signal that IS available moves opposite the asserted
+//             direction, beyond the negligible-move band -- the mechanical
+//             trigger and the observed price action actively disagree, the
+//             exact "math vs. chart" split.
+// A move inside +/-CONFIDENCE_NEGLIGIBLE_MOVE_PCT counts as unavailable,
+// not agreeing or disagreeing -- confidence should never hinge on noise,
+// same reasoning proxyCoherenceCheck's own flat band already applies.
+// direction is "UP" or "DOWN"; tickerPct/proxyPct are the already-computed
+// session % moves (see the /analyze handler's own comment on why those two
+// specific fields are what's actually populated on the request).
+function priceConfirmedConfidence(direction, tickerPct, proxyPct) {
+  const sign = direction === "DOWN" ? -1 : 1;
+  const isReal    = (v) => v != null && Math.abs(v) > CONFIDENCE_NEGLIGIBLE_MOVE_PCT;
+  const agrees    = (v) => isReal(v) && Math.sign(v) === sign;
+  const disagrees = (v) => isReal(v) && Math.sign(v) === -sign;
+  if (disagrees(tickerPct) || disagrees(proxyPct)) return "LOW";
+  if (agrees(tickerPct) && agrees(proxyPct)) return "HIGH";
+  return "MEDIUM"; // nothing to confirm or deny it with, or only one side does
 }
 
 // Normalizes a marketData[symbol] entry into {pct, change}. Handles both
@@ -2739,7 +2784,7 @@ Return only JSON.
       if (preGateResult.hardTrigger) {
         parsed.verdict    = "DOWN";
         parsed.sizing      = "NONE";
-        parsed.confidence = "MEDIUM";
+        parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason      = `Pre-Gate thesis-integrity override — ${preGateResult.note}`;
         parsed.wait_for    = "Resolved solvency/dilution/guidance concern (or a new filing clearing it) required before re-evaluating.";
       }
@@ -2748,11 +2793,14 @@ Return only JSON.
       if (gate0Status === "RED") {
         // Both SPY AND QQQ down >1% — genuine broad market failure
         parsed.verdict    = "DOWN";
-        parsed.confidence = "MEDIUM";
+        parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason     = `Broad market failure — ${gate0Note}. No entries until market stabilizes.`;
       } else if (gate0Status === "YELLOW" && parsed.verdict === "UP") {
-        // Sector rotation or mild headwind — cap confidence
-        parsed.confidence = "MEDIUM";
+        // Sector rotation or mild headwind — was a flat MEDIUM cap; now
+        // reflects whether the ticker's own price is actually cutting
+        // through the headwind (confirmed) or the model's UP call isn't
+        // backed by real price action yet (unconfirmed/contradicted).
+        parsed.confidence = priceConfirmedConfidence("UP", tickerPct, proxyPct);
       }
 
       // ── SERVER ENFORCEMENT: Gate 1 forceDown ──────────────────────
@@ -2763,7 +2811,7 @@ Return only JSON.
       if (gate1Result.forceDown) {
         parsed.verdict    = "DOWN";
         parsed.sizing      = "NONE";
-        parsed.confidence = "MEDIUM";
+        parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason      = `Gate 1 structural breakdown override — ${gate1Result.note}`;
         parsed.wait_for    = "Structural reversal (higher high + reclaim of 50-day MA) required before re-evaluating.";
       }
@@ -2821,15 +2869,28 @@ Return only JSON.
           if (coherence.forceDown) {
             gate5ForceDown    = true;
             parsed.sizing     = "NONE";
-            parsed.confidence = "MEDIUM";
+            // Case 1: ticker actively moved WITH the proxy -- two
+            // independent signals genuinely confirming each other, HIGH.
+            // Case 2: ticker is flat/inside the coherence check's own flat
+            // band -- the trigger still applies (hasn't been contradicted),
+            // but the ticker hasn't actually confirmed it either, just
+            // hasn't caught up yet -- MEDIUM, not HIGH.
+            parsed.confidence = coherence.case === 1 ? "HIGH" : "MEDIUM";
           } else {
             parsed.confidence = "LOW";
           }
         } else {
+          // No coherence check possible (not tickerGating-eligible, or
+          // tickerPct/proxyPct genuinely missing) -- still run the generic
+          // price-confirmation read rather than a flat MEDIUM, so a
+          // dynamically-resolved primary proxy (Patch 2, not Taiwan/Korea-
+          // gated, so it skips proxyCoherenceCheck above) still gets real
+          // credit when its own tickerPct/proxyPct happen to be available
+          // and actually agree.
           gate5ForceDown    = true;
           parsed.verdict    = "DOWN";
           parsed.sizing      = "NONE";
-          parsed.confidence = "MEDIUM";
+          parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
           parsed.reason      = `Gate 5 forceDown — ${gate5Result.note}`;
           parsed.wait_for    = `${rule.proxy.name} must stabilize before re-evaluating.`;
         }
@@ -2839,7 +2900,12 @@ Return only JSON.
         // Gate 5 RED + Gate 2 RED = DOWN (double negative, congruent bearish)
         if (g2Status === "RED") {
           parsed.verdict    = "DOWN";
-          parsed.confidence = "MEDIUM";
+          // Two independent gates (sector proxy + catalyst) already agree;
+          // if the ticker's own price and its proxy's price also confirm
+          // the same direction, that's every signal this app checks
+          // aligning at once -- the actual HIGH bar, not just MEDIUM by
+          // default because a rule fired.
+          parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
           parsed.wait_for   = `${rule.proxy.name} and catalyst headwind both need to clear.`;
         } else if (parsed.verdict === "UP") {
           parsed.verdict    = "FLAT";

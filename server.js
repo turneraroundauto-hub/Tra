@@ -2882,6 +2882,20 @@ Return only JSON.
         }
       }
 
+      // ── INVARIANT: LOW confidence always ships with a real wait_for ──
+      // Confirmed (Aug 16, 2026) this wasn't actually guaranteed: the Proxy
+      // Coherence Check's "possible decoupling" branch above sets confidence
+      // to LOW without touching wait_for at all, and the model's own
+      // self-assigned LOW (per the CONFIDENCE rubric, when no server
+      // override fires) was never instructed to pair one either. A single
+      // choke point here — after every branch that can set confidence has
+      // already run — is more robust than patching each site individually,
+      // and doesn't overwrite a real wait_for the model or an earlier branch
+      // already provided.
+      if (parsed.confidence === "LOW" && (!parsed.wait_for || parsed.wait_for === "null")) {
+        parsed.wait_for = "Additional confirmation needed before directional entry.";
+      }
+
       const result = { ...parsed, marketOpen: isMarketOpen() };
       setCache(cacheKey, result);
       res.json(result);

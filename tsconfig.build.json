@@ -1,0 +1,31 @@
+{
+  // Phase 2 of the TypeScript adoption plan (mirrored from trade-verdict's
+  // CLAUDE.md, "Engineering: TypeScript adoption path"). Separate from
+  // tsconfig.json (type-checking only, noEmit:true) because this one
+  // actually EMITS gates-extended.js from gates-extended.ts — no bundler,
+  // tsc emits one .js in place, so server.js's plain
+  // `require("./gates-extended")` keeps resolving exactly as it always
+  // has. The emitted .js IS the deploy artifact — commit it alongside its
+  // .ts source, same as trade-verdict's own Phase 2 conversions.
+  //
+  // Run with `npx tsc -p tsconfig.build.json` after editing
+  // gates-extended.ts, then verify the emitted gates-extended.js the same
+  // way trade-verdict's own conversions were verified: require() it
+  // directly and confirm the export set/behavior, not just that tsc
+  // compiled clean — a real bug in this exact file (a type-only import
+  // silently breaking CommonJS require() at runtime, invisible to both
+  // tsc and node --check) is exactly why that extra step matters here.
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": false
+  },
+  "include": ["gates-extended.ts"]
+}

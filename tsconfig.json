@@ -1,0 +1,43 @@
+{
+  // Mirrors trade-verdict's Phase 0 TypeScript adoption pass (see that
+  // repo's CLAUDE.md, "Engineering: TypeScript adoption path" — Aug 14,
+  // 2026) into this repo, the real backend (Aug 16, 2026). JSDoc + checkJs
+  // only: no .ts files, no build step, ever. Run with `tsc --noEmit` (or
+  // `npx tsc`, TypeScript is not a committed devDependency here).
+  //
+  // Scope is deliberately narrow — gates-extended.js only — same scope
+  // trade-verdict's own Phase 0 used, kept low-risk on purpose. server.js
+  // (where the real /analyze handler, evaluateProxyStatus(), and
+  // evaluateGate1() actually live) and credits.js are NOT covered yet
+  // (untyped Express/Stripe/Supabase surface, much higher noise) — a
+  // natural follow-up once this proves out, not part of this pass. This
+  // repo has no shared/ subdirectory (that's a trade-verdict/frontend-only
+  // concept), so this tsconfig's scope is just the one file plus types.js.
+  //
+  // KNOWN, EXPECTED baseline noise on a fresh run (same two categories
+  // trade-verdict's own Phase 0 documented — neither is a real bug):
+  //   1. Any local `require`/`import` of an untyped sibling file with no
+  //      corresponding @typedef will report as implicit `any` — expected
+  //      until that file gets its own typedef coverage in a later pass.
+  //   2. Generic noise from untyped third-party libraries this repo
+  //      depends on (Express/Stripe/Supabase) if anything outside
+  //      gates-extended.js's own scope gets pulled in transitively.
+  // What this pass actually adds is the real @typedefs (types.js, mirrored
+  // byte-for-byte from trade-verdict's shared/types.js for the shape
+  // definitions themselves) applied to gates-extended.js's exported
+  // functions — the same file, the same typedefs, the same annotations
+  // trade-verdict already shipped and verified against the real Aug 13,
+  // 2026 Gate 5 bug shape.
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "noImplicitAny": false,
+    "strictNullChecks": false
+  },
+  "include": ["gates-extended.js", "types.js"]
+}

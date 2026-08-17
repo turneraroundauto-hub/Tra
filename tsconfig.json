@@ -44,5 +44,5 @@
     "noImplicitAny": false,
     "strictNullChecks": false
   },
-  "include": ["gates-extended.ts", "types.js"]
+  "include": ["gates-extended.ts", "analyze-helpers.ts", "types.js"]
 }

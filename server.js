@@ -14,6 +14,7 @@ const express   = require("express");
 const cors      = require("cors");
 const credits   = require("./credits");
 const gx        = require("./gates-extended");
+const ah        = require("./analyze-helpers");
 const { createClient } = require("@supabase/supabase-js");
 
 // ── SUPABASE CLIENT ───────────────────────────────────────────────
@@ -1659,116 +1660,14 @@ async function fetchEarningsCalendarFlag(symbol) {
   }
 }
 
-// Parses a formatted "+1.23%"/"-4.5%" string (the shape sectorContext's
-// per-symbol fields actually arrive in from every tier's client -- see the
-// corroboration block in /analyze for why this is used instead of the
-// .pct-object shape some existing code elsewhere assumes) into a number.
-function parsePctString(s) {
-  if (typeof s !== "string") return null;
-  const n = parseFloat(s.replace("%", ""));
-  return Number.isFinite(n) ? n : null;
-}
-
-// Same tolerance gates-extended.ts's proxyCoherenceCheck() already uses
-// (COHERENCE_FLAT_BAND_PCT) to decide a move is real, not noise -- kept as
-// its own local constant rather than importing that one, since exporting a
-// value tuned for one specific check to double as a generic threshold here
-// would couple the two for no real reason.
-const CONFIDENCE_NEGLIGIBLE_MOVE_PCT = 1.0;
-
-// Confidence reflects whether the ticker's own observed price move AND its
-// sector/proxy's observed price move independently confirm the direction a
-// hard server-side override is asserting -- not just "did a rule fire."
-// (Aug 16, 2026 -- direct product decision, replacing a blanket MEDIUM/LOW
-// every override branch used to apply regardless of how corroborated its
-// own trigger actually was.)
-//   HIGH   -- both the ticker's own move and its proxy's move agree with
-//             the asserted direction. Two independent signals confirming
-//             each other is the actual bar for high confidence.
-//   MEDIUM -- the trigger is real and clean on its own terms, but there's
-//             no independent price data available to confirm or deny it
-//             (missing tickerPct/proxyPct, or a move too small to read as
-//             a real signal either way) -- unconfirmed, not contradicted.
-//   LOW    -- either signal that IS available moves opposite the asserted
-//             direction, beyond the negligible-move band -- the mechanical
-//             trigger and the observed price action actively disagree, the
-//             exact "math vs. chart" split.
-// A move inside +/-CONFIDENCE_NEGLIGIBLE_MOVE_PCT counts as unavailable,
-// not agreeing or disagreeing -- confidence should never hinge on noise,
-// same reasoning proxyCoherenceCheck's own flat band already applies.
-// direction is "UP" or "DOWN"; tickerPct/proxyPct are the already-computed
-// session % moves (see the /analyze handler's own comment on why those two
-// specific fields are what's actually populated on the request).
-function priceConfirmedConfidence(direction, tickerPct, proxyPct) {
-  const sign = direction === "DOWN" ? -1 : 1;
-  const isReal    = (v) => v != null && Math.abs(v) > CONFIDENCE_NEGLIGIBLE_MOVE_PCT;
-  const agrees    = (v) => isReal(v) && Math.sign(v) === sign;
-  const disagrees = (v) => isReal(v) && Math.sign(v) === -sign;
-  if (disagrees(tickerPct) || disagrees(proxyPct)) return "LOW";
-  if (agrees(tickerPct) && agrees(proxyPct)) return "HIGH";
-  return "MEDIUM"; // nothing to confirm or deny it with, or only one side does
-}
-
-// Normalizes a marketData[symbol] entry into {pct, change}. Handles both
-// shapes actually seen in this codebase: a real {price,change,pct,direction}
-// object (the server's own internal marketCache, e.g. generatePulse's input)
-// and a bare "+1.23%"/"-4.5%" string (what every tier's client actually
-// sends as sectorContext[symbol] -- see the parsePctString comment above).
-// Returns null when neither shape yields a usable number, so the caller can
-// filter it out the same way a missing symbol already was.
-function normalizeMarketReading(raw) {
-  if (raw == null) return null;
-  if (typeof raw === "string") {
-    const pct = parsePctString(raw);
-    return pct === null ? null : { pct, change: raw };
-  }
-  if (typeof raw === "object" && typeof raw.pct === "number") {
-    return { pct: raw.pct, change: raw.change };
-  }
-  return null;
-}
-
-// ─── EVALUATE PROXY STATUS ────────────────────────────────────────
-// BUG FIX (Aug 13, 2026): this previously read marketData[symbol].pct
-// directly, assuming an object shape. Every tier's client actually sends
-// sectorContext[symbol] as a bare formatted `.change` string (confirmed
-// while building Proposal 4 -- see CLAUDE.md) -- so `.pct` was always
-// undefined, avgPct was always 0, and this function could NEVER return RED
-// or YELLOW through /analyze, for any ticker, regardless of how far TSM/
-// KOSPI/XBI/etc had actually moved. That's not just Proposal 2's coherence
-// check failing to run (a downstream symptom) -- it means Gate 5's RED
-// hard-trigger itself has never fired via /analyze in production. Fixed by
-// normalizing each reading through normalizeMarketReading() above, which
-// parses the real string wire format (and still accepts an object, so
-// nothing that already passed real objects here breaks). Also fixed a
-// second, smaller latent bug in the same function: changeStr rebuilt symbol
-// labels by re-indexing the post-filter `readings` array against the
-// pre-filter `symbols` array, which mislabels a reading whenever an earlier
-// symbol in a multi-symbol rule (e.g. the TSM+KOSPI combined rule) fails to
-// resolve -- symbol and reading are now kept paired together instead.
-function evaluateProxyStatus(proxyRule, marketData) {
-  const symbols = proxyRule.proxy.symbols;
-  const readings = symbols
-    .map(s => ({ symbol: s, reading: normalizeMarketReading(marketData[s.toLowerCase()]) }))
-    .filter(x => x.reading);
-
-  if (!readings.length) return { status: "GREEN", note: proxyRule.proxy.rationale };
-
-  const avgPct = readings.reduce((a, x) => a + x.reading.pct, 0) / readings.length;
-  const anyRedFlag = readings.some(x => x.reading.pct <= -3);
-
-  let status = "GREEN";
-  if (anyRedFlag || avgPct <= -3)      status = "RED";
-  else if (avgPct <= -1)               status = "YELLOW";
-
-  const changeStr = readings.map(x =>
-    `${x.symbol} ${x.reading.change || "?"}`).join(", ");
-
-  return {
-    status,
-    note: `${proxyRule.proxy.name}: ${changeStr}. ${proxyRule.proxy.rationale}`,
-  };
-}
+// parsePctString / CONFIDENCE_NEGLIGIBLE_MOVE_PCT / priceConfirmedConfidence /
+// normalizeMarketReading / evaluateProxyStatus (Gate 5's forceDown status
+// check -- see the Aug 13, 2026 CLAUDE.md incident writeup) all moved to
+// analyze-helpers.js (Aug 16, 2026, Phase 4 of the TypeScript adoption
+// plan) -- pure, side-effect-free logic, extracted so it's requirable and
+// unit-testable in isolation (server.js itself can't be required for tests
+// without also starting a real Express server). Pure code motion, same
+// names/bodies/behavior, called below via the `ah.` namespace.
 
 // ─── GATE 5 — DYNAMIC PROXY RESOLUTION (Patch 2, Aug 1 2026) ───────
 // classifyTicker()/PROXY_RULES above are already Steps 1-2 of the Dynamic
@@ -1900,7 +1799,7 @@ async function resolveProxyRegime(symbol, tickerCloses) {
 }
 
 // Maps a resolveFixedProxyBreak()-shaped result (fresh or reconstructed from
-// a cached row) into a proxyRule-compatible object: evaluateProxyStatus() can
+// a cached row) into a proxyRule-compatible object: ah.evaluateProxyStatus() can
 // consume it unchanged (reads rule.proxy.symbols/name/rationale), and /analyze
 // reads the extra tier/forceDownAuthority/sizingOverride/etc fields directly
 // off the same object once it round-trips back through req.body.
@@ -2566,7 +2465,7 @@ app.post("/analyze", async (req, res) => {
 
   // ── GATE 5 — SMART PROXY PRE-DETERMINED ──────────────────────────
   const rule        = proxyRule || DEFAULT_PROXY;
-  const gate5Result = evaluateProxyStatus(rule, sectorContext || {});
+  const gate5Result = ah.evaluateProxyStatus(rule, sectorContext || {});
 
   // ── GATE 1 — BIDIRECTIONAL TREND, PRE-DETERMINED ─────────────────
   // Computed server-side once in /ticker/:symbol and passed through here
@@ -2647,19 +2546,19 @@ Current price: $${metricsData.price || "?"}
   // ever sends sectorContext[sym] as the formatted `.change` string (e.g.
   // "+1.23%"), never a raw `.pct` number, and metricsData never carries a
   // `.pct` field either, so both are always null/undefined in practice.
-  // That's the BUG FIX (Aug 13, 2026) documented on evaluateProxyStatus()
+  // That's the BUG FIX (Aug 13, 2026) documented on ah.evaluateProxyStatus()
   // above -- this is the second half of it: the Coherence Check read the
   // same two always-null fields, so it never ran either, silently falling
   // through to the plain forceDown branch every time. Sourced instead from
   // openingBarData's own bar-1 open->close and a parse of sectorContext's
-  // change strings via parsePctString(), both of which are actually
+  // change strings via ah.parsePctString(), both of which are actually
   // populated.
   const tickerPct = (openingBarData && openingBarData.open)
     ? (openingBarData.close - openingBarData.open) / openingBarData.open * 100
     : null;
   const proxyPct = (() => {
     const syms = (rule.proxy?.symbols || []).map(s => s.toLowerCase());
-    const vals = syms.map(s => parsePctString(sectorContext?.[s])).filter(v => v !== null);
+    const vals = syms.map(s => ah.parsePctString(sectorContext?.[s])).filter(v => v !== null);
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   })();
 
@@ -2784,7 +2683,7 @@ Return only JSON.
       if (preGateResult.hardTrigger) {
         parsed.verdict    = "DOWN";
         parsed.sizing      = "NONE";
-        parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
+        parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason      = `Pre-Gate thesis-integrity override — ${preGateResult.note}`;
         parsed.wait_for    = "Resolved solvency/dilution/guidance concern (or a new filing clearing it) required before re-evaluating.";
       }
@@ -2793,14 +2692,14 @@ Return only JSON.
       if (gate0Status === "RED") {
         // Both SPY AND QQQ down >1% — genuine broad market failure
         parsed.verdict    = "DOWN";
-        parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
+        parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason     = `Broad market failure — ${gate0Note}. No entries until market stabilizes.`;
       } else if (gate0Status === "YELLOW" && parsed.verdict === "UP") {
         // Sector rotation or mild headwind — was a flat MEDIUM cap; now
         // reflects whether the ticker's own price is actually cutting
         // through the headwind (confirmed) or the model's UP call isn't
         // backed by real price action yet (unconfirmed/contradicted).
-        parsed.confidence = priceConfirmedConfidence("UP", tickerPct, proxyPct);
+        parsed.confidence = ah.priceConfirmedConfidence("UP", tickerPct, proxyPct);
       }
 
       // ── SERVER ENFORCEMENT: Gate 1 forceDown ──────────────────────
@@ -2811,7 +2710,7 @@ Return only JSON.
       if (gate1Result.forceDown) {
         parsed.verdict    = "DOWN";
         parsed.sizing      = "NONE";
-        parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
+        parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason      = `Gate 1 structural breakdown override — ${gate1Result.note}`;
         parsed.wait_for    = "Structural reversal (higher high + reclaim of 50-day MA) required before re-evaluating.";
       }
@@ -2890,7 +2789,7 @@ Return only JSON.
           gate5ForceDown    = true;
           parsed.verdict    = "DOWN";
           parsed.sizing      = "NONE";
-          parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
+          parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
           parsed.reason      = `Gate 5 forceDown — ${gate5Result.note}`;
           parsed.wait_for    = `${rule.proxy.name} must stabilize before re-evaluating.`;
         }
@@ -2905,7 +2804,7 @@ Return only JSON.
           // the same direction, that's every signal this app checks
           // aligning at once -- the actual HIGH bar, not just MEDIUM by
           // default because a rule fired.
-          parsed.confidence = priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
+          parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
           parsed.wait_for   = `${rule.proxy.name} and catalyst headwind both need to clear.`;
         } else if (parsed.verdict === "UP") {
           parsed.verdict    = "FLAT";

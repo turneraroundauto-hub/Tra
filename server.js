@@ -659,10 +659,14 @@ async function getCik(symbol) {
           if (!res.ok) throw new Error(`SEC company_tickers ${res.status}`);
           const data = await res.json();
           const map = {};
+          const nameMap = {};
           Object.values(data).forEach(row => {
-            map[String(row.ticker).toUpperCase()] = String(row.cik_str).padStart(10, "0");
+            const t = String(row.ticker).toUpperCase();
+            map[t] = String(row.cik_str).padStart(10, "0");
+            if (row.title) nameMap[t] = row.title; // for diagnosing a ticker->wrong-company resolution, see evaluatePreGate
           });
           tickerCikCache = map;
+          tickerCikNameCache = nameMap;
           tickerCikCacheAt = Date.now();
         } catch (e) {
           console.error("getCik ticker map fetch:", e.message);
@@ -674,11 +678,22 @@ async function getCik(symbol) {
     await tickerCikInFlight;
   }
   const primary = tickerCikCache ? (tickerCikCache[sym] || null) : null;
-  if (primary) return primary;
-  if (KNOWN_CIK_OVERRIDES[sym]) return KNOWN_CIK_OVERRIDES[sym];
+  if (primary) {
+    console.log(`[PRE-GATE] ${sym} -> CIK ${primary} (primary map: ${tickerCikNameCache?.[sym] || "name unknown"})`);
+    return primary;
+  }
+  if (KNOWN_CIK_OVERRIDES[sym]) {
+    console.log(`[PRE-GATE] ${sym} -> CIK ${KNOWN_CIK_OVERRIDES[sym]} (KNOWN_CIK_OVERRIDES)`);
+    return KNOWN_CIK_OVERRIDES[sym];
+  }
   const fundCik = await getCikFromFundMap(sym);
-  if (fundCik) return fundCik;
-  return getCikFromEdgarSearch(sym);
+  if (fundCik) {
+    console.log(`[PRE-GATE] ${sym} -> CIK ${fundCik} (fund ticker map)`);
+    return fundCik;
+  }
+  const edgarCik = await getCikFromEdgarSearch(sym);
+  console.log(`[PRE-GATE] ${sym} -> CIK ${edgarCik || "NOT FOUND"} (live EDGAR search, last-resort tier)`);
+  return edgarCik;
 }
 
 // forms/sinceDate are optional overrides so the solvency-clearance check
@@ -705,14 +720,31 @@ async function searchEdgarFilings(cik, keywords, forms = PRE_GATE_FORMS, sinceDa
   // param is a well-documented requirement of this exact endpoint.
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
     `&dateRange=custom&ciks=${cik}&forms=${forms}&startdt=${startdt}&enddt=${enddt}`;
+  // Diagnostic logging (Aug 18, 2026) -- after 4 rounds of fixes that all
+  // reasoned correctly about this endpoint's documented behavior but
+  // couldn't be verified against a live response from this sandbox
+  // (sec.gov is unreachable here), a real going-concern filing (PLAG/XTI,
+  // exact "substantial doubt"/"going concern" keyword matches, well inside
+  // every lookback window) STILL came back GREEN live. Rather than guess a
+  // fifth time, log exactly what this function sends and gets back, so a
+  // real Render-log check can show what's actually happening instead of
+  // more reasoning from documentation. Grep Render logs for "[PRE-GATE]".
+  console.log(`[PRE-GATE] searchEdgarFilings request: ${url}`);
   try {
     await secThrottle();
     const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
-    if (!res.ok) throw new Error(`EDGAR full-text search ${res.status}`);
+    console.log(`[PRE-GATE] searchEdgarFilings response: HTTP ${res.status} for CIK ${cik}`);
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "(could not read body)");
+      console.log(`[PRE-GATE] searchEdgarFilings error body (first 500 chars): ${bodyText.slice(0, 500)}`);
+      throw new Error(`EDGAR full-text search ${res.status}`);
+    }
     const data = await res.json();
-    return data?.hits?.hits || [];
+    const hits = data?.hits?.hits || [];
+    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${hits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}`);
+    return hits;
   } catch (e) {
-    console.error(`searchEdgarFilings ${cik}:`, e.message);
+    console.error(`[PRE-GATE] searchEdgarFilings ${cik} FAILED:`, e.message);
     return [];
   }
 }

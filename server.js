@@ -447,6 +447,15 @@ const PRE_GATE_TRIGGERS = {
 // list benefits every trigger category, not just dilution.
 const PRE_GATE_FORMS = "8-K,10-Q,10-K,S-1,S-3,424B2,424B3,424B4,424B5";
 const PRE_GATE_LOOKBACK_DAYS = 45;
+// Solvency needs its own, much wider lookback -- see evaluatePreGate()'s
+// dedicated pre-check. A going-concern/bankruptcy/default/delisting event
+// that already predates the routine 45-day window by the time this code
+// first runs for a given ticker would otherwise NEVER get flagged at all --
+// the persistent-flag mechanism only persists a flag once created, it can't
+// create one from a filing outside PRE_GATE_LOOKBACK_DAYS. First draft --
+// 2 years is a reasonable "catch it whenever it happened" balance, not a
+// tuned spec.
+const PRE_GATE_SOLVENCY_LOOKBACK_DAYS = 730;
 const PRE_GATE_ESCALATION_WINDOW_DAYS = 30;
 const PRE_GATE_ESCALATION_COUNT = 2;
 const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeTribunal research contact@example.com";
@@ -933,6 +942,37 @@ async function evaluatePreGate(symbol) {
       // search below instead of returning GREEN outright, so a hard
       // trigger sitting inside the CURRENT 45-day window (a genuinely new,
       // separate event) still gets caught in the same pass.
+    }
+
+    // Wide-lookback solvency pre-check (Aug 18, 2026) -- real gap found
+    // after the persistent-flag mechanism above still didn't stop a
+    // reported live case from showing GREEN: that mechanism only ever
+    // PERSISTS a flag once one exists -- it can't CREATE one from a filing
+    // that already predates the routine 45-day window below by the time
+    // this code first runs for a given ticker. A going-concern opinion
+    // typically lives in an annual 10-K and doesn't necessarily repeat
+    // every quarter, so a real, still-unresolved distress situation could
+    // easily sit just outside 45 days and never get flagged at all under
+    // the persistent mechanism alone. This runs BEFORE the narrower
+    // dilution/guidance-cut search below, on every never-flagged ticker
+    // (bounded by the same 24h preGateCache as everything else in this
+    // function, so it's at most one extra SEC call per ticker per day, not
+    // per request). Scoped to solvency only, same as the persistent flag
+    // itself -- dilution/guidance-cut intentionally keep the narrow 45-day
+    // window below, since those are meant to decay/escalate, not persist.
+    const wideSolvencyHits = await searchEdgarFilings(
+      cik, PRE_GATE_TRIGGERS.solvency.keywords, PRE_GATE_FORMS,
+      new Date(Date.now() - PRE_GATE_SOLVENCY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    );
+    if (wideSolvencyHits.length) {
+      await flagSolvency(symbol, wideSolvencyHits[0]._id);
+      return {
+        status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
+        note: `Pre-Gate solvency hard trigger — going-concern/bankruptcy/default/delisting language found in `
+          + `SEC filings (within the last ${Math.round(PRE_GATE_SOLVENCY_LOOKBACK_DAYS / 365 * 10) / 10} years). `
+          + `Forces DOWN regardless of any other gate. Clears only once a subsequent 10-Q/10-K drops the `
+          + `language AND a corroborated positive catalyst confirms it.`,
+      };
     }
 
     const allKeywords = Object.values(PRE_GATE_TRIGGERS).flatMap(t => t.keywords);

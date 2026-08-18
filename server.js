@@ -2996,7 +2996,21 @@ Return only JSON.
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", max_tokens: 800,
+        // Bumped 800->1400 (Aug 18, 2026) -- reported live: "Failed to
+        // parse AI response" on MU right after today's Pre-Gate work
+        // landed. Leading hypothesis, not confirmed: this session's new
+        // persistent-solvency-flag notes are meaningfully longer/more
+        // detailed than the original Pre-Gate notes (quoting the flag
+        // date, matched company, and both dual-clearance conditions), and
+        // the model plausibly writes a correspondingly longer "reason"
+        // when reacting to a more detailed override -- at 800 tokens for
+        // a full 6-gate JSON breakdown, that's plausibly enough to get
+        // truncated mid-object, which JSON.parse would report exactly as
+        // this failure mode (not a markdown-fence or malformed-JSON
+        // issue, just an incomplete one). Paired with the raw-text
+        // logging below so a recurrence is actually diagnosable instead
+        // of guessed at again.
+        model: "claude-sonnet-4-6", max_tokens: 1400,
         temperature: 0,
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
@@ -3230,6 +3244,14 @@ Return only JSON.
       setCache(cacheKey, result);
       res.json(result);
     } catch {
+      // Logged server-side (Aug 18, 2026) -- previously only returned in
+      // the HTTP response body, which the frontend doesn't surface, so a
+      // parse failure was undiagnosable from Render logs alone. Also logs
+      // stop_reason -- "max_tokens" here would directly confirm/deny the
+      // truncation hypothesis behind the max_tokens bump above, rather
+      // than reasoning about it blind.
+      console.error(`[ANALYZE PARSE FAIL] ticker=${ticker} stop_reason=${data?.stop_reason || "?"} length=${text.length}`);
+      console.error(`[ANALYZE PARSE FAIL] raw text (first 2000 chars): ${text.slice(0, 2000)}`);
       res.status(500).json({ error: "Failed to parse AI response", raw: text });
     }
   } catch(err) {

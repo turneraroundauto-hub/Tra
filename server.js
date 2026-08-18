@@ -821,7 +821,7 @@ async function getSolvencyFlag(symbol) {
   }
 }
 
-async function flagSolvency(symbol, accession) {
+async function flagSolvency(symbol, accession, companyName) {
   if (!supabase) return;
   try {
     const { data: existing } = await supabase
@@ -840,6 +840,7 @@ async function flagSolvency(symbol, accession) {
       first_flagged_at: firstFlaggedAt,
       last_checked_at: new Date().toISOString(),
       trigger_accession: accession || null,
+      trigger_company_name: companyName || null, // the filing's OWN reported company -- surfaced in the note so a mismatch is visible in the app itself, not just Render logs
       filing_clear: false,
       catalyst_clear: false,
       cleared_at: null,
@@ -938,6 +939,52 @@ async function checkSolvencyClearance(symbol, cik, flaggedRow) {
   return { filingClear, catalystClear, bothClear };
 }
 
+// Cross-company mismatch guard (Aug 18, 2026) -- live report: MU (Micron,
+// a real, healthy company) got flagged with a fabricated solvency hard
+// trigger, while XTI (a genuinely distressed ticker, confirmed via a real
+// quoted 10-K) stayed GREEN. Best working theory: the SEC full-text
+// search's `ciks` scoping isn't reliably constraining results to the
+// intended company, so a hit gets attributed to the wrong ticker.
+// Unverified against a live response (same standing sandbox limitation),
+// but this check is worth having regardless of the exact root cause --
+// it's a direct, structural safety net: never persist a hard solvency
+// flag whose matched filing's own reported company name doesn't
+// plausibly match the company SEC's own ticker map says the requested
+// symbol IS. Fails PERMISSIVE (allows the flag) when either name is
+// unavailable to compare -- this is a guard against a confirmed
+// cross-attribution failure mode, not a general-purpose filter, so it
+// should never block a real match just because metadata happens to be
+// thin.
+function normalizeCompanyName(name) {
+  return String(name || "").toUpperCase()
+    .replace(/[.,]/g, "")
+    .replace(/\b(INC|CORP|CORPORATION|CO|COMPANY|LTD|LLC|PLC|LP|HOLDINGS?|GROUP|CLASS [A-Z])\b/g, "")
+    .replace(/\s+/g, " ").trim();
+}
+function companyNamesLikelyMatch(expected, actual) {
+  const a = normalizeCompanyName(expected), b = normalizeCompanyName(actual);
+  if (!a || !b) return true;
+  if (a === b) return true;
+  const wordsA = new Set(a.split(" ").filter(w => w.length >= 4));
+  const wordsB = b.split(" ").filter(w => w.length >= 4);
+  return wordsB.some(w => wordsA.has(w));
+}
+// hit is a raw EDGAR full-text-search hit object; symbol is the ticker
+// being evaluated. Returns the hit's own reported company name (for
+// storage/display) and whether it's trusted enough to flag from.
+function checkHitCompanyMatch(symbol, hit) {
+  const hitCompanyName = (hit?._source?.display_names || []).join(", ") || null;
+  const expectedName = tickerCikNameCache?.[symbol.toUpperCase()] || null;
+  const trusted = companyNamesLikelyMatch(expectedName, hitCompanyName);
+  if (!trusted) {
+    console.error(
+      `[PRE-GATE] MISMATCH: ${symbol} (expected "${expectedName}") matched a solvency hit from `
+      + `"${hitCompanyName}" -- suppressing, NOT flagging. Likely a SEC search ciks-scoping failure.`
+    );
+  }
+  return { hitCompanyName, trusted };
+}
+
 async function evaluatePreGate(symbol) {
   try {
     const cik = await getCik(symbol);
@@ -964,7 +1011,9 @@ async function evaluatePreGate(symbol) {
         );
         return {
           status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
-          note: `Pre-Gate solvency flag active since ${flaggedDate} — forces DOWN regardless of any other gate. `
+          note: `Pre-Gate solvency flag active since ${flaggedDate}`
+            + `${existingFlag.trigger_company_name ? ` (matched filing by ${existingFlag.trigger_company_name})` : ""} `
+            + `— forces DOWN regardless of any other gate. `
             + `Clears only once a subsequent 10-Q/10-K drops the going-concern/distress language AND a `
             + `corroborated positive catalyst confirms it (filing: ${filingClear ? "clear" : "still flagged"}, `
             + `catalyst: ${catalystClear ? "confirmed" : "none yet"}).`,
@@ -997,14 +1046,25 @@ async function evaluatePreGate(symbol) {
       new Date(Date.now() - PRE_GATE_SOLVENCY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString()
     );
     if (wideSolvencyHits.length) {
-      await flagSolvency(symbol, wideSolvencyHits[0]._id);
-      return {
-        status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
-        note: `Pre-Gate solvency hard trigger — going-concern/bankruptcy/default/delisting language found in `
-          + `SEC filings (within the last ${Math.round(PRE_GATE_SOLVENCY_LOOKBACK_DAYS / 365 * 10) / 10} years). `
-          + `Forces DOWN regardless of any other gate. Clears only once a subsequent 10-Q/10-K drops the `
-          + `language AND a corroborated positive catalyst confirms it.`,
-      };
+      let trustedHit = null, trustedName = null;
+      for (const h of wideSolvencyHits) {
+        const { hitCompanyName, trusted } = checkHitCompanyMatch(symbol, h);
+        if (trusted) { trustedHit = h; trustedName = hitCompanyName; break; }
+      }
+      if (trustedHit) {
+        await flagSolvency(symbol, trustedHit._id, trustedName);
+        return {
+          status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
+          note: `Pre-Gate solvency hard trigger — going-concern/bankruptcy/default/delisting language found in `
+            + `a SEC filing${trustedName ? ` by ${trustedName}` : ""} (within the last `
+            + `${Math.round(PRE_GATE_SOLVENCY_LOOKBACK_DAYS / 365 * 10) / 10} years). Forces DOWN regardless of `
+            + `any other gate. Clears only once a subsequent 10-Q/10-K drops the language AND a corroborated `
+            + `positive catalyst confirms it.`,
+        };
+      }
+      // Every hit failed the company-name cross-check -- don't trust
+      // unverifiable attribution, fall through to the narrower 45-day
+      // search below instead of flagging.
     }
 
     const allKeywords = Object.values(PRE_GATE_TRIGGERS).flatMap(t => t.keywords);
@@ -1021,7 +1081,18 @@ async function evaluatePreGate(symbol) {
       const text = `${(hit._source?.display_names || []).join(" ")} ${JSON.stringify(hit.highlight || hit._source || {})}`.toLowerCase();
       for (const [category, def] of Object.entries(PRE_GATE_TRIGGERS)) {
         if (def.keywords.some(kw => text.includes(kw))) {
-          matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id });
+          // Same cross-company guard as the wide-lookback pre-check above --
+          // a solvency match whose filing's own reported company doesn't
+          // plausibly match the ticker's expected company gets suppressed
+          // here, not counted as a hard trigger at all, so hasHardTrigger
+          // below never sees it.
+          if (category === "solvency") {
+            const { hitCompanyName, trusted } = checkHitCompanyMatch(symbol, hit);
+            if (!trusted) continue;
+            matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id, companyName: hitCompanyName });
+          } else {
+            matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id });
+          }
         }
       }
     }
@@ -1038,7 +1109,7 @@ async function evaluatePreGate(symbol) {
     // here persists the flag so it keeps forcing RED beyond this one
     // request, independent of the 45-day window, per the block above.
     const solvencyHit = matched.find(m => m.category === "solvency");
-    if (solvencyHit) await flagSolvency(symbol, solvencyHit.accession);
+    if (solvencyHit) await flagSolvency(symbol, solvencyHit.accession, solvencyHit.companyName);
 
     let escalated = false;
     if (!hasHardTrigger) {

@@ -778,26 +778,30 @@ async function evaluatePreGate(symbol) {
       };
     }
 
-    const allKeywords = Object.values(PRE_GATE_TRIGGERS).flatMap(t => t.keywords);
-    const hits = await searchEdgarFilings(cik, allKeywords);
-    if (!hits.length) {
-      return { status: "GREEN", hardTrigger: false, note: "No solvency, dilution, or guidance-cut language found in recent SEC filings." };
-    }
-
-    // Classify each hit into a trigger category by keyword match against its
-    // returned metadata (full-text search returns snippets/highlights, not
-    // the full filing body).
+    // Search each trigger category SEPARATELY, one query per category,
+    // instead of one combined OR'd query reclassified afterward against a
+    // `hit.highlight` field (Aug 18, 2026 fix -- confirmed via live Render
+    // logs: BALY's real, current going-concern 10-Q came back as 3
+    // correctly-attributed hits from the search itself, then classified to
+    // ZERO categories, because EDGAR's full-text search response doesn't
+    // reliably populate `highlight` the way the old code assumed -- every
+    // genuine hit was silently thrown away after the fact. A hit returned
+    // from a query scoped to only ONE category's keywords is guaranteed,
+    // by construction of a full-text keyword search, to actually contain
+    // that category's language somewhere in the filing -- there's no
+    // post-hoc reclassification step left to get wrong. Costs 3 SEC calls
+    // per evaluatePreGate() invocation instead of 1, but this only runs
+    // once per ticker per 24h (preGateCache), so the extra throttled calls
+    // are a modest, acceptable price for actually working.
     const matched = [];
-    for (const hit of hits) {
-      const text = `${(hit._source?.display_names || []).join(" ")} ${JSON.stringify(hit.highlight || hit._source || {})}`.toLowerCase();
-      for (const [category, def] of Object.entries(PRE_GATE_TRIGGERS)) {
-        if (def.keywords.some(kw => text.includes(kw))) {
-          matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id });
-        }
+    for (const [category, def] of Object.entries(PRE_GATE_TRIGGERS)) {
+      const hits = await searchEdgarFilings(cik, def.keywords);
+      for (const hit of hits) {
+        matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id });
       }
     }
     if (!matched.length) {
-      return { status: "GREEN", hardTrigger: false, note: "SEC filings matched search terms but none confirmed a hard/soft trigger category on closer classification." };
+      return { status: "GREEN", hardTrigger: false, note: "No solvency, dilution, or guidance-cut language found in recent SEC filings." };
     }
 
     const hasHardTrigger = matched.some(m => m.hardOrSoft === "hard");

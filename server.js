@@ -399,10 +399,26 @@ function classifyTicker(symbol, sectorInfo) {
 // framework docs; these keyword lists are a reasonable starting point, not
 // an authoritative spec. Tune against real false-positive/negative rates
 // before trusting this to force verdicts unattended.
+//
+// Coverage gap found live (Aug 18, 2026): PARA filed a distress 8-K but
+// Pre-Gate stayed GREEN. Root cause — solvency's keyword list only covered
+// the narrow auditor-opinion phrasing ("substantial doubt"/"going concern"),
+// which is what shows up in a 10-K/10-Q footnote, not what a company's own
+// 8-K typically says when announcing real trouble (a bankruptcy filing, a
+// debt default, or a delisting notice — Items 1.03/2.04/3.01). Widened to
+// cover those directly. Still a first draft, still needs real-world tuning,
+// but this closes the specific gap PARA exposed rather than just the one
+// phrasing that happened to already be there.
 const PRE_GATE_TRIGGERS = {
   solvency: {
     hardOrSoft: "hard",
-    keywords: ["substantial doubt", "going concern"],
+    keywords: [
+      "substantial doubt", "going concern",
+      "chapter 11", "chapter 7 bankruptcy", "voluntary petition for bankruptcy",
+      "bankruptcy protection", "insolvent", "insolvency", "receivership",
+      "event of default", "notice of default", "acceleration of indebtedness",
+      "notice of delisting", "delisting notice",
+    ],
   },
   dilution: {
     hardOrSoft: "soft",

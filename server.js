@@ -399,10 +399,27 @@ function classifyTicker(symbol, sectorInfo) {
 // framework docs; these keyword lists are a reasonable starting point, not
 // an authoritative spec. Tune against real false-positive/negative rates
 // before trusting this to force verdicts unattended.
+//
+// Widened solvency keywords (Aug 18, 2026, re-landed after a same-day
+// revert of the persistent-flag work built on top of this): a distress
+// 8-K rarely uses the narrow auditor-opinion phrasing below on its own --
+// it announces a bankruptcy filing, a debt default, or a delisting notice
+// (Items 1.03/2.04/3.01). This fix itself was never disproven by anything
+// that happened later the same day -- only the NEW enforcement mechanism
+// built on top of it (persistent flag, wide lookback, cross-company
+// guard) caused a live false positive and got reverted. Re-landing this
+// half alone, paired with real diagnostic logging this time, before
+// rebuilding any enforcement on top of it.
 const PRE_GATE_TRIGGERS = {
   solvency: {
     hardOrSoft: "hard",
-    keywords: ["substantial doubt", "going concern"],
+    keywords: [
+      "substantial doubt", "going concern",
+      "chapter 11", "chapter 7 bankruptcy", "voluntary petition for bankruptcy",
+      "bankruptcy protection", "insolvent", "insolvency", "receivership",
+      "event of default", "notice of default", "acceleration of indebtedness",
+      "notice of delisting", "delisting notice",
+    ],
   },
   dilution: {
     hardOrSoft: "soft",
@@ -473,6 +490,7 @@ function secThrottle() {
 // re-fetches and re-parses the entire SEC ticker list instead of the whole
 // burst sharing one fetch.
 let tickerCikCache = null;
+let tickerCikNameCache = null; // ticker -> company name (title), logged alongside CIK resolution for direct diagnosis
 let tickerCikCacheAt = 0;
 let tickerCikInFlight = null;
 
@@ -634,10 +652,14 @@ async function getCik(symbol) {
           if (!res.ok) throw new Error(`SEC company_tickers ${res.status}`);
           const data = await res.json();
           const map = {};
+          const nameMap = {};
           Object.values(data).forEach(row => {
-            map[String(row.ticker).toUpperCase()] = String(row.cik_str).padStart(10, "0");
+            const t = String(row.ticker).toUpperCase();
+            map[t] = String(row.cik_str).padStart(10, "0");
+            if (row.title) nameMap[t] = row.title;
           });
           tickerCikCache = map;
+          tickerCikNameCache = nameMap;
           tickerCikCacheAt = Date.now();
         } catch (e) {
           console.error("getCik ticker map fetch:", e.message);
@@ -648,12 +670,30 @@ async function getCik(symbol) {
     }
     await tickerCikInFlight;
   }
+  // Diagnostic logging (Aug 18, 2026, re-landed observation-only after
+  // today's enforcement mechanism -- persistent flag/wide lookback/
+  // cross-company guard -- was reverted for causing a live false
+  // positive). Before rebuilding any of that, get real Render-log
+  // evidence of which CIK/company a ticker actually resolves to and what
+  // the real SEC full-text search returns. Grep Render logs for
+  // "[PRE-GATE]".
   const primary = tickerCikCache ? (tickerCikCache[sym] || null) : null;
-  if (primary) return primary;
-  if (KNOWN_CIK_OVERRIDES[sym]) return KNOWN_CIK_OVERRIDES[sym];
+  if (primary) {
+    console.log(`[PRE-GATE] ${sym} -> CIK ${primary} (primary map: ${tickerCikNameCache?.[sym] || "name unknown"})`);
+    return primary;
+  }
+  if (KNOWN_CIK_OVERRIDES[sym]) {
+    console.log(`[PRE-GATE] ${sym} -> CIK ${KNOWN_CIK_OVERRIDES[sym]} (KNOWN_CIK_OVERRIDES)`);
+    return KNOWN_CIK_OVERRIDES[sym];
+  }
   const fundCik = await getCikFromFundMap(sym);
-  if (fundCik) return fundCik;
-  return getCikFromEdgarSearch(sym);
+  if (fundCik) {
+    console.log(`[PRE-GATE] ${sym} -> CIK ${fundCik} (fund ticker map)`);
+    return fundCik;
+  }
+  const edgarCik = await getCikFromEdgarSearch(sym);
+  console.log(`[PRE-GATE] ${sym} -> CIK ${edgarCik || "NOT FOUND"} (live EDGAR search, last-resort tier)`);
+  return edgarCik;
 }
 
 async function searchEdgarFilings(cik, keywords) {
@@ -661,16 +701,35 @@ async function searchEdgarFilings(cik, keywords) {
     .toISOString().slice(0, 10);
   const enddt = new Date().toISOString().slice(0, 10);
   const q = keywords.map(k => `"${k}"`).join(" OR ");
+  // dateRange=custom is required by efts.sec.gov whenever startdt/enddt are
+  // supplied -- the real EDGAR full-text-search UI always includes it
+  // alongside a custom date range. Without it the request is liable to be
+  // rejected or the date filter silently dropped. Re-landed alongside the
+  // keyword widening above -- neither of these two request-correctness
+  // fixes was ever disproven by anything that happened later the same
+  // day; only the persistence/enforcement layer built on top got reverted.
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
-    `&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
+    `&dateRange=custom&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
+  // Diagnostic logging, re-landed observation-only (Aug 18, 2026) -- see
+  // getCik() above. This is the actual evidence needed before any
+  // enforcement mechanism gets rebuilt on top of this function.
+  console.log(`[PRE-GATE] searchEdgarFilings request: ${url}`);
   try {
     await secThrottle();
     const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
-    if (!res.ok) throw new Error(`EDGAR full-text search ${res.status}`);
+    console.log(`[PRE-GATE] searchEdgarFilings response: HTTP ${res.status} for CIK ${cik}`);
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "(could not read body)");
+      console.log(`[PRE-GATE] searchEdgarFilings error body (first 500 chars): ${bodyText.slice(0, 500)}`);
+      throw new Error(`EDGAR full-text search ${res.status}`);
+    }
     const data = await res.json();
-    return data?.hits?.hits || [];
+    const hits = data?.hits?.hits || [];
+    const companies = hits.map(h => (h._source?.display_names || []).join(", ")).join(" | ") || "(none)";
+    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${hits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}, companies: ${companies}`);
+    return hits;
   } catch (e) {
-    console.error(`searchEdgarFilings ${cik}:`, e.message);
+    console.error(`[PRE-GATE] searchEdgarFilings ${cik} FAILED:`, e.message);
     return [];
   }
 }

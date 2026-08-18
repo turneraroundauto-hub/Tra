@@ -677,8 +677,20 @@ async function searchEdgarFilings(cik, keywords) {
     .toISOString().slice(0, 10);
   const enddt = new Date().toISOString().slice(0, 10);
   const q = keywords.map(k => `"${k}"`).join(" OR ");
+  // dateRange=custom is required by efts.sec.gov whenever startdt/enddt are
+  // supplied -- the real EDGAR full-text-search UI always includes it
+  // alongside a custom date range, and this endpoint was found missing it
+  // entirely (Aug 18, 2026, live report: Pre-Gate stayed GREEN across every
+  // 8-K distress case, not just the keyword-coverage gap fixed alongside
+  // this). Without it, startdt/enddt are liable to be rejected outright,
+  // which would make every single searchEdgarFilings call fail and get
+  // silently caught, returning [] -- i.e. every ticker reads as clean
+  // regardless of what its filings actually say. Unverified against a live
+  // response -- same standing sandbox limitation as everything else
+  // SEC-related in this file (sec.gov is unreachable from here) -- but this
+  // param is a well-documented requirement of this exact endpoint.
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
-    `&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
+    `&dateRange=custom&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
   try {
     await secThrottle();
     const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);

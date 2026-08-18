@@ -672,9 +672,14 @@ async function getCik(symbol) {
   return getCikFromEdgarSearch(sym);
 }
 
-async function searchEdgarFilings(cik, keywords) {
-  const startdt = new Date(Date.now() - PRE_GATE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
-    .toISOString().slice(0, 10);
+// forms/sinceDate are optional overrides so the solvency-clearance check
+// below can reuse this same function scoped to 10-Q/10-K only, searching
+// from the flag's onset date instead of the default 45-day window --
+// existing call sites (passing just cik/keywords) are unaffected.
+async function searchEdgarFilings(cik, keywords, forms = PRE_GATE_FORMS, sinceDate = null) {
+  const startdt = sinceDate
+    ? new Date(sinceDate).toISOString().slice(0, 10)
+    : new Date(Date.now() - PRE_GATE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const enddt = new Date().toISOString().slice(0, 10);
   const q = keywords.map(k => `"${k}"`).join(" OR ");
   // dateRange=custom is required by efts.sec.gov whenever startdt/enddt are
@@ -690,7 +695,7 @@ async function searchEdgarFilings(cik, keywords) {
   // SEC-related in this file (sec.gov is unreachable from here) -- but this
   // param is a well-documented requirement of this exact endpoint.
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
-    `&dateRange=custom&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
+    `&dateRange=custom&ciks=${cik}&forms=${forms}&startdt=${startdt}&enddt=${enddt}`;
   try {
     await secThrottle();
     const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
@@ -737,6 +742,161 @@ async function logPreGateTrigger(symbol, category, hardOrSoft, filingAccession) 
   }
 }
 
+// ─── PERSISTENT SOLVENCY FLAG (Aug 18, 2026) ──────────────────────────
+// Direct instruction, prompted by a live report that a distress 8-K
+// (PARA) wasn't forcing a hard DOWN at all: a hard solvency trigger
+// should keep forcing DOWN indefinitely -- independent of the 45-day
+// rolling lookback every other Pre-Gate check uses, which would otherwise
+// silently stop flagging a real, still-unresolved going-concern situation
+// the moment it ages out of the window -- until BOTH (a) a subsequent
+// 10-Q/10-K no longer contains going-concern/distress language, AND
+// (b) a corroborated, congruent positive catalyst confirms it. Scoped to
+// solvency only, per direct confirmation -- dilution/guidance-cut stay
+// soft/escalating exactly as before, untouched by any of this.
+//
+// Same shape as proxy_regime_state (Proposal 3, Aug 13, 2026): gracefully
+// no-ops (never persists, never blocks via this mechanism) if Supabase
+// isn't configured or the table doesn't exist yet -- see
+// supabase-ddl-patch10-solvency-state.sql, which must be run manually
+// before this actually takes effect in production.
+//
+// FIRST DRAFT, NEEDS REVIEW, same posture as PRE_GATE_TRIGGERS itself --
+// the catalyst-corroboration keyword list and price threshold below are a
+// reasonable starting point, not a tuned spec.
+async function getSolvencyFlag(symbol) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from("pre_gate_solvency_state")
+      .select("*")
+      .eq("ticker", symbol)
+      .eq("flagged", true)
+      .maybeSingle();
+    if (error || !data) return null;
+    return data;
+  } catch (e) {
+    console.error(`getSolvencyFlag ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+async function flagSolvency(symbol, accession) {
+  if (!supabase) return;
+  try {
+    const { data: existing } = await supabase
+      .from("pre_gate_solvency_state")
+      .select("flagged, first_flagged_at")
+      .eq("ticker", symbol)
+      .maybeSingle();
+    // Keep the original onset date if this ticker is already flagged (a
+    // fresh hit inside the normal 45-day search just confirms the existing
+    // flag, doesn't restart its clock) -- only a re-onset after a genuine
+    // prior clearance gets a new first_flagged_at.
+    const firstFlaggedAt = existing?.flagged === true ? existing.first_flagged_at : new Date().toISOString();
+    await supabase.from("pre_gate_solvency_state").upsert({
+      ticker: symbol,
+      flagged: true,
+      first_flagged_at: firstFlaggedAt,
+      last_checked_at: new Date().toISOString(),
+      trigger_accession: accession || null,
+      filing_clear: false,
+      catalyst_clear: false,
+      cleared_at: null,
+    }, { onConflict: "ticker" });
+  } catch (e) {
+    console.error(`flagSolvency ${symbol}:`, e.message);
+  }
+}
+
+// Part A of clearance: has a REAL subsequent 10-Q/10-K been filed since the
+// flag, and does it no longer contain the going-concern/distress language?
+// A going-concern opinion lives in the audited financials, not an 8-K, so
+// this deliberately searches 10-Q/10-K only. Full-text search can only
+// confirm what DOES match, never what doesn't -- an empty keyword-hit
+// result is ambiguous (resolved, or simply no new 10-Q/10-K filed yet), so
+// this also independently confirms a real subsequent filing actually
+// exists via SEC's submissions feed before calling it clear.
+async function hasNewerFiling(cik, forms, sinceDate) {
+  try {
+    await secThrottle();
+    const url = `https://data.sec.gov/submissions/CIK${cik}.json`;
+    const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
+    if (!res.ok) throw new Error(`SEC submissions ${res.status}`);
+    const data = await res.json();
+    const recent = data?.filings?.recent;
+    if (!Array.isArray(recent?.form) || !Array.isArray(recent?.filingDate)) return false;
+    const formSet = new Set(forms);
+    const since = new Date(sinceDate).getTime();
+    for (let i = 0; i < recent.form.length; i++) {
+      if (formSet.has(recent.form[i]) && new Date(recent.filingDate[i]).getTime() > since) return true;
+    }
+    return false;
+  } catch (e) {
+    console.error(`hasNewerFiling ${cik}:`, e.message);
+    return false;
+  }
+}
+
+async function checkSolvencyFilingClear(cik, flaggedSince) {
+  const stillFlaggedHits = await searchEdgarFilings(
+    cik, PRE_GATE_TRIGGERS.solvency.keywords, "10-Q,10-K", flaggedSince
+  );
+  if (stillFlaggedHits.length) return false; // a post-flag 10-Q/10-K still contains it
+  return hasNewerFiling(cik, ["10-Q", "10-K"], flaggedSince);
+}
+
+// Part B of clearance: a corroborated, congruent positive catalyst --
+// "corroborated" (real resolution language in recent news) AND "congruent"
+// (the ticker's own price agrees) both required, same "don't clear on one
+// signal alone" posture as every other corroboration mechanism in this
+// file (Proposal 4's news/price/calendar corroboration, the Gate 5 Proxy
+// Coherence Check). Reuses fetchTickerMetrics()/fetchNewsBodiesForCorroboration()
+// as-is -- no new fetches beyond what those already do, and both are only
+// called here, on the rare already-flagged ticker, not on every request.
+const SOLVENCY_CATALYST_KEYWORDS = [
+  "debt refinanced", "refinanced its debt", "credit facility secured", "new credit facility",
+  "capital raise completed", "completed its restructuring", "restructuring completed",
+  "regained compliance", "returned to compliance", "going concern doubt alleviated",
+  "going concern doubt resolved", "no longer substantial doubt", "returned to profitability",
+  "raised guidance", "increased guidance", "beat consensus estimates", "beat analyst estimates",
+];
+const SOLVENCY_CATALYST_PRICE_PCT = 2; // first-draft threshold -- needs real tuning
+
+async function checkSolvencyCatalystClear(symbol) {
+  const [metrics, newsBodies] = await Promise.all([
+    fetchTickerMetrics(symbol).catch(() => null),
+    fetchNewsBodiesForCorroboration(symbol).catch(() => []),
+  ]);
+  const priceUp = typeof metrics?.pct === "number" && metrics.pct >= SOLVENCY_CATALYST_PRICE_PCT;
+  const newsPositive = newsBodies.some(body => {
+    const lower = body.toLowerCase();
+    return SOLVENCY_CATALYST_KEYWORDS.some(kw => lower.includes(kw));
+  });
+  return priceUp && newsPositive;
+}
+
+async function checkSolvencyClearance(symbol, cik, flaggedRow) {
+  const [filingClear, catalystClear] = await Promise.all([
+    checkSolvencyFilingClear(cik, flaggedRow.first_flagged_at),
+    checkSolvencyCatalystClear(symbol),
+  ]);
+  const bothClear = filingClear && catalystClear;
+  if (supabase) {
+    try {
+      await supabase.from("pre_gate_solvency_state").update({
+        last_checked_at: new Date().toISOString(),
+        filing_clear: filingClear,
+        catalyst_clear: catalystClear,
+        flagged: !bothClear,
+        cleared_at: bothClear ? new Date().toISOString() : null,
+      }).eq("ticker", symbol);
+    } catch (e) {
+      console.error(`checkSolvencyClearance persist ${symbol}:`, e.message);
+    }
+  }
+  return { filingClear, catalystClear, bothClear };
+}
+
 async function evaluatePreGate(symbol) {
   try {
     const cik = await getCik(symbol);
@@ -745,6 +905,34 @@ async function evaluatePreGate(symbol) {
         status: "GREEN", hardTrigger: false,
         note: `No SEC CIK found for ${symbol} — skipping Pre-Gate screen (likely non-US-listed or not in the SEC ticker map).`,
       };
+    }
+
+    // Persistent solvency flag (Aug 18, 2026) -- checked before the normal
+    // 45-day search below, and independent of it: a ticker flagged from a
+    // PRIOR hard solvency trigger keeps forcing RED even if nothing in the
+    // current 45-day window matches anymore (that's the whole point --
+    // don't let a real, unresolved going-concern situation silently clear
+    // itself just by aging out of the rolling window). Falls through to the
+    // normal search only once BOTH clearance conditions are actually met.
+    const existingFlag = await getSolvencyFlag(symbol);
+    if (existingFlag) {
+      const { filingClear, catalystClear, bothClear } = await checkSolvencyClearance(symbol, cik, existingFlag);
+      if (!bothClear) {
+        const flaggedDate = new Date(existingFlag.first_flagged_at).toLocaleDateString(
+          "en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" }
+        );
+        return {
+          status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
+          note: `Pre-Gate solvency flag active since ${flaggedDate} — forces DOWN regardless of any other gate. `
+            + `Clears only once a subsequent 10-Q/10-K drops the going-concern/distress language AND a `
+            + `corroborated positive catalyst confirms it (filing: ${filingClear ? "clear" : "still flagged"}, `
+            + `catalyst: ${catalystClear ? "confirmed" : "none yet"}).`,
+        };
+      }
+      // Both conditions just cleared -- fall through to a normal fresh
+      // search below instead of returning GREEN outright, so a hard
+      // trigger sitting inside the CURRENT 45-day window (a genuinely new,
+      // separate event) still gets caught in the same pass.
     }
 
     const allKeywords = Object.values(PRE_GATE_TRIGGERS).flatMap(t => t.keywords);
@@ -773,6 +961,12 @@ async function evaluatePreGate(symbol) {
     for (const m of matched) {
       if (m.hardOrSoft === "soft") await logPreGateTrigger(symbol, m.category, "soft", m.accession);
     }
+
+    // Solvency is the only hard category (see PRE_GATE_TRIGGERS) -- a hit
+    // here persists the flag so it keeps forcing RED beyond this one
+    // request, independent of the 45-day window, per the block above.
+    const solvencyHit = matched.find(m => m.category === "solvency");
+    if (solvencyHit) await flagSolvency(symbol, solvencyHit.accession);
 
     let escalated = false;
     if (!hasHardTrigger) {

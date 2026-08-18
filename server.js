@@ -399,26 +399,10 @@ function classifyTicker(symbol, sectorInfo) {
 // framework docs; these keyword lists are a reasonable starting point, not
 // an authoritative spec. Tune against real false-positive/negative rates
 // before trusting this to force verdicts unattended.
-//
-// Coverage gap found live (Aug 18, 2026): PARA filed a distress 8-K but
-// Pre-Gate stayed GREEN. Root cause — solvency's keyword list only covered
-// the narrow auditor-opinion phrasing ("substantial doubt"/"going concern"),
-// which is what shows up in a 10-K/10-Q footnote, not what a company's own
-// 8-K typically says when announcing real trouble (a bankruptcy filing, a
-// debt default, or a delisting notice — Items 1.03/2.04/3.01). Widened to
-// cover those directly. Still a first draft, still needs real-world tuning,
-// but this closes the specific gap PARA exposed rather than just the one
-// phrasing that happened to already be there.
 const PRE_GATE_TRIGGERS = {
   solvency: {
     hardOrSoft: "hard",
-    keywords: [
-      "substantial doubt", "going concern",
-      "chapter 11", "chapter 7 bankruptcy", "voluntary petition for bankruptcy",
-      "bankruptcy protection", "insolvent", "insolvency", "receivership",
-      "event of default", "notice of default", "acceleration of indebtedness",
-      "notice of delisting", "delisting notice",
-    ],
+    keywords: ["substantial doubt", "going concern"],
   },
   dilution: {
     hardOrSoft: "soft",
@@ -447,15 +431,6 @@ const PRE_GATE_TRIGGERS = {
 // list benefits every trigger category, not just dilution.
 const PRE_GATE_FORMS = "8-K,10-Q,10-K,S-1,S-3,424B2,424B3,424B4,424B5";
 const PRE_GATE_LOOKBACK_DAYS = 45;
-// Solvency needs its own, much wider lookback -- see evaluatePreGate()'s
-// dedicated pre-check. A going-concern/bankruptcy/default/delisting event
-// that already predates the routine 45-day window by the time this code
-// first runs for a given ticker would otherwise NEVER get flagged at all --
-// the persistent-flag mechanism only persists a flag once created, it can't
-// create one from a filing outside PRE_GATE_LOOKBACK_DAYS. First draft --
-// 2 years is a reasonable "catch it whenever it happened" balance, not a
-// tuned spec.
-const PRE_GATE_SOLVENCY_LOOKBACK_DAYS = 730;
 const PRE_GATE_ESCALATION_WINDOW_DAYS = 30;
 const PRE_GATE_ESCALATION_COUNT = 2;
 const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeTribunal research contact@example.com";
@@ -659,14 +634,10 @@ async function getCik(symbol) {
           if (!res.ok) throw new Error(`SEC company_tickers ${res.status}`);
           const data = await res.json();
           const map = {};
-          const nameMap = {};
           Object.values(data).forEach(row => {
-            const t = String(row.ticker).toUpperCase();
-            map[t] = String(row.cik_str).padStart(10, "0");
-            if (row.title) nameMap[t] = row.title; // for diagnosing a ticker->wrong-company resolution, see evaluatePreGate
+            map[String(row.ticker).toUpperCase()] = String(row.cik_str).padStart(10, "0");
           });
           tickerCikCache = map;
-          tickerCikNameCache = nameMap;
           tickerCikCacheAt = Date.now();
         } catch (e) {
           console.error("getCik ticker map fetch:", e.message);
@@ -678,73 +649,28 @@ async function getCik(symbol) {
     await tickerCikInFlight;
   }
   const primary = tickerCikCache ? (tickerCikCache[sym] || null) : null;
-  if (primary) {
-    console.log(`[PRE-GATE] ${sym} -> CIK ${primary} (primary map: ${tickerCikNameCache?.[sym] || "name unknown"})`);
-    return primary;
-  }
-  if (KNOWN_CIK_OVERRIDES[sym]) {
-    console.log(`[PRE-GATE] ${sym} -> CIK ${KNOWN_CIK_OVERRIDES[sym]} (KNOWN_CIK_OVERRIDES)`);
-    return KNOWN_CIK_OVERRIDES[sym];
-  }
+  if (primary) return primary;
+  if (KNOWN_CIK_OVERRIDES[sym]) return KNOWN_CIK_OVERRIDES[sym];
   const fundCik = await getCikFromFundMap(sym);
-  if (fundCik) {
-    console.log(`[PRE-GATE] ${sym} -> CIK ${fundCik} (fund ticker map)`);
-    return fundCik;
-  }
-  const edgarCik = await getCikFromEdgarSearch(sym);
-  console.log(`[PRE-GATE] ${sym} -> CIK ${edgarCik || "NOT FOUND"} (live EDGAR search, last-resort tier)`);
-  return edgarCik;
+  if (fundCik) return fundCik;
+  return getCikFromEdgarSearch(sym);
 }
 
-// forms/sinceDate are optional overrides so the solvency-clearance check
-// below can reuse this same function scoped to 10-Q/10-K only, searching
-// from the flag's onset date instead of the default 45-day window --
-// existing call sites (passing just cik/keywords) are unaffected.
-async function searchEdgarFilings(cik, keywords, forms = PRE_GATE_FORMS, sinceDate = null) {
-  const startdt = sinceDate
-    ? new Date(sinceDate).toISOString().slice(0, 10)
-    : new Date(Date.now() - PRE_GATE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+async function searchEdgarFilings(cik, keywords) {
+  const startdt = new Date(Date.now() - PRE_GATE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10);
   const enddt = new Date().toISOString().slice(0, 10);
   const q = keywords.map(k => `"${k}"`).join(" OR ");
-  // dateRange=custom is required by efts.sec.gov whenever startdt/enddt are
-  // supplied -- the real EDGAR full-text-search UI always includes it
-  // alongside a custom date range, and this endpoint was found missing it
-  // entirely (Aug 18, 2026, live report: Pre-Gate stayed GREEN across every
-  // 8-K distress case, not just the keyword-coverage gap fixed alongside
-  // this). Without it, startdt/enddt are liable to be rejected outright,
-  // which would make every single searchEdgarFilings call fail and get
-  // silently caught, returning [] -- i.e. every ticker reads as clean
-  // regardless of what its filings actually say. Unverified against a live
-  // response -- same standing sandbox limitation as everything else
-  // SEC-related in this file (sec.gov is unreachable from here) -- but this
-  // param is a well-documented requirement of this exact endpoint.
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(q)}` +
-    `&dateRange=custom&ciks=${cik}&forms=${forms}&startdt=${startdt}&enddt=${enddt}`;
-  // Diagnostic logging (Aug 18, 2026) -- after 4 rounds of fixes that all
-  // reasoned correctly about this endpoint's documented behavior but
-  // couldn't be verified against a live response from this sandbox
-  // (sec.gov is unreachable here), a real going-concern filing (PLAG/XTI,
-  // exact "substantial doubt"/"going concern" keyword matches, well inside
-  // every lookback window) STILL came back GREEN live. Rather than guess a
-  // fifth time, log exactly what this function sends and gets back, so a
-  // real Render-log check can show what's actually happening instead of
-  // more reasoning from documentation. Grep Render logs for "[PRE-GATE]".
-  console.log(`[PRE-GATE] searchEdgarFilings request: ${url}`);
+    `&ciks=${cik}&forms=${PRE_GATE_FORMS}&startdt=${startdt}&enddt=${enddt}`;
   try {
     await secThrottle();
     const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
-    console.log(`[PRE-GATE] searchEdgarFilings response: HTTP ${res.status} for CIK ${cik}`);
-    if (!res.ok) {
-      const bodyText = await res.text().catch(() => "(could not read body)");
-      console.log(`[PRE-GATE] searchEdgarFilings error body (first 500 chars): ${bodyText.slice(0, 500)}`);
-      throw new Error(`EDGAR full-text search ${res.status}`);
-    }
+    if (!res.ok) throw new Error(`EDGAR full-text search ${res.status}`);
     const data = await res.json();
-    const hits = data?.hits?.hits || [];
-    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${hits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}`);
-    return hits;
+    return data?.hits?.hits || [];
   } catch (e) {
-    console.error(`[PRE-GATE] searchEdgarFilings ${cik} FAILED:`, e.message);
+    console.error(`searchEdgarFilings ${cik}:`, e.message);
     return [];
   }
 }
@@ -783,208 +709,6 @@ async function logPreGateTrigger(symbol, category, hardOrSoft, filingAccession) 
   }
 }
 
-// ─── PERSISTENT SOLVENCY FLAG (Aug 18, 2026) ──────────────────────────
-// Direct instruction, prompted by a live report that a distress 8-K
-// (PARA) wasn't forcing a hard DOWN at all: a hard solvency trigger
-// should keep forcing DOWN indefinitely -- independent of the 45-day
-// rolling lookback every other Pre-Gate check uses, which would otherwise
-// silently stop flagging a real, still-unresolved going-concern situation
-// the moment it ages out of the window -- until BOTH (a) a subsequent
-// 10-Q/10-K no longer contains going-concern/distress language, AND
-// (b) a corroborated, congruent positive catalyst confirms it. Scoped to
-// solvency only, per direct confirmation -- dilution/guidance-cut stay
-// soft/escalating exactly as before, untouched by any of this.
-//
-// Same shape as proxy_regime_state (Proposal 3, Aug 13, 2026): gracefully
-// no-ops (never persists, never blocks via this mechanism) if Supabase
-// isn't configured or the table doesn't exist yet -- see
-// supabase-ddl-patch10-solvency-state.sql, which must be run manually
-// before this actually takes effect in production.
-//
-// FIRST DRAFT, NEEDS REVIEW, same posture as PRE_GATE_TRIGGERS itself --
-// the catalyst-corroboration keyword list and price threshold below are a
-// reasonable starting point, not a tuned spec.
-async function getSolvencyFlag(symbol) {
-  if (!supabase) return null;
-  try {
-    const { data, error } = await supabase
-      .from("pre_gate_solvency_state")
-      .select("*")
-      .eq("ticker", symbol)
-      .eq("flagged", true)
-      .maybeSingle();
-    if (error || !data) return null;
-    return data;
-  } catch (e) {
-    console.error(`getSolvencyFlag ${symbol}:`, e.message);
-    return null;
-  }
-}
-
-async function flagSolvency(symbol, accession, companyName) {
-  if (!supabase) return;
-  try {
-    const { data: existing } = await supabase
-      .from("pre_gate_solvency_state")
-      .select("flagged, first_flagged_at")
-      .eq("ticker", symbol)
-      .maybeSingle();
-    // Keep the original onset date if this ticker is already flagged (a
-    // fresh hit inside the normal 45-day search just confirms the existing
-    // flag, doesn't restart its clock) -- only a re-onset after a genuine
-    // prior clearance gets a new first_flagged_at.
-    const firstFlaggedAt = existing?.flagged === true ? existing.first_flagged_at : new Date().toISOString();
-    await supabase.from("pre_gate_solvency_state").upsert({
-      ticker: symbol,
-      flagged: true,
-      first_flagged_at: firstFlaggedAt,
-      last_checked_at: new Date().toISOString(),
-      trigger_accession: accession || null,
-      trigger_company_name: companyName || null, // the filing's OWN reported company -- surfaced in the note so a mismatch is visible in the app itself, not just Render logs
-      filing_clear: false,
-      catalyst_clear: false,
-      cleared_at: null,
-    }, { onConflict: "ticker" });
-  } catch (e) {
-    console.error(`flagSolvency ${symbol}:`, e.message);
-  }
-}
-
-// Part A of clearance: has a REAL subsequent 10-Q/10-K been filed since the
-// flag, and does it no longer contain the going-concern/distress language?
-// A going-concern opinion lives in the audited financials, not an 8-K, so
-// this deliberately searches 10-Q/10-K only. Full-text search can only
-// confirm what DOES match, never what doesn't -- an empty keyword-hit
-// result is ambiguous (resolved, or simply no new 10-Q/10-K filed yet), so
-// this also independently confirms a real subsequent filing actually
-// exists via SEC's submissions feed before calling it clear.
-async function hasNewerFiling(cik, forms, sinceDate) {
-  try {
-    await secThrottle();
-    const url = `https://data.sec.gov/submissions/CIK${cik}.json`;
-    const res = await fetchWithTimeout(url, { headers: { "User-Agent": SEC_USER_AGENT } }, 8000);
-    if (!res.ok) throw new Error(`SEC submissions ${res.status}`);
-    const data = await res.json();
-    const recent = data?.filings?.recent;
-    if (!Array.isArray(recent?.form) || !Array.isArray(recent?.filingDate)) return false;
-    const formSet = new Set(forms);
-    const since = new Date(sinceDate).getTime();
-    for (let i = 0; i < recent.form.length; i++) {
-      if (formSet.has(recent.form[i]) && new Date(recent.filingDate[i]).getTime() > since) return true;
-    }
-    return false;
-  } catch (e) {
-    console.error(`hasNewerFiling ${cik}:`, e.message);
-    return false;
-  }
-}
-
-async function checkSolvencyFilingClear(cik, flaggedSince) {
-  const stillFlaggedHits = await searchEdgarFilings(
-    cik, PRE_GATE_TRIGGERS.solvency.keywords, "10-Q,10-K", flaggedSince
-  );
-  if (stillFlaggedHits.length) return false; // a post-flag 10-Q/10-K still contains it
-  return hasNewerFiling(cik, ["10-Q", "10-K"], flaggedSince);
-}
-
-// Part B of clearance: a corroborated, congruent positive catalyst --
-// "corroborated" (real resolution language in recent news) AND "congruent"
-// (the ticker's own price agrees) both required, same "don't clear on one
-// signal alone" posture as every other corroboration mechanism in this
-// file (Proposal 4's news/price/calendar corroboration, the Gate 5 Proxy
-// Coherence Check). Reuses fetchTickerMetrics()/fetchNewsBodiesForCorroboration()
-// as-is -- no new fetches beyond what those already do, and both are only
-// called here, on the rare already-flagged ticker, not on every request.
-const SOLVENCY_CATALYST_KEYWORDS = [
-  "debt refinanced", "refinanced its debt", "credit facility secured", "new credit facility",
-  "capital raise completed", "completed its restructuring", "restructuring completed",
-  "regained compliance", "returned to compliance", "going concern doubt alleviated",
-  "going concern doubt resolved", "no longer substantial doubt", "returned to profitability",
-  "raised guidance", "increased guidance", "beat consensus estimates", "beat analyst estimates",
-];
-const SOLVENCY_CATALYST_PRICE_PCT = 2; // first-draft threshold -- needs real tuning
-
-async function checkSolvencyCatalystClear(symbol) {
-  const [metrics, newsBodies] = await Promise.all([
-    fetchTickerMetrics(symbol).catch(() => null),
-    fetchNewsBodiesForCorroboration(symbol).catch(() => []),
-  ]);
-  const priceUp = typeof metrics?.pct === "number" && metrics.pct >= SOLVENCY_CATALYST_PRICE_PCT;
-  const newsPositive = newsBodies.some(body => {
-    const lower = body.toLowerCase();
-    return SOLVENCY_CATALYST_KEYWORDS.some(kw => lower.includes(kw));
-  });
-  return priceUp && newsPositive;
-}
-
-async function checkSolvencyClearance(symbol, cik, flaggedRow) {
-  const [filingClear, catalystClear] = await Promise.all([
-    checkSolvencyFilingClear(cik, flaggedRow.first_flagged_at),
-    checkSolvencyCatalystClear(symbol),
-  ]);
-  const bothClear = filingClear && catalystClear;
-  if (supabase) {
-    try {
-      await supabase.from("pre_gate_solvency_state").update({
-        last_checked_at: new Date().toISOString(),
-        filing_clear: filingClear,
-        catalyst_clear: catalystClear,
-        flagged: !bothClear,
-        cleared_at: bothClear ? new Date().toISOString() : null,
-      }).eq("ticker", symbol);
-    } catch (e) {
-      console.error(`checkSolvencyClearance persist ${symbol}:`, e.message);
-    }
-  }
-  return { filingClear, catalystClear, bothClear };
-}
-
-// Cross-company mismatch guard (Aug 18, 2026) -- live report: MU (Micron,
-// a real, healthy company) got flagged with a fabricated solvency hard
-// trigger, while XTI (a genuinely distressed ticker, confirmed via a real
-// quoted 10-K) stayed GREEN. Best working theory: the SEC full-text
-// search's `ciks` scoping isn't reliably constraining results to the
-// intended company, so a hit gets attributed to the wrong ticker.
-// Unverified against a live response (same standing sandbox limitation),
-// but this check is worth having regardless of the exact root cause --
-// it's a direct, structural safety net: never persist a hard solvency
-// flag whose matched filing's own reported company name doesn't
-// plausibly match the company SEC's own ticker map says the requested
-// symbol IS. Fails PERMISSIVE (allows the flag) when either name is
-// unavailable to compare -- this is a guard against a confirmed
-// cross-attribution failure mode, not a general-purpose filter, so it
-// should never block a real match just because metadata happens to be
-// thin.
-function normalizeCompanyName(name) {
-  return String(name || "").toUpperCase()
-    .replace(/[.,]/g, "")
-    .replace(/\b(INC|CORP|CORPORATION|CO|COMPANY|LTD|LLC|PLC|LP|HOLDINGS?|GROUP|CLASS [A-Z])\b/g, "")
-    .replace(/\s+/g, " ").trim();
-}
-function companyNamesLikelyMatch(expected, actual) {
-  const a = normalizeCompanyName(expected), b = normalizeCompanyName(actual);
-  if (!a || !b) return true;
-  if (a === b) return true;
-  const wordsA = new Set(a.split(" ").filter(w => w.length >= 4));
-  const wordsB = b.split(" ").filter(w => w.length >= 4);
-  return wordsB.some(w => wordsA.has(w));
-}
-// hit is a raw EDGAR full-text-search hit object; symbol is the ticker
-// being evaluated. Returns the hit's own reported company name (for
-// storage/display) and whether it's trusted enough to flag from.
-function checkHitCompanyMatch(symbol, hit) {
-  const hitCompanyName = (hit?._source?.display_names || []).join(", ") || null;
-  const expectedName = tickerCikNameCache?.[symbol.toUpperCase()] || null;
-  const trusted = companyNamesLikelyMatch(expectedName, hitCompanyName);
-  if (!trusted) {
-    console.error(
-      `[PRE-GATE] MISMATCH: ${symbol} (expected "${expectedName}") matched a solvency hit from `
-      + `"${hitCompanyName}" -- suppressing, NOT flagging. Likely a SEC search ciks-scoping failure.`
-    );
-  }
-  return { hitCompanyName, trusted };
-}
-
 async function evaluatePreGate(symbol) {
   try {
     const cik = await getCik(symbol);
@@ -993,78 +717,6 @@ async function evaluatePreGate(symbol) {
         status: "GREEN", hardTrigger: false,
         note: `No SEC CIK found for ${symbol} — skipping Pre-Gate screen (likely non-US-listed or not in the SEC ticker map).`,
       };
-    }
-
-    // Persistent solvency flag (Aug 18, 2026) -- checked before the normal
-    // 45-day search below, and independent of it: a ticker flagged from a
-    // PRIOR hard solvency trigger keeps forcing RED even if nothing in the
-    // current 45-day window matches anymore (that's the whole point --
-    // don't let a real, unresolved going-concern situation silently clear
-    // itself just by aging out of the rolling window). Falls through to the
-    // normal search only once BOTH clearance conditions are actually met.
-    const existingFlag = await getSolvencyFlag(symbol);
-    if (existingFlag) {
-      const { filingClear, catalystClear, bothClear } = await checkSolvencyClearance(symbol, cik, existingFlag);
-      if (!bothClear) {
-        const flaggedDate = new Date(existingFlag.first_flagged_at).toLocaleDateString(
-          "en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" }
-        );
-        return {
-          status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
-          note: `Pre-Gate solvency flag active since ${flaggedDate}`
-            + `${existingFlag.trigger_company_name ? ` (matched filing by ${existingFlag.trigger_company_name})` : ""} `
-            + `— forces DOWN regardless of any other gate. `
-            + `Clears only once a subsequent 10-Q/10-K drops the going-concern/distress language AND a `
-            + `corroborated positive catalyst confirms it (filing: ${filingClear ? "clear" : "still flagged"}, `
-            + `catalyst: ${catalystClear ? "confirmed" : "none yet"}).`,
-        };
-      }
-      // Both conditions just cleared -- fall through to a normal fresh
-      // search below instead of returning GREEN outright, so a hard
-      // trigger sitting inside the CURRENT 45-day window (a genuinely new,
-      // separate event) still gets caught in the same pass.
-    }
-
-    // Wide-lookback solvency pre-check (Aug 18, 2026) -- real gap found
-    // after the persistent-flag mechanism above still didn't stop a
-    // reported live case from showing GREEN: that mechanism only ever
-    // PERSISTS a flag once one exists -- it can't CREATE one from a filing
-    // that already predates the routine 45-day window below by the time
-    // this code first runs for a given ticker. A going-concern opinion
-    // typically lives in an annual 10-K and doesn't necessarily repeat
-    // every quarter, so a real, still-unresolved distress situation could
-    // easily sit just outside 45 days and never get flagged at all under
-    // the persistent mechanism alone. This runs BEFORE the narrower
-    // dilution/guidance-cut search below, on every never-flagged ticker
-    // (bounded by the same 24h preGateCache as everything else in this
-    // function, so it's at most one extra SEC call per ticker per day, not
-    // per request). Scoped to solvency only, same as the persistent flag
-    // itself -- dilution/guidance-cut intentionally keep the narrow 45-day
-    // window below, since those are meant to decay/escalate, not persist.
-    const wideSolvencyHits = await searchEdgarFilings(
-      cik, PRE_GATE_TRIGGERS.solvency.keywords, PRE_GATE_FORMS,
-      new Date(Date.now() - PRE_GATE_SOLVENCY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString()
-    );
-    if (wideSolvencyHits.length) {
-      let trustedHit = null, trustedName = null;
-      for (const h of wideSolvencyHits) {
-        const { hitCompanyName, trusted } = checkHitCompanyMatch(symbol, h);
-        if (trusted) { trustedHit = h; trustedName = hitCompanyName; break; }
-      }
-      if (trustedHit) {
-        await flagSolvency(symbol, trustedHit._id, trustedName);
-        return {
-          status: "RED", hardTrigger: true, categories: ["solvency"], escalated: false, persistent: true,
-          note: `Pre-Gate solvency hard trigger — going-concern/bankruptcy/default/delisting language found in `
-            + `a SEC filing${trustedName ? ` by ${trustedName}` : ""} (within the last `
-            + `${Math.round(PRE_GATE_SOLVENCY_LOOKBACK_DAYS / 365 * 10) / 10} years). Forces DOWN regardless of `
-            + `any other gate. Clears only once a subsequent 10-Q/10-K drops the language AND a corroborated `
-            + `positive catalyst confirms it.`,
-        };
-      }
-      // Every hit failed the company-name cross-check -- don't trust
-      // unverifiable attribution, fall through to the narrower 45-day
-      // search below instead of flagging.
     }
 
     const allKeywords = Object.values(PRE_GATE_TRIGGERS).flatMap(t => t.keywords);
@@ -1081,18 +733,7 @@ async function evaluatePreGate(symbol) {
       const text = `${(hit._source?.display_names || []).join(" ")} ${JSON.stringify(hit.highlight || hit._source || {})}`.toLowerCase();
       for (const [category, def] of Object.entries(PRE_GATE_TRIGGERS)) {
         if (def.keywords.some(kw => text.includes(kw))) {
-          // Same cross-company guard as the wide-lookback pre-check above --
-          // a solvency match whose filing's own reported company doesn't
-          // plausibly match the ticker's expected company gets suppressed
-          // here, not counted as a hard trigger at all, so hasHardTrigger
-          // below never sees it.
-          if (category === "solvency") {
-            const { hitCompanyName, trusted } = checkHitCompanyMatch(symbol, hit);
-            if (!trusted) continue;
-            matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id, companyName: hitCompanyName });
-          } else {
-            matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id });
-          }
+          matched.push({ category, hardOrSoft: def.hardOrSoft, accession: hit._id });
         }
       }
     }
@@ -1104,12 +745,6 @@ async function evaluatePreGate(symbol) {
     for (const m of matched) {
       if (m.hardOrSoft === "soft") await logPreGateTrigger(symbol, m.category, "soft", m.accession);
     }
-
-    // Solvency is the only hard category (see PRE_GATE_TRIGGERS) -- a hit
-    // here persists the flag so it keeps forcing RED beyond this one
-    // request, independent of the 45-day window, per the block above.
-    const solvencyHit = matched.find(m => m.category === "solvency");
-    if (solvencyHit) await flagSolvency(symbol, solvencyHit.accession, solvencyHit.companyName);
 
     let escalated = false;
     if (!hasHardTrigger) {

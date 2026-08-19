@@ -413,8 +413,23 @@ function classifyTicker(symbol, sectorInfo) {
 const PRE_GATE_TRIGGERS = {
   solvency: {
     hardOrSoft: "hard",
+    // "going concern" was removed as its own standalone keyword (Aug 19,
+    // 2026) -- confirmed via a real live false positive on STWD (Starwood
+    // Property Trust, a healthy company): the phrase isn't exclusively an
+    // auditor going-concern qualification, it's also standard M&A/legal
+    // terminology for a VALUATION METHOD ("fair saleable value...
+    // determined on a going concern basis" -- meaning valued as an
+    // operating business, not liquidated). The actual matched hit was
+    // Section 5.7 "Solvency" of a merger agreement exhibit, boilerplate
+    // every deal includes, with zero connection to real distress. A real
+    // auditor going-concern qualification always pairs it with
+    // "substantial doubt" (the required U.S. GAAP/PCAOB terminology for
+    // an actual doubt determination), which is why that keyword alone is
+    // kept and is sufficient -- confirmed it still catches BALY's real
+    // warning ("raise substantial doubt about the company's ability to
+    // continue as a going concern") on "substantial doubt" alone.
     keywords: [
-      "substantial doubt", "going concern",
+      "substantial doubt",
       "chapter 11", "chapter 7 bankruptcy", "voluntary petition for bankruptcy",
       "bankruptcy protection", "insolvent", "insolvency", "receivership",
       "event of default", "notice of default", "acceleration of indebtedness",

@@ -428,11 +428,34 @@ const PRE_GATE_TRIGGERS = {
     // kept and is sufficient -- confirmed it still catches BALY's real
     // warning ("raise substantial doubt about the company's ability to
     // continue as a going concern") on "substantial doubt" alone.
+    // "insolvent"/"insolvency" removed the same way (Aug 20, 2026) --
+    // confirmed live on STWD again after the "going concern" fix: still
+    // RED, same 2 hits, same company, now matching "insolvent" instead.
+    // A scoped EDGAR search for "insolvent" on STWD's own CIK returned
+    // 1,648 hits, all boilerplate -- the word is standard language in
+    // risk-factor/counterparty-risk/credit-agreement text regardless of
+    // the filer's own health, the identical failure mode "going concern"
+    // had. That confirmed pattern generalizes to the remaining generic,
+    // definitional terms below -- "event of default", "notice of
+    // default", "acceleration of indebtedness", and "receivership" are
+    // all standard defined terms in loan-agreement/indenture exhibits,
+    // describing what WOULD constitute a default, not that one actually
+    // happened. Removed as a class rather than waiting for a third live
+    // false positive on each one individually, given the same underlying
+    // mechanism (a bare legal/financial term with no requirement that the
+    // filer is actively asserting it about itself) is now confirmed
+    // twice. What's left is deliberately narrow: an actual auditor
+    // determination ("substantial doubt") or an actual bankruptcy/
+    // delisting event -- phrases that are inherently about something
+    // having actually happened, not hypothetical/definitional boilerplate.
+    // Real trade-off, not free: this will miss real distress language
+    // that doesn't use one of these specific phrases -- precision over
+    // recall, a deliberate choice given today's confirmed false-positive
+    // cost, not a claim that recall no longer matters.
     keywords: [
       "substantial doubt",
       "chapter 11", "chapter 7 bankruptcy", "voluntary petition for bankruptcy",
-      "bankruptcy protection", "insolvent", "insolvency", "receivership",
-      "event of default", "notice of default", "acceleration of indebtedness",
+      "bankruptcy protection",
       "notice of delisting", "delisting notice",
     ],
   },

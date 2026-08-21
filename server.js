@@ -762,9 +762,37 @@ async function searchEdgarFilings(cik, keywords) {
       throw new Error(`EDGAR full-text search ${res.status}`);
     }
     const data = await res.json();
-    const hits = data?.hits?.hits || [];
-    const companies = hits.map(h => (h._source?.display_names || []).join(", ")).join(" | ") || "(none)";
-    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${hits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}, companies: ${companies}`);
+    const allHits = data?.hits?.hits || [];
+    const companies = allHits.map(h => (h._source?.display_names || []).join(", ")).join(" | ") || "(none)";
+    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${allHits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}, companies: ${companies}`);
+
+    // Exhibit-vs-primary-document filter (Aug 21, 2026). Root cause of the
+    // STWD false positive: the matched text lived in an EX-2.1 merger-
+    // agreement exhibit's boilerplate "Solvency" representation (Section
+    // 5.7), not in the 10-Q's own primary financial statements. EDGAR's
+    // full-text search indexes exhibits alongside the primary document and
+    // returns both under the same CIK/form -- confirmed via SEC's own
+    // documented response shape, each hit's _source.file_type identifies
+    // which sub-document actually matched (e.g. "10-Q" for the primary
+    // document, "EX-2.1"/"EX-99.1"/etc. for an attached exhibit). A real
+    // auditor going-concern opinion is part of the audited financial
+    // statements themselves -- it is never filed as an attachment -- so a
+    // hit is only trustworthy when it matched inside the primary document.
+    // Fail permissive (keep the hit) if file_type is missing/unrecognized,
+    // matching this codebase's established "don't block on thin metadata"
+    // posture (see companyNamesLikelyMatch's own reasoning, elsewhere in
+    // this file's history) -- excluding on absence of a signal would be a
+    // new, unverified assumption of its own.
+    const isExhibit = (h) => {
+      const ft = h._source?.file_type;
+      return typeof ft === "string" && /^EX-/i.test(ft.trim());
+    };
+    const hits = allHits.filter(h => !isExhibit(h));
+    const excluded = allHits.length - hits.length;
+    if (excluded > 0) {
+      const exhibitTypes = allHits.filter(isExhibit).map(h => h._source?.file_type).join(", ");
+      console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: excluded ${excluded} exhibit-only hit(s) (${exhibitTypes}), ${hits.length} primary-document hit(s) remain`);
+    }
     return hits;
   } catch (e) {
     console.error(`[PRE-GATE] searchEdgarFilings ${cik} FAILED:`, e.message);

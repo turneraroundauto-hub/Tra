@@ -428,11 +428,34 @@ const PRE_GATE_TRIGGERS = {
     // kept and is sufficient -- confirmed it still catches BALY's real
     // warning ("raise substantial doubt about the company's ability to
     // continue as a going concern") on "substantial doubt" alone.
+    // "insolvent"/"insolvency" removed the same way (Aug 20, 2026) --
+    // confirmed live on STWD again after the "going concern" fix: still
+    // RED, same 2 hits, same company, now matching "insolvent" instead.
+    // A scoped EDGAR search for "insolvent" on STWD's own CIK returned
+    // 1,648 hits, all boilerplate -- the word is standard language in
+    // risk-factor/counterparty-risk/credit-agreement text regardless of
+    // the filer's own health, the identical failure mode "going concern"
+    // had. That confirmed pattern generalizes to the remaining generic,
+    // definitional terms below -- "event of default", "notice of
+    // default", "acceleration of indebtedness", and "receivership" are
+    // all standard defined terms in loan-agreement/indenture exhibits,
+    // describing what WOULD constitute a default, not that one actually
+    // happened. Removed as a class rather than waiting for a third live
+    // false positive on each one individually, given the same underlying
+    // mechanism (a bare legal/financial term with no requirement that the
+    // filer is actively asserting it about itself) is now confirmed
+    // twice. What's left is deliberately narrow: an actual auditor
+    // determination ("substantial doubt") or an actual bankruptcy/
+    // delisting event -- phrases that are inherently about something
+    // having actually happened, not hypothetical/definitional boilerplate.
+    // Real trade-off, not free: this will miss real distress language
+    // that doesn't use one of these specific phrases -- precision over
+    // recall, a deliberate choice given today's confirmed false-positive
+    // cost, not a claim that recall no longer matters.
     keywords: [
       "substantial doubt",
       "chapter 11", "chapter 7 bankruptcy", "voluntary petition for bankruptcy",
-      "bankruptcy protection", "insolvent", "insolvency", "receivership",
-      "event of default", "notice of default", "acceleration of indebtedness",
+      "bankruptcy protection",
       "notice of delisting", "delisting notice",
     ],
   },
@@ -739,9 +762,37 @@ async function searchEdgarFilings(cik, keywords) {
       throw new Error(`EDGAR full-text search ${res.status}`);
     }
     const data = await res.json();
-    const hits = data?.hits?.hits || [];
-    const companies = hits.map(h => (h._source?.display_names || []).join(", ")).join(" | ") || "(none)";
-    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${hits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}, companies: ${companies}`);
+    const allHits = data?.hits?.hits || [];
+    const companies = allHits.map(h => (h._source?.display_names || []).join(", ")).join(" | ") || "(none)";
+    console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: ${allHits.length} hit(s), total=${data?.hits?.total?.value ?? "?"}, companies: ${companies}`);
+
+    // Exhibit-vs-primary-document filter (Aug 21, 2026). Root cause of the
+    // STWD false positive: the matched text lived in an EX-2.1 merger-
+    // agreement exhibit's boilerplate "Solvency" representation (Section
+    // 5.7), not in the 10-Q's own primary financial statements. EDGAR's
+    // full-text search indexes exhibits alongside the primary document and
+    // returns both under the same CIK/form -- confirmed via SEC's own
+    // documented response shape, each hit's _source.file_type identifies
+    // which sub-document actually matched (e.g. "10-Q" for the primary
+    // document, "EX-2.1"/"EX-99.1"/etc. for an attached exhibit). A real
+    // auditor going-concern opinion is part of the audited financial
+    // statements themselves -- it is never filed as an attachment -- so a
+    // hit is only trustworthy when it matched inside the primary document.
+    // Fail permissive (keep the hit) if file_type is missing/unrecognized,
+    // matching this codebase's established "don't block on thin metadata"
+    // posture (see companyNamesLikelyMatch's own reasoning, elsewhere in
+    // this file's history) -- excluding on absence of a signal would be a
+    // new, unverified assumption of its own.
+    const isExhibit = (h) => {
+      const ft = h._source?.file_type;
+      return typeof ft === "string" && /^EX-/i.test(ft.trim());
+    };
+    const hits = allHits.filter(h => !isExhibit(h));
+    const excluded = allHits.length - hits.length;
+    if (excluded > 0) {
+      const exhibitTypes = allHits.filter(isExhibit).map(h => h._source?.file_type).join(", ");
+      console.log(`[PRE-GATE] searchEdgarFilings CIK ${cik}: excluded ${excluded} exhibit-only hit(s) (${exhibitTypes}), ${hits.length} primary-document hit(s) remain`);
+    }
     return hits;
   } catch (e) {
     console.error(`[PRE-GATE] searchEdgarFilings ${cik} FAILED:`, e.message);

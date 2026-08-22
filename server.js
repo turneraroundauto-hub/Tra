@@ -913,6 +913,7 @@ IMPORTANT RULES:
 - Pre-Gate status is PRE-DETERMINED by the server. Copy exactly. Never override.
 - Gate 0 status is PRE-DETERMINED by the server. Copy exactly. Never override.
 - Gate 1 status is PRE-DETERMINED by the server. Copy exactly. Never override.
+- Gate 4 phase is PRE-DETERMINED by the server. Copy exactly. Never override.
 - Gate 5 proxy is PRE-DETERMINED by the server. Copy exactly. Never override.
 - Temperature is 0 — be deterministic. Same data = same verdict every time.
 - News headlines provided ARE potential catalysts — treat them as Gate 2 evidence.
@@ -1038,7 +1039,9 @@ data is unavailable, treat that as no additional signal — do not assume a
 direction. This never applies on Monday or Friday themselves (those keep
 the same-day rule above), nor on weekends/holidays.
 
-GATE 4 — PHASE
+GATE 4 — PHASE (server-provided, never recalculate)
+A plain 52-week-range-position threshold, not a judgment call — computed
+server-side from the same rangePosition number given to you below.
 Phase 1 (range <30%): GREEN — discovery phase, full size entry appropriate
 Phase 2 (range 30-70%): YELLOW — acceleration phase, half size, enter on pullbacks only
 Phase 3 (range >70%): RED — priced for perfection, post-flush entry only, defined risk
@@ -1625,6 +1628,27 @@ function evaluateGate1(closesAscending) {
     return { status: "YELLOW", sizing: "HALF", forceDown: false, unit: r.unit, note: r.note };
   }
   return { status: r.color, sizing: r.sizing, forceDown: r.forceDown, unit: r.unit, branch: r.branch, note: r.note };
+}
+
+// evaluateGate4 — Phase, a plain 52-week-range-position threshold, not an
+// LLM judgment call (Aug 22, 2026). rangePosition is already computed
+// server-side in fetchTickerFundamentals()'s caller above and relayed to
+// /analyze inside metricsData -- this just applies the same GREEN <30% /
+// YELLOW 30-70% / RED >70% thresholds the prompt used to hand the model
+// and ask it to apply itself. Same "PRE-DETERMINED, copy exactly" pattern
+// as Gate 0/1/5.
+function evaluateGate4(metricsData) {
+  const rp = metricsData?.rangePosition;
+  if (rp === null || rp === undefined) {
+    return { status: "GREEN", note: "52-week range position unavailable — treating as no signal." };
+  }
+  if (rp > 70) {
+    return { status: "RED", note: `${rp}% of 52-week range — Phase 3, priced for perfection. Wait for a post-catalyst flush; do not chase.` };
+  }
+  if (rp > 30) {
+    return { status: "YELLOW", note: `${rp}% of 52-week range — Phase 2, acceleration. Half size, enter on pullbacks only.` };
+  }
+  return { status: "GREEN", note: `${rp}% of 52-week range — Phase 1, discovery. Full size entry appropriate.` };
 }
 
 const MAX_NEWS_AGE_HOURS = 300; // 14 days / last business week
@@ -2601,6 +2625,12 @@ app.post("/analyze", async (req, res) => {
   // untouched — same pattern as Gate 0/Gate 5. Never recalculated by the LLM.
   const gate1Result = gate1Data || evaluateGate1(null);
 
+  // ── GATE 4 — PHASE, PRE-DETERMINED (Aug 22, 2026) ────────────────
+  // Plain math off metricsData.rangePosition (already computed and sent by
+  // the client every call) -- no reason for the LLM to eyeball a number
+  // it's just been handed and re-derive the same three thresholds itself.
+  const gate4Result = evaluateGate4(metricsData);
+
   // ── BUILD NEWS CONTEXT ────────────────────────────────────────────
   let newsContext = "No news within the last business week (300 hours). Gate 2 catalyst = NEUTRAL.";
   if (newsData && newsData.ageHours <= MAX_NEWS_AGE_HOURS) {
@@ -2727,11 +2757,15 @@ Status: ${gate1Result.status}
 Sizing: ${gate1Result.sizing}
 Note: ${gate1Result.note}
 
+GATE 4 — USE EXACTLY THIS (do not recalculate, server-enforced phase):
+Status: ${gate4Result.status}
+Note: ${gate4Result.note}
+
 GATE 5 — USE EXACTLY THIS (do not recalculate):
 Status: ${gate5Result.status}
 Note: ${gate5Result.note}
 
-Market data for Gates 2-4 context:
+Market data for Gates 2-3 context:
 SPY ${sectorContext?.spy||"?"}, QQQ ${sectorContext?.qqq||"?"}, BTC ${sectorContext?.btc||"?"}
 XBI ${sectorContext?.xbi||"?"}, IBB ${sectorContext?.ibb||"?"}, SOXX ${sectorContext?.soxx||"?"}
 TSM ${sectorContext?.tsm||"?"}, MSFT ${sectorContext?.msft||"?"}
@@ -2747,7 +2781,7 @@ Gate 3 weekly carryover: ${carryoverContext}
 Additional context: ${marketContext || "None"}
 Session Context corroboration: ${contextCorroboration ? contextCorroboration.note : "N/A — no Session Context provided."}
 
-Run Gates 2, 3, 4 only. Pre-Gate, Gate 0, Gate 1, and Gate 5 are provided above — copy them exactly.
+Run Gates 2 and 3 only. Pre-Gate, Gate 0, Gate 1, Gate 4, and Gate 5 are provided above — copy them exactly.
 Return only JSON.
 `;
 
@@ -2787,6 +2821,9 @@ Return only JSON.
 
       // ── SERVER ENFORCEMENT: Gate 1 ────────────────────────────────
       parsed.gates.g1_prewindow = { status: gate1Result.status, note: gate1Result.note };
+
+      // ── SERVER ENFORCEMENT: Gate 4 ────────────────────────────────
+      parsed.gates.g4_phase = { status: gate4Result.status, note: gate4Result.note };
 
       // ── SERVER ENFORCEMENT: Gate 5 ────────────────────────────────
       parsed.gates.g5_korea = { status: gate5Result.status, note: gate5Result.note };

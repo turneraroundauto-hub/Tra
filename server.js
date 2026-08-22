@@ -927,9 +927,13 @@ filings before any other gate runs. GREEN: no risk language found in recent
 filings. YELLOW: a soft trigger (dilution or guidance-cut language) found —
 logged, not yet forcing a verdict on its own. RED: a hard trigger (solvency/
 going-concern language, or 2+ soft triggers within 30 days escalating) —
-this RED carries forceDown override authority EQUIVALENT TO GATE 0 RED: it
-forces the final verdict to DOWN regardless of any other gate, and is exempt
-from the corroboration rule below.
+sets DOWN as a candidate verdict, same as any other RED gate. As of
+Aug 22, 2026, Pre-Gate RED is NO LONGER an unconditional override — it is
+NOT exempt from the corroboration rule below. A RED Pre-Gate only holds as
+a final DOWN verdict when the corroboration rule's conditions are met
+(2+ RED gates, counting Pre-Gate itself as one, or the single-RED
+exception when Gates 2, 3, and 4 are all independently YELLOW) —
+otherwise it downgrades to FLAT like any other uncorroborated single RED.
 
 GATE 0 — SECTOR (server-provided, never recalculate)
 GREEN-STRONG: SPY >+0.5% AND QQQ >+0.5% — genuine tailwind, boosts UP confidence
@@ -2925,16 +2929,18 @@ Return only JSON.
         parsed.gates.g2_catalyst.note = (parsed.gates.g2_catalyst.note || "") + tag;
       }
 
-      // ── SERVER ENFORCEMENT: Pre-Gate forceDown ────────────────────
-      // No corroboration required — solvency/dilution/guidance-cut risk has
-      // override authority equivalent to Gate 0 RED. This is a hard
-      // code-level override, not a prompt instruction, so it can't be missed.
+      // ── SERVER ENFORCEMENT: Pre-Gate ──────────────────────────────
+      // No longer an unconditional override (Aug 22, 2026, direct
+      // instruction) — a RED Pre-Gate sets DOWN as a CANDIDATE verdict,
+      // same as any other RED gate, and is now subject to the CONGRUENCY
+      // check below (2+ RED gates, counting Pre-Gate itself as one, or the
+      // new Gates-2/3/4-all-YELLOW escape hatch) before it's allowed to
+      // stand. Previously this had blanket forceDown authority equivalent
+      // to Gate 0 RED — deliberately walked back: a single SEC filing
+      // shouldn't be able to force DOWN entirely alone anymore.
       if (preGateResult.hardTrigger) {
-        parsed.verdict    = "DOWN";
-        parsed.sizing      = "NONE";
-        parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
-        parsed.reason      = `Pre-Gate thesis-integrity override — ${preGateResult.note}`;
-        parsed.wait_for    = "Resolved solvency/dilution/guidance concern (or a new filing clearing it) required before re-evaluating.";
+        parsed.verdict = "DOWN";
+        parsed.reason  = `Pre-Gate thesis-integrity concern — ${preGateResult.note}`;
       }
 
       // ── SERVER ENFORCEMENT: Gate 0 ────────────────────────────────
@@ -3080,16 +3086,27 @@ Return only JSON.
       // (Exceptions: Gate 0 RED, Gate 1 forceDown, and Gate 5 forceDown
       // (Korea/Taiwan hard trigger or dynamically-resolved primary proxy)
       // are all corroboration-exempt per the Corroboration Rule — any one
-      // of them can force DOWN on its own.)
+      // of them can force DOWN on its own. Pre-Gate lost its own blanket
+      // exemption Aug 22, 2026 — it's now a normal member of the
+      // corroboration pool below, same as Gates 1/2/4/5.)
       const g1Status = parsed.gates?.g1_prewindow?.status || "GREEN";
+      const g3Status = parsed.gates?.g3_openbar?.status || "GREEN";
       const g4Status = parsed.gates?.g4_phase?.status || "GREEN";
-      const downForceAuthorized = preGateResult.hardTrigger || gate0Status === "RED" || gate1Result.forceDown || gate5ForceDown;
+      const downForceAuthorized = gate0Status === "RED" || gate1Result.forceDown || gate5ForceDown;
       if (parsed.verdict === "DOWN" && !downForceAuthorized) {
-        // DOWN without an exempt gate requires corroboration
-        const redCount = [g1Status, g2Status, g4Status, gate5Result.status]
+        // DOWN without an exempt gate requires corroboration. Pre-Gate
+        // counts toward the RED tally here — direct instruction, Aug 22,
+        // 2026 — same as it counts toward every other congruency check.
+        const redCount = [preGateResult.status, g1Status, g2Status, g4Status, gate5Result.status]
           .filter(x => x === "RED").length;
-        if (redCount < 2) {
-          // Single non-exempt RED gate — not enough for DOWN
+        // Single-RED escape hatch (Aug 22, 2026): if Gates 2, 3, and 4 are
+        // ALL independently showing caution (YELLOW), that's treated as
+        // sufficient corroboration on its own, even with only one outright
+        // RED gate (Pre-Gate included) — three gates agreeing something's
+        // off doesn't need a second RED to be taken seriously.
+        const threeYellowBreakdown = g2Status === "YELLOW" && g3Status === "YELLOW" && g4Status === "YELLOW";
+        if (redCount < 2 && !threeYellowBreakdown) {
+          // Single non-exempt RED gate, no 3-yellow corroboration either — not enough for DOWN
           parsed.verdict    = "FLAT";
           parsed.confidence = "LOW";
           parsed.wait_for   = parsed.wait_for || "Additional confirmation needed before directional entry.";

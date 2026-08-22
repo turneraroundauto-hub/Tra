@@ -995,6 +995,16 @@ Mon/Fri overlay always applies:
 - Friday + any sequence = add skepticism, 67% reversal frequency
 - Weekend/holiday = YELLOW, no bar data available
 
+Friday full-weight exception (server-computed check, use exactly what it
+says — do not guess at this from the bar data alone): if the "Gate 3
+Friday full-weight check" context below explicitly says the week has
+been FLAT, AND today's own 3-bar sequence is itself bullish/convicted,
+do not apply the standard 67%-reversal skepticism discount — weight
+today's sequence at full conviction instead, same as a Monday GREEN.
+If that context says NOT flat, or the data was unavailable, keep the
+standard Friday skepticism above. This never applies on any day other
+than Friday.
+
 MODE 2 — SWING LEVEL (Shark tier, Alpaca data provided)
 Four reference levels are pre-calculated and provided:
 - 14D_HIGH: 14-day absolute high (outer swing resistance)
@@ -1093,17 +1103,25 @@ If SENTIMENT ticker AND Gate 2 = negative catalyst AND Gate 5 = RED → HIGH CON
 
 FULL size only when: Gate 0 GREEN-STRONG + Gate 1 GREEN + Gate 2 GREEN + Gate 5 GREEN
 HALF size when: Any single YELLOW gate, or Gate 0 GREEN-NEUTRAL
-QUARTER size when: 2 YELLOW gates, or Gate 2/5 incongruent
-NONE / Defined risk only when: Any RED gate present
+QUARTER size when: 2 YELLOW gates, Gate 2/5 incongruent, or the single-RED
+  UP exception below (exactly one of Gates 2/3/4 RED on an otherwise-UP verdict)
+NONE / Defined risk only when: Any RED gate present, other than the
+  single-RED UP exception above, which caps at QUARTER instead of NONE
 
 ═══ VERDICT RULES ═══
 
 The server enforces Pre-Gate, Gate 0, Gate 1, and Gate 5. You handle Gates 2-4 and congruency.
 
 UP (bullish edge, long bias):
-- Gate 0 GREEN (either strength) AND Gates 1,2,3,4 all GREEN or YELLOW
+- Gate 0 GREEN (either strength), Gate 1 GREEN or YELLOW, Gate 5 GREEN or YELLOW
+- Gates 2, 3, and 4 all GREEN or YELLOW, EXCEPT: no more than one of
+  Gates 2/3/4 may be RED (single-RED exception, Aug 22, 2026) — if
+  exactly one of them is RED and everything else above still supports
+  UP, the verdict can still be UP, but sizing caps at QUARTER (see
+  SIZING RULES) instead of the size the rest of the picture would
+  otherwise earn. Two or more RED among Gates 2/3/4 is NOT this
+  exception — that's DOWN/FLAT territory below.
 - At least one GREEN-STRONG gate among 1,2,4,5
-- No RED gates
 - Congruency checks A and B pass
 
 DOWN (bearish edge, defined risk or short):
@@ -1597,6 +1615,58 @@ async function fetchWeeklyCarryover(symbol) {
     return null;
   } catch (e) {
     console.error(`fetchWeeklyCarryover ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+// fetchWeekOwnRange — Gate 3 Friday full-weight check (Aug 22, 2026).
+// Only ever called on Friday itself (see /analyze) -- classifies whether
+// THIS week (Monday's close through the most recent completed session,
+// normally Thursday) has been flat, so a genuinely convicted Friday
+// opening-bar sequence isn't automatically discounted by the standard
+// 67%-reversal skepticism the same way a directional week would be.
+// Called directly from /analyze, not relayed through /ticker/:symbol --
+// same pattern as Proposal 4's fetchNewsBodiesForCorroboration/
+// fetchEarningsCalendarFlag below: a conditional, day-gated fetch that
+// adds zero call volume on the 4 days it doesn't apply, with no new
+// client-relay field or frontend change needed anywhere.
+// Own dated-bars fetch, same reasoning as fetchWeeklyCarryover just above
+// -- dailyCloses (Gate 1's own array) is deliberately NOT date-anchored
+// (see its own comment), so it can't be reused to find "this week's
+// Monday" robustly across holidays.
+async function fetchWeekOwnRange(symbol) {
+  if (!alpacaKeys()) return null;
+  try {
+    const end   = new Date();
+    const start = new Date(end.getTime() - 10 * 24 * 60 * 60 * 1000);
+    const data = await alpacaGet(
+      `/v2/stocks/${symbol}/bars?timeframe=1Day&start=${start.toISOString().split("T")[0]}&end=${end.toISOString().split("T")[0]}&limit=15&feed=iex&adjustment=split`
+    );
+    const bars = data.bars || [];
+    if (bars.length < 2) return null;
+
+    const etDay = (isoTime) =>
+      new Date(new Date(isoTime).toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
+
+    // Most recent bar in the window is the most recent completed session
+    // (normally Thursday's close, when this runs on a real Friday).
+    const latest = bars[bars.length - 1];
+    // Walk backward from there to find this week's own Monday bar.
+    let monday = null;
+    for (let i = bars.length - 1; i >= 0; i--) {
+      if (etDay(bars[i].t) === 1) { monday = bars[i]; break; }
+    }
+    if (!monday || monday.t === latest.t) return null;
+
+    const mondayClose = monday.c, latestClose = latest.c;
+    const pctMove = Math.round(((latestClose - mondayClose) / mondayClose) * 10000) / 100;
+    return {
+      mondayClose, latestClose, pctMove,
+      flat: Math.abs(pctMove) <= 0.3, // same tolerance as fetchWeeklyCarryover's own CONFIRMED_UP/DOWN vs FLAT threshold
+      throughDate: new Date(latest.t).toISOString().split("T")[0],
+    };
+  } catch (e) {
+    console.error(`fetchWeekOwnRange ${symbol}:`, e.message);
     return null;
   }
 }
@@ -2685,6 +2755,18 @@ Check SESSION CONTEXT for additional bar data provided by user.`;
     carryoverContext = `Weekly carryover data unavailable this run — treat as no additional signal (do not assume a direction).`;
   }
 
+  // ── BUILD GATE 3 FRIDAY FULL-WEIGHT CONTEXT (Aug 22, 2026) ─────────
+  // Only relevant/fetched on Friday itself (real ET weekday, same "never
+  // trust the client for what day it is" reasoning as everything else
+  // here) -- adds zero call volume the other 4 days of the week.
+  let fridayWeightContext = "N/A — not Friday, this override doesn't apply.";
+  if (etWeekday() === 5) {
+    const weekRange = await fetchWeekOwnRange(ticker.toUpperCase());
+    fridayWeightContext = weekRange
+      ? `This week (Monday $${weekRange.mondayClose} → ${weekRange.throughDate} $${weekRange.latestClose}, ${weekRange.pctMove > 0 ? '+' : ''}${weekRange.pctMove}%) has been ${weekRange.flat ? 'FLAT' : 'NOT flat'}.`
+      : `Week-range data unavailable this run — treat as NOT flat (apply the standard Friday skepticism discount).`;
+  }
+
   // ── BUILD METRICS CONTEXT ─────────────────────────────────────────
   let metricsContext = "No metrics data — estimate from training knowledge.";
   if (metricsData) {
@@ -2778,6 +2860,7 @@ News context: ${newsContext}
 Gate 3 bar mode: ${barMode}
 Opening bar context: ${barContext}
 Gate 3 weekly carryover: ${carryoverContext}
+Gate 3 Friday full-weight check: ${fridayWeightContext}
 Additional context: ${marketContext || "None"}
 Session Context corroboration: ${contextCorroboration ? contextCorroboration.note : "N/A — no Session Context provided."}
 

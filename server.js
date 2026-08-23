@@ -1887,6 +1887,39 @@ async function fetchEarningsCalendarFlag(symbol) {
   }
 }
 
+// Company-name -> ticker resolution for Import's free-text entry (Aug
+// 2026). Only ever called for an Import entry that already failed the
+// plain-ticker regex client-side (shared/watchlist.ts's parseTickers) --
+// typing a real ticker directly never round-trips through this at all.
+// Routed through the same finnhubGet()/finnhubThrottle() queue as every
+// other Finnhub call in this file. Results (including misses) are cached
+// in symbolSearchCache above so a popular name isn't re-searched on every
+// Import across every user.
+async function searchSymbolByName(query) {
+  const key = query.trim().toLowerCase();
+  if (!key) return null;
+  const cached = symbolSearchCache.get(key);
+  if (cached && Date.now() - cached.time < SYMBOL_SEARCH_MAX_AGE_MS) return cached.symbol;
+  let symbol = null;
+  try {
+    const data = await finnhubGet(`/search?q=${encodeURIComponent(query)}`);
+    const hits = Array.isArray(data?.result) ? data.result : [];
+    // Finnhub's search already ranks by relevance -- just take the first
+    // hit that's a plain, bare US-listed symbol (no exchange suffix like
+    // ".DE"/".MX", matching the same 1-5 letter shape shared/watchlist.ts's
+    // own ticker regex expects) and an actual tradable security type, not
+    // a warrant/index/mutual-fund-class row a bare name search can also
+    // surface.
+    const hit = hits.find(h => typeof h.symbol === "string" && /^[A-Z]{1,5}$/.test(h.symbol)
+      && (h.type === "Common Stock" || h.type === "ETP"));
+    if (hit) symbol = hit.symbol;
+  } catch (e) {
+    console.error(`searchSymbolByName "${query}":`, e.message);
+  }
+  symbolSearchCache.set(key, { symbol, time: Date.now() });
+  return symbol;
+}
+
 // parsePctString / CONFIDENCE_NEGLIGIBLE_MOVE_PCT / priceConfirmedConfidence /
 // normalizeMarketReading / evaluateProxyStatus (Gate 5's forceDown status
 // check -- see the Aug 13, 2026 CLAUDE.md incident writeup) all moved to
@@ -2162,6 +2195,20 @@ Write exactly 2 sentences: sector rotation summary for a swing trader.
 app.get("/status", async (req, res) => {
   const status = await credits.getUserStatus(req.userKey, req.userTier);
   res.json(status);
+});
+
+// Company-name -> ticker lookup, powering Import's free-text entry
+// (shared/watchlist.ts's addTickers()). Free, no credit cost -- a plain
+// data lookup like /ticker/:symbol, not an AI call like /analyze.
+app.get("/lookup", async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  if (!q) return res.status(400).json({ error: "q is required" });
+  try {
+    const symbol = await searchSymbolByName(q);
+    res.json({ symbol });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── WATCHLIST SYNC (any authenticated account, any tier) ───────────
@@ -2452,6 +2499,13 @@ const symbolMarketCache = new Map(); // symbol -> { data: {metrics,openingBar,da
 const preGateCache      = new Map(); // symbol -> { data, time }
 const NEWS_REFRESH_MS     = 30 * 60 * 1000;
 const PRE_GATE_REFRESH_MS = 24 * 60 * 60 * 1000;
+
+// Company-name -> ticker lookup cache (Import's free-text entry -- see
+// searchSymbolByName() below). A week-long TTL, not a market-data-length
+// one: unlike price/news, a name<->symbol mapping essentially never
+// changes day to day, so there's no reason to treat this like a live feed.
+const symbolSearchCache      = new Map(); // lowercased query -> { symbol, time }
+const SYMBOL_SEARCH_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // News window: 8am-8pm ET, every day of the week (including weekends) —
 // unlike price/trend data, a headline can land any day, so this window is

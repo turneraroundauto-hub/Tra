@@ -2593,14 +2593,21 @@ app.get("/agitator", async (req, res) => {
     res.json({
       resolved: true, symbol,
       headlineUsed: effectiveHeadline,
-      factors: {
+      // Phase 0 fix (Aug 26, 2026): the sub-factor breakdown is Pro's
+      // "full dynamic gauge" per the Notion log's own tier table -- Starter
+      // gets "Simple gauge (low/med/high)" only. This was missed in the
+      // original pass (only comps-count/secondary-news were tier-gated);
+      // caught before Starter's own flag ever flips on. Omitted entirely
+      // (not just hidden client-side) so a non-full tier never receives
+      // data it isn't meant to show.
+      factors: isFull ? {
         surprise:    aiFactors?.surprise    ?? null,
         uncertainty: aiFactors?.uncertainty ?? null,
         positioning: aiFactors?.positioning ?? null,
         crossAsset:  aiFactors?.crossAsset  ?? null,
         liquidity, ivEnvironment,
         historicalReaction: null, // deliberately omitted -- no data source exists for this yet
-      },
+      } : undefined,
       composite, comps, news: newsOut,
     });
   } catch (e) {

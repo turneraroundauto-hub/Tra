@@ -70,9 +70,9 @@ const TIERS = {
     alpaca:        false,
     earnings:      false,
     iv:            false,
-    scorecard:     false,       // Proposal 7, Aug 26 2026 -- rolling out Pro-first, trickling down
-    agitator:      false,       // Proposal 5, Aug 26 2026 -- rolling out Pro-first, trickling down
-    dial:          false,       // Proposal 6, Aug 26 2026 -- rolling out Pro-first, trickling down
+    scorecard:     true,        // Proposal 7, Aug 26 2026 -- Starter Phase 1, trickled down from Pro
+    agitator:      true,        // Proposal 5, Aug 26 2026 -- Starter Phase 1, trickled down from Pro
+    dial:          false,       // Proposal 6, Aug 26 2026 -- Phase 1.5 range decision still open, not rolled out here
     maxRollover:   45,
     price:         9.99,
   },

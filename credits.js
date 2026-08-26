@@ -56,22 +56,7 @@ const TIERS = {
     iv:            false,
     scorecard:     false,       // Proposal 7, Aug 26 2026 -- rolling out Pro-first, trickling down
     agitator:      false,       // Proposal 5, Aug 26 2026 -- rolling out Pro-first, trickling down
-    startingCredits: 3,         // hard cap: 3 credits, reset weekly (see checkWeeklyReset)
-  },
-  starter: {
-    name:          "Starter",
-    monthlyCredits: 45,
-    maxTickers:    7,
-    cacheMinutes:  5,
-    pulse:         true,
-    tracker:       false,
-    glossary:      true,
-    alpaca:        false,
-    earnings:      false,
-    iv:            false,
-    scorecard:     false,       // Proposal 7, Aug 26 2026 -- rolling out Pro-first, trickling down
-    agitator:      false,       // Proposal 5, Aug 26 2026 -- rolling out Pro-first, trickling down
-    maxRollover:   45,
+    dial:          false,       // Proposal 6, Aug 26 2026 -- rolling out Pro-first, trickling down    maxRollover:   45,
     price:         9.99,
   },
   // iv is intentionally separate from `alpaca` — alpaca gates Shark's Gate 3
@@ -91,23 +76,7 @@ const TIERS = {
     iv:            true,
     scorecard:     true,        // Proposal 7, Aug 26 2026 -- first tier to get it
     agitator:      true,        // Proposal 5, Aug 26 2026 -- first tier to get it
-    maxRollover:   45,
-    price:         16.99,
-  },
-  shark: {
-    name:          "Shark",
-    monthlyCredits: 145,
-    maxTickers:    999,
-    cacheMinutes:  1,
-    pulse:         true,
-    tracker:       true,
-    glossary:      true,
-    alpaca:        true,
-    earnings:      true,
-    iv:            true,
-    scorecard:     false,       // Proposal 7, Aug 26 2026 -- Shark UI is shelved indefinitely, not rolled out here
-    agitator:      false,       // Proposal 5, Aug 26 2026 -- Shark UI is shelved indefinitely, not rolled out here
-    maxRollover:   45,
+    dial:          true,        // Proposal 6, Aug 26 2026 -- first tier to get it    maxRollover:   45,
     price:         39.99,
   },
 };
@@ -154,6 +123,7 @@ function statusFromUser(user) {
       iv:        tierConfig.iv,
       scorecard: tierConfig.scorecard,
       agitator:  tierConfig.agitator,
+      dial:      tierConfig.dial,
     },
     lastReset:       user.lastReset,
     lastWeeklyReset: user.lastWeeklyReset,

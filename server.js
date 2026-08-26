@@ -1901,6 +1901,60 @@ async function fetchNewsBodiesForCorroboration(symbol) {
 // "not corroborated" by corroborateSessionContext, never as a false
 // positive). Routed through finnhubGet()/finnhubThrottle() like every other
 // Finnhub call in this file.
+// ─── PROPOSAL 6 — AGGRESSION DIAL (Aug 26, 2026) ──────────────────────
+// The Notion log's own "dial-proof gates" list named a "hard pre-earnings
+// exit rule" as already-existing, fixed-at-all-5-positions infrastructure
+// -- grepped both repos before building anything and confirmed no such
+// rule exists anywhere in this app. This is that rule, built as the real
+// prerequisite it actually is, not a pointer to existing code.
+//
+// Deliberately its own function, not a reuse of fetchEarningsCalendarFlag()
+// above: that one's -3/+14 day window is tuned for Session Context
+// corroboration ("is there an earnings date anywhere near this claim"),
+// not "is a real entry about to walk into an earnings print" -- a
+// forward-only, tight window is what an exit rule actually needs.
+async function checkUpcomingEarnings(symbol) {
+  try {
+    const now  = new Date();
+    const from = now.toISOString().split("T")[0];
+    const to   = new Date(now.getTime() + 2 * 86400000).toISOString().split("T")[0];
+    const data = await finnhubGet(`/calendar/earnings?symbol=${symbol}&from=${from}&to=${to}`);
+    const items = data?.earningsCalendar;
+    if (!Array.isArray(items) || !items.length) return null;
+    return items[0]?.date || true;
+  } catch (e) {
+    console.error(`checkUpcomingEarnings ${symbol}:`, e.message);
+    return null; // fail-safe: a Finnhub error never blocks an entry on its own
+  }
+}
+
+// Dial position metadata. Only sizingCeiling is actually enforced --
+// monitoringCadence/entryGuidance/stopGuidance/recheckInterval are
+// informational display text the Pro UI shows independently (this app
+// has no stop-order tracking, no per-ticker scheduling/notifications, and
+// no gamma-exposure computation anywhere, so those can't be real,
+// server-enforced mechanics yet -- disclosed here rather than faked).
+// Per direct instruction: ceiling-only, never a floor -- Position-Lean/
+// Position/Long's "larger position size" is portfolio-construction
+// guidance (shown as text), not a mandate to inflate a verdict's real,
+// gate-earned sizing. NEUTRAL is a guaranteed no-op, matching "= current
+// CRF behavior unchanged."
+const SIZING_ORDER = ["NONE", "QUARTER", "HALF", "FULL"];
+const DIAL_POSITIONS = {
+  ACTIVE_SWING:  { sizingCeiling: "HALF" },
+  ACTIVE_LEAN:   { sizingCeiling: "FULL" },
+  NEUTRAL:       { sizingCeiling: "FULL" },
+  POSITION_LEAN: { sizingCeiling: "FULL" },
+  POSITION_LONG: { sizingCeiling: "FULL" },
+};
+function applySizingCeiling(sizing, dialPosition) {
+  const ceiling = DIAL_POSITIONS[dialPosition]?.sizingCeiling || "FULL";
+  const cur = SIZING_ORDER.indexOf(sizing);
+  const cap = SIZING_ORDER.indexOf(ceiling);
+  if (cur === -1 || cap === -1 || cur <= cap) return sizing;
+  return ceiling;
+}
+
 async function fetchEarningsCalendarFlag(symbol) {
   try {
     const now  = new Date();
@@ -2176,7 +2230,7 @@ async function logVerdict(fields) {
       gate1_branch:              fields.gate1Branch || null,
       gate0_read:                fields.gate0Read || null,
       gate2_corroboration_state: fields.gate2CorroborationState || null,
-      dial_position:             null, // Proposal 6 (Aggression Dial) not yet built
+      dial_position:             fields.dialPosition || null,
       grading_window_days:       fields.gradingWindowDays,
       grade_due_at:              dueAt.toISOString(),
       user_email:                fields.userEmail || null,
@@ -3222,10 +3276,19 @@ function setCache(key, data) {
 
 // ─── ANALYZE ──────────────────────────────────────────────────────
 app.post("/analyze", async (req, res) => {
-  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData } = req.body;
+  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData, dialPosition, holdThroughEarnings } = req.body;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
+
+  // ── PROPOSAL 6 — AGGRESSION DIAL (Aug 26, 2026) ──────────────────
+  // Only takes effect where the Dial feature itself is enabled
+  // (tierConfig.dial, Pro-first) -- scoped exactly to the feature's own
+  // rollout rather than a blast-radius-widening CRF-wide change. A
+  // missing/unrecognized value falls back to NEUTRAL, which is a
+  // guaranteed no-op (sizingCeiling FULL, no earnings check) -- so this
+  // is safe even before the client sends a real dial position.
+  const effectiveDialPosition = (req.tierConfig?.dial && DIAL_POSITIONS[dialPosition]) ? dialPosition : "NEUTRAL";
 
   // ── CREDIT CHECK ──────────────────────────────────────────────
   const userStatus = await credits.getUserStatus(req.userKey, req.userTier);
@@ -3258,6 +3321,14 @@ app.post("/analyze", async (req, res) => {
 
   // Deduct 1 credit (only if not cached)
   await credits.deductCredit(req.userKey, 1, req.userTier);
+
+  // Dial-proof at all 5 positions, no exceptions, per direct instruction --
+  // only runs where the Dial feature itself is enabled (tierConfig.dial),
+  // and only when the caller hasn't already opted in for this specific
+  // run (the "one-time opt-in toggle," never a persistent default, per
+  // the Notion log's own framing).
+  const upcomingEarnings = (req.tierConfig?.dial && !holdThroughEarnings)
+    ? await checkUpcomingEarnings(ticker) : null;
 
   // ── PRE-GATE — THESIS INTEGRITY, PRE-DETERMINED (Patch 3) ──────────
   // Computed server-side once in /ticker/:symbol and passed through here
@@ -3707,7 +3778,21 @@ Return only JSON.
         parsed.wait_for = "Additional confirmation needed before directional entry.";
       }
 
-      const result = { ...parsed, marketOpen: isMarketOpen() };
+      // ── PROPOSAL 6 — AGGRESSION DIAL: sizing ceiling + pre-earnings ──
+      // Both applied last, after every other sizing rule has already run,
+      // so nothing downstream can re-inflate past either one. The ceiling
+      // never raises sizing (see applySizingCeiling); the earnings block
+      // forces NONE outright, regardless of verdict direction -- this
+      // isn't a directional call, it's "don't size into a print."
+      parsed.sizing = applySizingCeiling(parsed.sizing, effectiveDialPosition);
+      let earningsBlocked = false;
+      if (upcomingEarnings) {
+        earningsBlocked = true;
+        parsed.sizing   = "NONE";
+        parsed.wait_for = `Earnings imminent${typeof upcomingEarnings === "string" ? ` (${upcomingEarnings})` : ""} — no new entries until it's reported, unless you explicitly hold through it.`;
+      }
+
+      const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
       setCache(cacheKey, result);
       await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
@@ -3717,6 +3802,7 @@ Return only JSON.
         gate2CorroborationState: contextCorroboration
           ? `${contextCorroboration.corroborated ? "CONTEXT-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/3)`
           : null,
+        dialPosition: req.tierConfig?.dial ? effectiveDialPosition : null,
         gradingWindowDays: DEFAULT_GRADING_WINDOW_TRADING_DAYS,
         userEmail: req.userEmail, tier: req.userTier,
       });

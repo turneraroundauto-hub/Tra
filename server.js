@@ -1948,6 +1948,150 @@ async function searchSymbolByName(query) {
   return symbol;
 }
 
+// ─── PROPOSAL 5 — AGITATOR GAUGE (Aug 26, 2026) ───────────────────────
+// Standalone discovery/validation tool -- proofing a new stock interest or
+// a media rumor BEFORE it enters the watchlist. Sits alongside the CRF,
+// not inside it: no gate-layer conflict, no change to Pre-Gate/Gate 2.
+// Scored out of 6 factors, not the 7 the Notion log named -- Historical
+// Reaction is deliberately omitted, same reason gx.buildupPatternCheck()
+// already omits its own earnings-reaction sub-signal: no per-ticker
+// headline/earnings-reaction history exists anywhere in this app, and
+// faking one would be worse than disclosing the gap.
+//
+// Hybrid scoring per direct instruction: deterministic where real data
+// already exists (Liquidity Sensitivity from fetchTickerFundamentals's
+// marketCap/avgVol20d, Options/IV Environment from the existing
+// fetchImpliedVolatility()), one lightweight AI call for the 4 factors
+// that are genuinely judgment calls (Surprise/Uncertainty/Positioning/
+// Cross-Asset Exposure) -- not a full 7-factor AI guess.
+
+const AGITATOR_PROMPT = `You are scoring a single news headline's likely
+market-moving impact on ONE stock, across exactly 4 factors. Score each
+0-100 (100 = maximum). Return ONLY this exact JSON shape, no other text,
+no markdown fences:
+{"surprise":N,"uncertainty":N,"positioning":N,"crossAsset":N}
+- surprise: how unexpected this is given the company's normal trajectory
+- uncertainty: how much the market doesn't yet know how to price this
+- positioning: how fresh/unpriced this catalyst still is (100 = fresh and unpriced, 0 = fully priced in already)
+- crossAsset: how much this could ripple into the ticker's sector proxy, correlated names, or crypto/macro`;
+
+// First-draft heuristic, explicitly not yet tuned against real outcomes --
+// same "needs review, tune against real data" posture this file already
+// uses for Pre-Gate's own trigger-keyword table when it first shipped.
+// Smaller market cap / thinner volume = a given dollar of buying/selling
+// moves the price more, i.e. higher liquidity sensitivity.
+function computeLiquiditySensitivity(fundamentals) {
+  if (!fundamentals || (fundamentals.marketCap == null && fundamentals.avgVol20d == null)) return null;
+  let score = 50;
+  if (fundamentals.marketCap != null) {
+    if (fundamentals.marketCap < 2e9) score += 25;
+    else if (fundamentals.marketCap > 10e9) score -= 25;
+  }
+  if (fundamentals.avgVol20d != null) {
+    if (fundamentals.avgVol20d < 1e6) score += 15;
+    else if (fundamentals.avgVol20d > 10e6) score -= 15;
+  }
+  return Math.max(0, Math.min(100, score));
+}
+
+// A representative IV reading (a %, typically 15-150+ for equities) mapped
+// directly onto the same 0-100 scale the other factors use -- clamped, not
+// rescaled, since IV past 100% already represents extreme expected
+// movement and shouldn't need to be compressed to fit.
+function ivToAgitatorScore(iv) {
+  if (typeof iv !== "number") return null;
+  return Math.max(0, Math.min(100, Math.round(iv)));
+}
+
+async function scoreAgitatorFactors(symbol, headline) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || !headline) return null;
+  try {
+    const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6", max_tokens: 150, temperature: 0,
+        system: AGITATOR_PROMPT,
+        messages: [{ role: "user", content: `Ticker: ${symbol}\nHeadline: "${headline}"` }],
+      }),
+    }, 20000);
+    if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+    const data = await res.json();
+    const text = data.content?.[0]?.text || "";
+    const match = text.match(/\{[^}]*\}/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]);
+    const clamp = v => (typeof v === "number" && v >= 0 && v <= 100) ? Math.round(v) : null;
+    return {
+      surprise:    clamp(parsed.surprise),
+      uncertainty: clamp(parsed.uncertainty),
+      positioning: clamp(parsed.positioning),
+      crossAsset:  clamp(parsed.crossAsset),
+    };
+  } catch (e) {
+    console.error(`scoreAgitatorFactors ${symbol}:`, e.message);
+    return null;
+  }
+}
+
+// Averages whatever subset of the 6 factors actually resolved (a headline-
+// less lookup still gets Liquidity/IV; a call with no Alpaca IV entitlement
+// still gets the 4 AI factors) -- never blocks on a factor that's missing,
+// same fail-safe posture as gx.buildupPatternCheck()'s own "usable >= 2".
+function computeAgitatorComposite(factors) {
+  const vals = Object.values(factors).filter(v => typeof v === "number");
+  if (!vals.length) return null;
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  return {
+    score: Math.round(avg),
+    level: avg >= 66 ? "HIGH" : avg >= 34 ? "MEDIUM" : "LOW",
+    factorCount: vals.length,
+  };
+}
+
+// "Comps" per Proposal 5's own reuse note: rank the existing Gate 5
+// candidate-proxy universe by correlation strength against this ticker,
+// rather than a literal same-industry-peer list -- reuses gx.pearson()/
+// dailyReturns() exactly as directed, over the real 130-day window
+// fetchDailyCloses() already uses everywhere else (the Notion log's own
+// "90-day" description of this function was checked against the code and
+// is wrong -- corrected here, not perpetuated).
+async function computeAgitatorComps(symbol, tickerCloses, limit) {
+  if (!tickerCloses) return [];
+  const tr = gx.dailyReturns(tickerCloses);
+  const entries = await Promise.all(GATE5_CANDIDATE_SYMBOLS.filter(s => s !== symbol).map(async sym => {
+    const closes = await fetchDailyCloses(sym, 130);
+    if (!closes) return null;
+    const r = gx.pearson(tr, gx.dailyReturns(closes));
+    return r == null ? null : { symbol: sym, correlation: +r.toFixed(3) };
+  }));
+  return entries.filter(Boolean).sort((a, b) => Math.abs(b.correlation) - Math.abs(a.correlation)).slice(0, limit);
+}
+
+// Real operational-cost safeguard, not part of the original Notion scope:
+// this endpoint is free (no credit deduction, per direct instruction --
+// it's a discovery tool meant to be used before a ticker even enters the
+// watchlist, so a credit gate would work against its own purpose), but a
+// headline-bearing call still makes a real, uncosted-to-the-user Anthropic
+// call. A plain in-memory per-userKey rate limit keeps that from becoming
+// an open-ended cost, the same spirit as finnhubThrottle/alpacaThrottle
+// protecting this app's other unmetered paths.
+const agitatorRateLimit = new Map(); // userKey -> { count, windowStart }
+const AGITATOR_RATE_LIMIT_MAX = 20;
+const AGITATOR_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+function checkAgitatorRateLimit(userKey) {
+  const now = Date.now();
+  const entry = agitatorRateLimit.get(userKey);
+  if (!entry || now - entry.windowStart > AGITATOR_RATE_LIMIT_WINDOW_MS) {
+    agitatorRateLimit.set(userKey, { count: 1, windowStart: now });
+    return true;
+  }
+  if (entry.count >= AGITATOR_RATE_LIMIT_MAX) return false;
+  entry.count++;
+  return true;
+}
+
 // parsePctString / CONFIDENCE_NEGLIGIBLE_MOVE_PCT / priceConfirmedConfidence /
 // normalizeMarketReading / evaluateProxyStatus (Gate 5's forceDown status
 // check -- see the Aug 13, 2026 CLAUDE.md incident writeup) all moved to
@@ -2378,6 +2522,90 @@ app.get("/lookup", async (req, res) => {
     res.json({ symbol });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PROPOSAL 5 — GET /agitator (Aug 26, 2026) ────────────────────────
+// Free (no credit deduction) and Pro-gated for now (tierConfig.agitator),
+// per the same Pro-first rollout as Proposal 7. "Full" (expanded comps +
+// a second corroborating news source) reuses tierConfig.tracker -- already
+// Pro/Shark-exclusive, same reuse-an-existing-flag reasoning as
+// /scorecard's own breakdown gate, rather than a second new flag for the
+// identical tier split.
+app.get("/agitator", async (req, res) => {
+  if (!req.tierConfig?.agitator) {
+    return res.status(403).json({ error: "Agitator Gauge not available on this tier yet" });
+  }
+  if (!checkAgitatorRateLimit(req.userKey)) {
+    return res.status(429).json({ error: "Too many Agitator checks this hour — try again later." });
+  }
+  const query = String(req.query.q || "").trim();
+  if (!query) return res.status(400).json({ error: "q is required" });
+  const headlineOverride = req.query.headline ? String(req.query.headline).trim() : null;
+
+  try {
+    // Same rule Import uses: an all-caps token that already looks like a
+    // ticker is used directly (zero extra network calls); anything else
+    // (a company name, a lowercase/mixed-case ticker) goes through
+    // searchSymbolByName(), the same company-name lookup Import added.
+    let symbol = /^[A-Z]{1,6}$/.test(query) ? query : await searchSymbolByName(query);
+    if (!symbol) return res.json({ resolved: false, query });
+    symbol = symbol.toUpperCase();
+
+    const isFull = !!req.tierConfig?.tracker;
+    const [fundamentals, dailyCloses, quote, news] = await Promise.all([
+      fetchTickerFundamentals(symbol),
+      fetchDailyCloses(symbol, 130),
+      fetchQuote(symbol),
+      headlineOverride ? Promise.resolve(null) : fetchNews(symbol).catch(() => null),
+    ]);
+    const effectiveHeadline = headlineOverride || (news ? news.headline : null);
+    const price = quote ? parseFloat(quote.price) : null;
+
+    const [aiFactors, iv] = await Promise.all([
+      effectiveHeadline ? scoreAgitatorFactors(symbol, effectiveHeadline) : null,
+      req.tierConfig?.iv ? fetchImpliedVolatility(symbol, price) : null,
+    ]);
+
+    const liquidity = computeLiquiditySensitivity(fundamentals);
+    const ivEnvironment = ivToAgitatorScore(iv);
+
+    const factorsForComposite = {};
+    if (aiFactors) Object.assign(factorsForComposite, aiFactors);
+    if (liquidity != null) factorsForComposite.liquidity = liquidity;
+    if (ivEnvironment != null) factorsForComposite.ivEnvironment = ivEnvironment;
+    const composite = computeAgitatorComposite(factorsForComposite);
+
+    const comps = await computeAgitatorComps(symbol, dailyCloses, isFull ? 8 : 3);
+
+    const newsOut = [];
+    if (news) newsOut.push({ source: "primary", headline: news.headline, ageLabel: news.ageLabel });
+    if (isFull && !headlineOverride) {
+      // A second, independently-sourced corroborating headline when one
+      // exists -- reuses Proposal 4's own pooled Alpaca+Finnhub news-body
+      // fetch, not a new integration.
+      try {
+        const bodies = await fetchNewsBodiesForCorroboration(symbol);
+        if (bodies.length > 1) newsOut.push({ source: "secondary", excerpt: bodies[1].slice(0, 200) });
+      } catch { /* fail-safe: primary headline alone is still a valid response */ }
+    }
+
+    res.json({
+      resolved: true, symbol,
+      headlineUsed: effectiveHeadline,
+      factors: {
+        surprise:    aiFactors?.surprise    ?? null,
+        uncertainty: aiFactors?.uncertainty ?? null,
+        positioning: aiFactors?.positioning ?? null,
+        crossAsset:  aiFactors?.crossAsset  ?? null,
+        liquidity, ivEnvironment,
+        historicalReaction: null, // deliberately omitted -- no data source exists for this yet
+      },
+      composite, comps, news: newsOut,
+    });
+  } catch (e) {
+    console.error(`GET /agitator "${query}":`, e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 

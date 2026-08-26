@@ -2118,23 +2118,49 @@ function computeAgitatorComposite(factors) {
   };
 }
 
-// "Comps" per Proposal 5's own reuse note: rank the existing Gate 5
-// candidate-proxy universe by correlation strength against this ticker,
-// rather than a literal same-industry-peer list -- reuses gx.pearson()/
-// dailyReturns() exactly as directed, over the real 130-day window
-// fetchDailyCloses() already uses everywhere else (the Notion log's own
-// "90-day" description of this function was checked against the code and
-// is wrong -- corrected here, not perpetuated).
-async function computeAgitatorComps(symbol, tickerCloses, limit) {
-  if (!tickerCloses) return [];
-  const tr = gx.dailyReturns(tickerCloses);
-  const entries = await Promise.all(GATE5_CANDIDATE_SYMBOLS.filter(s => s !== symbol).map(async sym => {
-    const closes = await fetchDailyCloses(sym, 130);
-    if (!closes) return null;
-    const r = gx.pearson(tr, gx.dailyReturns(closes));
-    return r == null ? null : { symbol: sym, correlation: +r.toFixed(3) };
-  }));
-  return entries.filter(Boolean).sort((a, b) => Math.abs(b.correlation) - Math.abs(a.correlation)).slice(0, limit);
+// "Comps" -- reworked Aug 26, 2026 (same day) after direct feedback that
+// the original approach (rank the Gate 5 candidate-proxy basket --
+// SPY/QQQ/TSM/GLD/etc. -- by correlation) wasn't "related companies" at
+// all, just the same macro/sector ETF list this app already uses
+// everywhere else for Gate 5, dumped as a list of up to 8. Real fix:
+// Finnhub's own /stock/peers endpoint (free-tier, returns genuine
+// same-industry competitor tickers for a symbol) -- an actual "related
+// companies" answer instead of a repurposed proxy basket. Cached
+// alongside the existing symbol-search cache pattern since a company's
+// peer set doesn't change day to day.
+const peersCache = new Map(); // symbol -> { peers, time }
+const PEERS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+async function fetchTickerPeers(symbol) {
+  const cached = peersCache.get(symbol);
+  if (cached && Date.now() - cached.time < PEERS_MAX_AGE_MS) return cached.peers;
+  let peers = [];
+  try {
+    const data = await finnhubGet(`/stock/peers?symbol=${symbol}`);
+    peers = Array.isArray(data) ? data.filter(s => typeof s === "string" && /^[A-Z]{1,5}$/.test(s) && s !== symbol) : [];
+  } catch (e) {
+    console.error(`fetchTickerPeers ${symbol}:`, e.message);
+  }
+  peersCache.set(symbol, { peers, time: Date.now() });
+  return peers;
+}
+
+// A short, genuinely useful list -- "a few related companies as a
+// positive recommendation," not an exhaustive correlation dump. Each
+// comp carries a real live price/% change (fetchQuote, already used for
+// the primary symbol) rather than a correlation float -- a tangible,
+// at-a-glance read instead of an abstract number next to an unrelated
+// macro ticker. Flat limit for every tier now that this is a real,
+// curated peer list rather than a repurposed proxy basket -- the old
+// isFull-scaled 3-vs-8 split existed to ration a bigger data dump, which
+// no longer applies once the list itself is short by design.
+const AGITATOR_COMPS_LIMIT = 3;
+async function computeAgitatorComps(symbol) {
+  const peers = (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_LIMIT);
+  const quotes = await Promise.all(peers.map(sym => fetchQuote(sym)));
+  return peers.map((sym, i) => {
+    const q = quotes[i];
+    return q ? { symbol: sym, price: q.price, change: q.change, direction: q.direction } : { symbol: sym, price: null, change: null, direction: "flat" };
+  });
 }
 
 // Real operational-cost safeguard, not part of the original Notion scope:
@@ -2600,6 +2626,64 @@ app.get("/lookup", async (req, res) => {
 // Pro/Shark-exclusive, same reuse-an-existing-flag reasoning as
 // /scorecard's own breakdown gate, rather than a second new flag for the
 // identical tier split.
+// Reworked Aug 26, 2026 (same day) after direct feedback that two separate
+// inputs ("ticker/company" + an optional headline box) wasn't what was
+// asked for -- one box that "recognizes context from a company like a
+// real search engine designed for the stock market." A short, name-shaped
+// query (<=4 words, no sentence-ending punctuation) resolves exactly as
+// before -- zero behavior change for the common "type AAPL"/"type Tesla"
+// case. A longer, sentence-shaped query is treated as a pasted headline/
+// rumor: still tried as a literal company-name search first (Finnhub's
+// own fuzzy search occasionally still surfaces the right hit), and if
+// that misses, this pulls out capitalized proper-noun-looking phrases
+// from the text and tries each in turn -- the same searchSymbolByName()
+// lookup, just fed better candidates than the raw sentence. Either way,
+// the one thing typed becomes both the resolved symbol AND (for the
+// headline-shaped path) the exact headline scored/displayed, since the
+// user typed the real thing to check.
+const CANDIDATE_STOPWORDS = new Set(["The","This","That","These","Those","A","An","Is","Are","Was","Were","Why","How","What","When","Where","Who","Will","Could","Should","Would","New","Real","Big","Not","And","But","For","With","After","Before","Amid","Says","Said","It","Its","There","Here"]);
+function extractCompanyCandidates(text) {
+  const words = String(text).split(/\s+/);
+  const runs = [];
+  let current = [];
+  for (const w of words) {
+    // Strip a possessive suffix ('s / ’s) BEFORE the shape test, so
+    // "Nvidia's" -> "Nvidia" instead of failing the shape test outright
+    // on the internal apostrophe and silently dropping the one word that
+    // matters most in a real headline like "Nvidia's Real Story...".
+    let clean = w.replace(/['’]s$/i, "");
+    clean = clean.replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "");
+    if (clean && /^[A-Z][a-zA-Z]*$/.test(clean) && !CANDIDATE_STOPWORDS.has(clean)) {
+      current.push(clean);
+    } else {
+      if (current.length) runs.push(current.join(" "));
+      current = [];
+    }
+  }
+  if (current.length) runs.push(current.join(" "));
+  // Also add each run's own individual words as fallback candidates -- an
+  // incidental adjacent capitalized token (a mid-sentence "Q3" cleaning to
+  // "Q", a trailing "CEO") can merge into an otherwise-useful run (e.g.
+  // "Tesla Q"), and the merged phrase may not resolve on its own even
+  // though the real company name inside it would. Tried after every full
+  // run, never instead of one.
+  const candidates = [];
+  for (const run of runs) {
+    candidates.push(run);
+    const parts = run.split(" ");
+    if (parts.length > 1) candidates.push(...parts);
+  }
+  // Longest runs first -- "Roundhill Memory ETF" is a better candidate than
+  // its own substring "Roundhill" alone -- then dedupe while preserving order.
+  const seen = new Set();
+  return candidates.sort((a, b) => b.split(" ").length - a.split(" ").length).filter(r => {
+    const k = r.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 app.get("/agitator", async (req, res) => {
   if (!req.tierConfig?.agitator) {
     return res.status(403).json({ error: "Agitator Gauge not available on this tier yet" });
@@ -2607,23 +2691,33 @@ app.get("/agitator", async (req, res) => {
   if (!checkAgitatorRateLimit(req.userKey)) {
     return res.status(429).json({ error: "Too many Agitator checks this hour — try again later." });
   }
-  const query = String(req.query.q || "").trim();
-  if (!query) return res.status(400).json({ error: "q is required" });
-  const headlineOverride = req.query.headline ? String(req.query.headline).trim() : null;
+  const raw = String(req.query.q || "").trim();
+  if (!raw) return res.status(400).json({ error: "q is required" });
+  // Legacy separate `headline` param still honored if a not-yet-updated
+  // client sends it, but the single-box client below never does.
+  let headlineOverride = req.query.headline ? String(req.query.headline).trim() : null;
+  const looksLikeName = raw.split(/\s+/).length <= 4 && !/[.!?]$/.test(raw);
 
   try {
-    // Same rule Import uses: an all-caps token that already looks like a
-    // ticker is used directly (zero extra network calls); anything else
-    // (a company name, a lowercase/mixed-case ticker) goes through
-    // searchSymbolByName(), the same company-name lookup Import added.
-    let symbol = /^[A-Z]{1,6}$/.test(query) ? query : await searchSymbolByName(query);
-    if (!symbol) return res.json({ resolved: false, query });
+    let symbol = null;
+    if (looksLikeName) {
+      symbol = /^[A-Z]{1,6}$/.test(raw) ? raw : await searchSymbolByName(raw);
+    } else {
+      symbol = await searchSymbolByName(raw);
+      if (!symbol) {
+        for (const candidate of extractCompanyCandidates(raw)) {
+          symbol = await searchSymbolByName(candidate);
+          if (symbol) break;
+        }
+      }
+      if (symbol && !headlineOverride) headlineOverride = raw;
+    }
+    if (!symbol) return res.json({ resolved: false, query: raw });
     symbol = symbol.toUpperCase();
 
     const isFull = !!req.tierConfig?.tracker;
-    const [fundamentals, dailyCloses, quote, news] = await Promise.all([
+    const [fundamentals, quote, news] = await Promise.all([
       fetchTickerFundamentals(symbol),
-      fetchDailyCloses(symbol, 130),
       fetchQuote(symbol),
       headlineOverride ? Promise.resolve(null) : fetchNews(symbol).catch(() => null),
     ]);
@@ -2644,23 +2738,14 @@ app.get("/agitator", async (req, res) => {
     if (ivEnvironment != null) factorsForComposite.ivEnvironment = ivEnvironment;
     const composite = computeAgitatorComposite(factorsForComposite);
 
-    const comps = await computeAgitatorComps(symbol, dailyCloses, isFull ? 8 : 3);
-
-    const newsOut = [];
-    if (news) newsOut.push({ source: "primary", headline: news.headline, ageLabel: news.ageLabel });
-    if (isFull && !headlineOverride) {
-      // A second, independently-sourced corroborating headline when one
-      // exists -- reuses Proposal 4's own pooled Alpaca+Finnhub news-body
-      // fetch, not a new integration.
-      try {
-        const bodies = await fetchNewsBodiesForCorroboration(symbol);
-        if (bodies.length > 1) newsOut.push({ source: "secondary", excerpt: bodies[1].slice(0, 200) });
-      } catch { /* fail-safe: primary headline alone is still a valid response */ }
-    }
+    const comps = await computeAgitatorComps(symbol);
 
     res.json({
       resolved: true, symbol,
       headlineUsed: effectiveHeadline,
+      // Only a real, fetched article (not a user-pasted headline/rumor,
+      // which has no source URL) is ever linkable.
+      headlineUsedUrl: (!headlineOverride && news) ? news.url || null : null,
       // Phase 0 fix (Aug 26, 2026): the sub-factor breakdown is Pro's
       // "full dynamic gauge" per the Notion log's own tier table -- Starter
       // gets "Simple gauge (low/med/high)" only. This was missed in the
@@ -2676,10 +2761,10 @@ app.get("/agitator", async (req, res) => {
         liquidity, ivEnvironment,
         historicalReaction: null, // deliberately omitted -- no data source exists for this yet
       } : undefined,
-      composite, comps, news: newsOut,
+      composite, comps,
     });
   } catch (e) {
-    console.error(`GET /agitator "${query}":`, e.message);
+    console.error(`GET /agitator "${raw}":`, e.message);
     res.status(500).json({ error: e.message });
   }
 });

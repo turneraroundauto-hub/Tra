@@ -1947,6 +1947,20 @@ const DIAL_POSITIONS = {
   POSITION_LEAN: { sizingCeiling: "FULL" },
   POSITION_LONG: { sizingCeiling: "FULL" },
 };
+// Phase 1.5 (Aug 26 2026) -- Starter's own restricted Dial range, per the
+// Notion plan's original "Narrow" (Starter) vs "Medium" (Pro) framing,
+// confirmed via AskUserQuestion rather than shipped as parity-with-Pro.
+// Keyed by tierConfig.dialRange ("full" for Pro, "narrow" for Starter);
+// an unset/unrecognized range falls back to "full" -- harmless for any
+// tier where tierConfig.dial is itself false. This is enforcement, not
+// just a UI restriction: the client only ever offers the buttons for its
+// own tier's range, but a stale/tampered dialPosition value from any
+// tier still gets silently rejected back to NEUTRAL here, same fail-safe
+// posture as every other dial validation in this function.
+const DIAL_RANGES = {
+  full:   ["ACTIVE_SWING", "ACTIVE_LEAN", "NEUTRAL", "POSITION_LEAN", "POSITION_LONG"],
+  narrow: ["ACTIVE_LEAN", "NEUTRAL", "POSITION_LEAN"],
+};
 function applySizingCeiling(sizing, dialPosition) {
   const ceiling = DIAL_POSITIONS[dialPosition]?.sizingCeiling || "FULL";
   const cur = SIZING_ORDER.indexOf(sizing);
@@ -3288,7 +3302,8 @@ app.post("/analyze", async (req, res) => {
   // missing/unrecognized value falls back to NEUTRAL, which is a
   // guaranteed no-op (sizingCeiling FULL, no earnings check) -- so this
   // is safe even before the client sends a real dial position.
-  const effectiveDialPosition = (req.tierConfig?.dial && DIAL_POSITIONS[dialPosition]) ? dialPosition : "NEUTRAL";
+  const allowedDialPositions = DIAL_RANGES[req.tierConfig?.dialRange] || DIAL_RANGES.full;
+  const effectiveDialPosition = (req.tierConfig?.dial && DIAL_POSITIONS[dialPosition] && allowedDialPositions.includes(dialPosition)) ? dialPosition : "NEUTRAL";
 
   // ── CREDIT CHECK ──────────────────────────────────────────────
   const userStatus = await credits.getUserStatus(req.userKey, req.userTier);

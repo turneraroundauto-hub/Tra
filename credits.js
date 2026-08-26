@@ -72,7 +72,8 @@ const TIERS = {
     iv:            false,
     scorecard:     true,        // Proposal 7, Aug 26 2026 -- Starter Phase 1, trickled down from Pro
     agitator:      true,        // Proposal 5, Aug 26 2026 -- Starter Phase 1, trickled down from Pro
-    dial:          false,       // Proposal 6, Aug 26 2026 -- Phase 1.5 range decision still open, not rolled out here
+    dial:          true,        // Proposal 6, Aug 26 2026 -- Starter Phase 2, restricted range (see dialRange)
+    dialRange:     "narrow",    // Phase 1.5 decision (confirmed via AskUserQuestion): Active-Lean/Neutral/Position-Lean only -- honors the Notion plan's "Narrow" (Starter) vs "Medium" (Pro) framing as a real, enforced difference
     maxRollover:   45,
     price:         9.99,
   },
@@ -94,6 +95,7 @@ const TIERS = {
     scorecard:     true,        // Proposal 7, Aug 26 2026 -- first tier to get it
     agitator:      true,        // Proposal 5, Aug 26 2026 -- first tier to get it
     dial:          true,        // Proposal 6, Aug 26 2026 -- first tier to get it
+    dialRange:     "full",      // Phase 1.5 (Aug 26 2026) -- Pro keeps the full 5-position range
     maxRollover:   45,
     price:         16.99,
   },

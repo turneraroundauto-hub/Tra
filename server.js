@@ -28,6 +28,34 @@ const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
     })
   : null;
 
+// ── CRF VERSION (Proposal 7 — Verdict Accuracy Scorecard, Aug 26, 2026) ──
+// Tags every verdict_log row so future CRF/gate-logic changes never
+// silently blend with historical accuracy that was measured under
+// different rules. Bump this by hand on every change that can alter what
+// verdict/sizing/confidence a given input produces (gate weighting,
+// forceDown/corroboration authority, confidence rules, sizing rules) —
+// NOT on cosmetic/UI-only changes. Last bumped: Aug 22, 2026 (Pre-Gate
+// joined the corroboration pool; Gate 4 moved server-side; Gate 3 Friday
+// full-weight exception; single-RED-among-2/3/4 sizing exception).
+const CRF_VERSION = "2026-08-22";
+
+// Fixed default until Proposal 6 (Aggression Dial) ships its own dial
+// position -- the Dial's neutral position is documented as "= current CRF
+// behavior unchanged," so 3 trading days is this app's own de facto
+// holding-period assumption today, not a new invented number.
+const DEFAULT_GRADING_WINDOW_TRADING_DAYS = 3;
+
+function addTradingDays(date, n) {
+  const d = new Date(date.getTime());
+  let added = 0;
+  while (added < n) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const day = d.getUTCDay(); // 0 = Sun, 6 = Sat
+    if (day !== 0 && day !== 6) added++;
+  }
+  return d;
+}
+
 // Pass supabase client to credit system
 credits.setSupabase(supabase);
 
@@ -1982,6 +2010,148 @@ async function saveProxyResolution(symbol, resolved, trigger) {
   }
 }
 
+// ─── PROPOSAL 7 — VERDICT ACCURACY SCORECARD (Aug 26, 2026) ───────────
+// One row per /analyze response, written just before the response is
+// sent. Never blocks/rejects the request -- same fail-safe posture as
+// every other Supabase write in this file. grade/actual_return_pct/
+// graded_at stay null until the grading job (below) fills them in once
+// grade_due_at has passed.
+async function logVerdict(fields) {
+  if (!supabase) return;
+  try {
+    const issuedAt = new Date();
+    const dueAt = addTradingDays(issuedAt, fields.gradingWindowDays);
+    await supabase.from("verdict_log").insert({
+      ticker:                    fields.ticker,
+      issued_at:                 issuedAt.toISOString(),
+      issued_price:              fields.issuedPrice ?? null,
+      verdict:                   fields.verdict,
+      size_action:               fields.sizeAction || null,
+      crf_version:               CRF_VERSION,
+      pre_gate_state:            fields.preGateState || null,
+      gate1_branch:              fields.gate1Branch || null,
+      gate0_read:                fields.gate0Read || null,
+      gate2_corroboration_state: fields.gate2CorroborationState || null,
+      dial_position:             null, // Proposal 6 (Aggression Dial) not yet built
+      grading_window_days:       fields.gradingWindowDays,
+      grade_due_at:              dueAt.toISOString(),
+      user_email:                fields.userEmail || null,
+      tier:                      fields.tier,
+    });
+  } catch (e) {
+    console.error(`logVerdict ${fields.ticker}:`, e.message);
+  }
+}
+
+// Only logs actual hits (one row per source that matched), matching
+// corroboration_log's "timestamp per source hit" design -- a miss isn't a
+// row. Label mapping matches gx.corroborateSessionContext()'s own
+// matchedLabels keys so this can never drift from what CONTEXT-
+// CORROBORATED actually counted.
+const CORROBORATION_SOURCE_MAP = {
+  news_content_match:    "news_match",
+  gate3_buildup_pattern:  "gate3_buildup",
+  earnings_calendar_event: "earnings_calendar",
+};
+async function logCorroborationHits(ticker, corroboration) {
+  if (!supabase || !corroboration) return;
+  const rows = (corroboration.matchedLabels || [])
+    .map(label => CORROBORATION_SOURCE_MAP[label])
+    .filter(Boolean)
+    .map(source => ({ ticker, source }));
+  if (!rows.length) return;
+  try {
+    await supabase.from("corroboration_log").insert(rows);
+  } catch (e) {
+    console.error(`logCorroborationHits ${ticker}:`, e.message);
+  }
+}
+
+// Proposal 7's own zone definitions (0.75% flat band + 1.75-pt margin band
+// each side = 2.5% confirm threshold, no gap/overlap). The TRUE/MARGINAL/
+// FALSE mapping per verdict direction below is this session's own
+// interpretation, NOT copied from a "full grading matrix" -- the Notion
+// log only carried the R-zone boundaries, referencing a matrix from chat
+// that wasn't in the log itself. Reasoning: UP/DOWN get TRUE only on a
+// same-direction Strong move, MARGINAL on a same-direction Weak move,
+// FALSE on flat or wrong-direction; FLAT gets TRUE on a real flat
+// outcome, MARGINAL on either Weak band (close to flat), FALSE on either
+// Strong band (a real move happened despite the flat call). Flag to Mr. T
+// to confirm this matches what was actually worked out in chat.
+function classifyVerdictReturn(verdict, r) {
+  let zone;
+  if (r >= 2.5) zone = "STRONG_UP";
+  else if (r > 0.75) zone = "WEAK_UP";
+  else if (r >= -0.75) zone = "FLAT";
+  else if (r > -2.5) zone = "WEAK_DOWN";
+  else zone = "STRONG_DOWN";
+
+  if (verdict === "UP") {
+    if (zone === "STRONG_UP") return "TRUE";
+    if (zone === "WEAK_UP") return "MARGINAL";
+    return "FALSE";
+  }
+  if (verdict === "DOWN") {
+    if (zone === "STRONG_DOWN") return "TRUE";
+    if (zone === "WEAK_DOWN") return "MARGINAL";
+    return "FALSE";
+  }
+  // FLAT
+  if (zone === "FLAT") return "TRUE";
+  if (zone === "WEAK_UP" || zone === "WEAK_DOWN") return "MARGINAL";
+  return "FALSE";
+}
+
+// Runs every 30 minutes, grades any verdict_log row whose grade_due_at has
+// passed. Same "poll on an interval, no external cron infra" shape as the
+// Market-Open Cache Warm below -- this app's only other recurring
+// scheduled job, and (per Proposal 7's own plan) the "quarterly proxy
+// recompute" this was originally supposed to match is actually a lazy
+// on-request staleness check, not a real cron -- that pattern doesn't fit
+// a sweep across every user's due rows, so this reuses the interval
+// pattern instead. Batched (50 rows/tick) so a large backlog can't fire an
+// unbounded burst of Finnhub calls in one tick -- fetchQuote() already
+// rides the shared finnhubThrottle() queue regardless.
+const GRADING_BATCH_SIZE = 50;
+async function runVerdictGradingSweep() {
+  if (!supabase) return;
+  try {
+    const nowIso = new Date().toISOString();
+    const { data: due, error } = await supabase
+      .from("verdict_log")
+      .select("id, ticker, verdict, issued_price")
+      .is("graded_at", null)
+      .lte("grade_due_at", nowIso)
+      .limit(GRADING_BATCH_SIZE);
+    if (error) { console.error("runVerdictGradingSweep query:", error.message); return; }
+    if (!due || !due.length) return;
+
+    for (const row of due) {
+      if (row.issued_price == null) {
+        // No entry price captured (e.g. logged before this column existed,
+        // or metricsData.price was missing) -- can't compute a real return.
+        // Mark graded with no grade rather than re-querying it forever.
+        await supabase.from("verdict_log").update({ graded_at: new Date().toISOString() }).eq("id", row.id);
+        continue;
+      }
+      const quote = await fetchQuote(row.ticker);
+      if (!quote) continue; // fail-safe: leave ungraded, retry next sweep
+      const actualPrice = parseFloat(quote.price);
+      const r = (actualPrice - row.issued_price) / row.issued_price * 100;
+      const grade = classifyVerdictReturn(row.verdict, r);
+      await supabase.from("verdict_log").update({
+        actual_return_pct: r,
+        grade,
+        graded_at: new Date().toISOString(),
+      }).eq("id", row.id);
+    }
+    console.log(`Verdict grading sweep: ${due.length} row(s) processed.`);
+  } catch (e) {
+    console.error("runVerdictGradingSweep:", e.message);
+  }
+}
+setInterval(() => { runVerdictGradingSweep().catch(e => console.error("runVerdictGradingSweep:", e.message)); }, 30 * 60 * 1000);
+
 // ─── PROPOSAL 3 — FIXED-PROXY REGIME VALIDATION (Aug 13, 2026) ────────
 // gates-extended.js's regimeValidation()/resolveFixedProxyBreak() have
 // existed since Patch 4 but were never wired up -- they need a place to
@@ -2317,6 +2487,85 @@ app.get("/track", async (req, res) => {
   } catch(e) { console.error("GET /track:", e.message); res.json({ entries: [] }); }
 });
 
+// ─── PROPOSAL 7 — /scorecard (Aug 26, 2026) ───────────────────────────
+// Free tier: aggregate, system-wide, pooled across every anonymous Free
+// visitor (tier='free' rows, no user_email filter) -- this is the only
+// query anyone reaches without a real signed-in session, and it never
+// returns a single row's data, only a pooled count/percentage, so it
+// can't leak any one user's history. Paid tiers: personalized, filtered
+// by user_email, same "real sign-in required" posture as GET /track.
+// Suppressed to insufficientData until n>=20 graded rows either way (an
+// early 100%/0% off 2-3 samples is worse than no number).
+const SCORECARD_MIN_GRADED = 20;
+function computeAccuracyStats(rows) {
+  const total = rows.length;
+  if (!total) return { gradedCount: 0, strictPct: null, directionalPct: null };
+  const trueCount     = rows.filter(r => r.grade === "TRUE").length;
+  const marginalCount = rows.filter(r => r.grade === "MARGINAL").length;
+  return {
+    gradedCount:    total,
+    strictPct:      +(trueCount / total * 100).toFixed(1),
+    directionalPct: +((trueCount + marginalCount) / total * 100).toFixed(1),
+  };
+}
+app.get("/scorecard", async (req, res) => {
+  // Gated Pro-first (credits.js TIERS.<tier>.scorecard) -- flip the flag
+  // per tier as this rolls out further, rather than branching on tier
+  // name here.
+  if (!req.tierConfig?.scorecard) {
+    return res.status(403).json({ error: "Scorecard not available on this tier yet" });
+  }
+  if (!supabase) return res.json({ insufficientData: true, gradedCount: 0 });
+
+  try {
+    if (req.userTier === "free") {
+      const { data, error } = await supabase
+        .from("verdict_log").select("grade")
+        .eq("tier", "free").not("graded_at", "is", null);
+      if (error) { console.error("GET /scorecard (free):", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
+      const stats = computeAccuracyStats(data || []);
+      if (stats.gradedCount < SCORECARD_MIN_GRADED) return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
+      // Directional % only for Free, per Proposal 7's tier rollout table.
+      return res.json({ scope: "aggregate", directionalPct: stats.directionalPct, gradedCount: stats.gradedCount });
+    }
+
+    if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+    const email = req.userEmail.trim().toLowerCase();
+    const { data, error } = await supabase
+      .from("verdict_log")
+      .select("grade, pre_gate_state, gate1_branch, gate0_read")
+      .eq("user_email", email).not("graded_at", "is", null);
+    if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
+    const rows  = data || [];
+    const stats = computeAccuracyStats(rows);
+    if (stats.gradedCount < SCORECARD_MIN_GRADED) {
+      return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
+    }
+    const result = { scope: "personal", strictPct: stats.strictPct, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount };
+
+    // Full breakdown by gate/branch fired — reuses tierConfig.tracker
+    // (already Pro/Shark-only, already means "real accuracy tracking is
+    // a real feature on this tier") rather than inventing a second flag
+    // for the same tier split.
+    if (req.tierConfig?.tracker) {
+      const breakdownBy = key => {
+        const groups = {};
+        rows.forEach(r => { const k = r[key] || "(none)"; (groups[k] = groups[k] || []).push(r); });
+        return Object.fromEntries(Object.entries(groups).map(([k, rs]) => [k, computeAccuracyStats(rs)]));
+      };
+      result.breakdown = {
+        gate1Branch:  breakdownBy("gate1_branch"),
+        preGateState: breakdownBy("pre_gate_state"),
+        gate0Read:    breakdownBy("gate0_read"),
+      };
+    }
+    res.json(result);
+  } catch (e) {
+    console.error("GET /scorecard:", e.message);
+    res.json({ insufficientData: true, gradedCount: 0 });
+  }
+});
+
 const TRACK_VERDICTS = new Set(["UP", "DOWN", "FLAT"]);
 app.post("/track", async (req, res) => {
   if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
@@ -2602,6 +2851,42 @@ async function refreshMarketEntry(symbol, hardTrigger = false) {
   return marketEntry;
 }
 
+// ─── PROPOSAL 7 — CORROBORATION DECAY (Aug 26, 2026) ──────────────────
+// Computed inline off the most recent corroboration_log hit for this
+// ticker (across whoever's analysis produced it -- corroboration_log has
+// no user scoping, matching its "timestamp per source hit" design). No
+// new endpoint, no new fetch cadence -- reuses whatever /ticker/:symbol
+// already runs on. Real gap, disclosed rather than hidden: Proposal 7
+// says decay should tie to the Agitator Gauge's Immediacy sub-factor, but
+// Proposal 5 (Agitator) hasn't been built yet, so this uses one fixed
+// 24h half-life for every hit regardless of source until Agitator ships
+// -- Free/Starter/Pro all effectively get the "fixed decay rate" tier
+// from Proposal 7's own rollout table for now, not the Agitator-tied
+// variable rate Pro/Shark are meant to eventually have. Returns null
+// (render nothing) for a ticker with zero corroboration_log rows --
+// most tickers, most of the time, since the underlying check only ever
+// runs when a user typed Session Context text.
+const DECAY_HALF_LIFE_HOURS = 24;
+async function computeCorroborationDecay(symbol) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from("corroboration_log")
+      .select("hit_at")
+      .eq("ticker", symbol)
+      .order("hit_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    const hoursSince = (Date.now() - new Date(data.hit_at).getTime()) / 3600000;
+    const freshnessPct = Math.max(0, Math.round(100 - (hoursSince / DECAY_HALF_LIFE_HOURS) * 100));
+    return { freshnessPct, label: freshnessPct >= 50 ? "FRESH" : "STALE", hitAt: data.hit_at };
+  } catch (e) {
+    console.error(`computeCorroborationDecay ${symbol}:`, e.message);
+    return null;
+  }
+}
+
 // ─── TICKER DATA ──────────────────────────────────────────────────
 app.get("/ticker/:symbol", async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
@@ -2667,7 +2952,12 @@ app.get("/ticker/:symbol", async (req, res) => {
     // doesn't need to ride on the same invalidation rule as the rest.
     const iv = req.tierConfig?.iv ? await fetchImpliedVolatility(symbol, metrics?.price) : null;
 
-    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, regime, timestamp: new Date().toISOString() });
+    // Corroboration Decay Indicator (Proposal 7) — gated on the same
+    // scorecard flag as /scorecard itself, since both parts of Proposal 7
+    // were approved and are rolling out on the same Pro-first schedule.
+    const corroborationDecay = req.tierConfig?.scorecard ? await computeCorroborationDecay(symbol) : null;
+
+    res.json({ symbol, metrics, news, openingBar, proxyRule, gate1, preGate, iv, weeklyCarryover, regime, corroborationDecay, timestamp: new Date().toISOString() });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -2879,6 +3169,7 @@ Current price: $${metricsData.price || "?"}
     });
 
     contextCorroboration = gx.corroborateSessionContext({ newsMatch, buildup, hasEarningsEvent });
+    await logCorroborationHits(ticker, contextCorroboration);
   }
 
   const userMessage = `
@@ -3183,6 +3474,17 @@ Return only JSON.
 
       const result = { ...parsed, marketOpen: isMarketOpen() };
       setCache(cacheKey, result);
+      await logVerdict({
+        ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
+        issuedPrice: typeof metricsData?.price === "number" ? metricsData.price : null,
+        preGateState: preGateResult.status, gate1Branch: gate1Result.branch,
+        gate0Read: gate0Status,
+        gate2CorroborationState: contextCorroboration
+          ? `${contextCorroboration.corroborated ? "CONTEXT-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/3)`
+          : null,
+        gradingWindowDays: DEFAULT_GRADING_WINDOW_TRADING_DAYS,
+        userEmail: req.userEmail, tier: req.userTier,
+      });
       res.json(result);
     } catch {
       res.status(500).json({ error: "Failed to parse AI response", raw: text });

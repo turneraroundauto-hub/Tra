@@ -54,6 +54,7 @@ const TIERS = {
     alpaca:        false,
     earnings:      false,
     iv:            false,
+    scorecard:     false,       // Proposal 7, Aug 26 2026 -- rolling out Pro-first, trickling down
     startingCredits: 3,         // hard cap: 3 credits, reset weekly (see checkWeeklyReset)
   },
   starter: {
@@ -67,6 +68,7 @@ const TIERS = {
     alpaca:        false,
     earnings:      false,
     iv:            false,
+    scorecard:     false,       // Proposal 7, Aug 26 2026 -- rolling out Pro-first, trickling down
     maxRollover:   45,
     price:         9.99,
   },
@@ -85,6 +87,7 @@ const TIERS = {
     alpaca:        false,
     earnings:      false,
     iv:            true,
+    scorecard:     true,        // Proposal 7, Aug 26 2026 -- first tier to get it
     maxRollover:   45,
     price:         16.99,
   },
@@ -99,6 +102,7 @@ const TIERS = {
     alpaca:        true,
     earnings:      true,
     iv:            true,
+    scorecard:     false,       // Proposal 7, Aug 26 2026 -- Shark UI is shelved indefinitely, not rolled out here
     maxRollover:   45,
     price:         39.99,
   },
@@ -142,8 +146,9 @@ function statusFromUser(user) {
       tracker:  tierConfig.tracker,
       glossary: tierConfig.glossary,
       alpaca:   tierConfig.alpaca,
-      earnings: tierConfig.earnings,
-      iv:       tierConfig.iv,
+      earnings:  tierConfig.earnings,
+      iv:        tierConfig.iv,
+      scorecard: tierConfig.scorecard,
     },
     lastReset:       user.lastReset,
     lastWeeklyReset: user.lastWeeklyReset,

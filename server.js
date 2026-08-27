@@ -2696,24 +2696,39 @@ app.get("/agitator", async (req, res) => {
   // Legacy separate `headline` param still honored if a not-yet-updated
   // client sends it, but the single-box client below never does.
   let headlineOverride = req.query.headline ? String(req.query.headline).trim() : null;
-  const looksLikeName = raw.split(/\s+/).length <= 4 && !/[.!?]$/.test(raw);
 
   try {
+    // No word-count/punctuation heuristic -- that version (same day)
+    // mis-shipped: it gated candidate-extraction behind "looks long/
+    // sentence-shaped," so a short-but-not-a-real-name phrase like
+    // "Nvidia earnings beat" (3 words, no terminal punctuation) took the
+    // bare-name path, searchSymbolByName() correctly failed to match the
+    // literal 3-word string, and extraction never even ran -- reported
+    // live as "Couldn't find a company." The real distinction that
+    // matters isn't length, it's whether raw resolved AS TYPED: if it
+    // did (a real ticker, or Finnhub's own fuzzy search matched the
+    // literal string), there's no headline in what was typed, just a
+    // name. If it didn't, extraction runs regardless of length, and
+    // succeeding there is itself the proof the input was headline/
+    // rumor-shaped -- that's what makes it the score-this-text case.
     let symbol = null;
-    if (looksLikeName) {
-      symbol = /^[A-Z]{1,6}$/.test(raw) ? raw : await searchSymbolByName(raw);
+    let directMatch = false;
+    if (/^[A-Z]{1,6}$/.test(raw)) {
+      symbol = raw;
+      directMatch = true;
     } else {
       symbol = await searchSymbolByName(raw);
-      if (!symbol) {
+      if (symbol) directMatch = true;
+      else {
         for (const candidate of extractCompanyCandidates(raw)) {
           symbol = await searchSymbolByName(candidate);
           if (symbol) break;
         }
       }
-      if (symbol && !headlineOverride) headlineOverride = raw;
     }
     if (!symbol) return res.json({ resolved: false, query: raw });
     symbol = symbol.toUpperCase();
+    if (!directMatch && !headlineOverride) headlineOverride = raw;
 
     const isFull = !!req.tierConfig?.tracker;
     const [fundamentals, quote, news] = await Promise.all([

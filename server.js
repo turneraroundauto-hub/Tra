@@ -2154,8 +2154,17 @@ async function fetchTickerPeers(symbol) {
 // isFull-scaled 3-vs-8 split existed to ration a bigger data dump, which
 // no longer applies once the list itself is short by design.
 const AGITATOR_COMPS_LIMIT = 3;
-async function computeAgitatorComps(symbol) {
-  const peers = (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_LIMIT);
+// mentionedSymbols: other real, resolvable companies already named in the
+// user's own typed input (e.g. "Salesforce, Crowdstrike, Okta surge" ->
+// CRWD/OKTA alongside primary CRM) -- when present, these are what the user
+// actually asked about, so they take priority over a generic same-industry
+// guess from Finnhub's peer list, which can surface something genuinely
+// unrelated to the story being checked (confirmed live: APP/AppLovin as a
+// "related" company for a Salesforce enterprise-SaaS earnings beat).
+async function computeAgitatorComps(symbol, mentionedSymbols) {
+  const peers = (mentionedSymbols && mentionedSymbols.length)
+    ? mentionedSymbols.slice(0, AGITATOR_COMPS_LIMIT)
+    : (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_LIMIT);
   const quotes = await Promise.all(peers.map(sym => fetchQuote(sym)));
   return peers.map((sym, i) => {
     const q = quotes[i];
@@ -2730,6 +2739,31 @@ app.get("/agitator", async (req, res) => {
     symbol = symbol.toUpperCase();
     if (!directMatch && !headlineOverride) headlineOverride = raw;
 
+    // Scan the SAME candidate list for other real companies the user
+    // already named alongside the primary one -- e.g. "Salesforce,
+    // Crowdstrike, Okta surge" should surface CRWD/OKTA as the related
+    // companies, not a generic industry-peer guess (confirmed live: APP/
+    // AppLovin surfaced as a "related" company for a Salesforce earnings
+    // beat, which makes no sense next to actual enterprise-SaaS peers the
+    // user had just named). Cheap on the common single-company case:
+    // extractCompanyCandidates is pure/no-network, and skipped entirely
+    // when raw is already a bare ticker; every searchSymbolByName call
+    // here is cache-backed, and several will already have run (success or
+    // fail) during primary resolution above.
+    const mentionedSymbols = [];
+    if (!/^[A-Z]{1,6}$/.test(raw)) {
+      const MENTION_SCAN_CAP = 6;
+      let scanned = 0;
+      for (const candidate of extractCompanyCandidates(raw)) {
+        if (mentionedSymbols.length >= AGITATOR_COMPS_LIMIT || scanned >= MENTION_SCAN_CAP) break;
+        scanned++;
+        const candSym = await searchSymbolByName(candidate);
+        if (candSym && candSym.toUpperCase() !== symbol && !mentionedSymbols.includes(candSym.toUpperCase())) {
+          mentionedSymbols.push(candSym.toUpperCase());
+        }
+      }
+    }
+
     const isFull = !!req.tierConfig?.tracker;
     const [fundamentals, quote, news] = await Promise.all([
       fetchTickerFundamentals(symbol),
@@ -2753,10 +2787,16 @@ app.get("/agitator", async (req, res) => {
     if (ivEnvironment != null) factorsForComposite.ivEnvironment = ivEnvironment;
     const composite = computeAgitatorComposite(factorsForComposite);
 
-    const comps = await computeAgitatorComps(symbol);
+    const comps = await computeAgitatorComps(symbol, mentionedSymbols);
 
     res.json({
       resolved: true, symbol,
+      // The resolved ticker's own real, live price move -- so a claimed
+      // rally/catalyst can be checked directly against actual trading
+      // instead of only an abstract AI-scored signal reading. `quote` was
+      // already fetched above (its `price` field feeds the IV lookup);
+      // this is the first time `change`/`direction` are surfaced.
+      tickerQuote: quote ? { price: quote.price, change: quote.change, direction: quote.direction } : null,
       headlineUsed: effectiveHeadline,
       // Only a real, fetched article (not a user-pasted headline/rumor,
       // which has no source URL) is ever linkable.

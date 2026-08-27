@@ -2161,15 +2161,32 @@ const AGITATOR_COMPS_LIMIT = 3;
 // guess from Finnhub's peer list, which can surface something genuinely
 // unrelated to the story being checked (confirmed live: APP/AppLovin as a
 // "related" company for a Salesforce enterprise-SaaS earnings beat).
+// A resolved-but-untradeable/junk symbol -- fetchQuote failed entirely, or
+// came back at $0.00 -- is strictly worse than showing nothing: it looks
+// like a real recommendation with no way for the user to sanity-check it.
+// Confirmed live: a Title-Case headline's common capitalized words
+// ("World", "Share", "One", ...) fuzzy-matched Finnhub's company-name
+// search into unrelated, effectively-worthless tickers (GDVM, PRDL) shown
+// as "related companies" for an Apple headline. Validated against the
+// real thing that matters -- does it have a real, live, positive price --
+// rather than trying to out-guess which capitalized words are "real"
+// company names with more stopwords (the same lesson already learned
+// from the "Nvidia earnings beat" resolution bug). Pulls a slightly wider
+// candidate pool than the display limit so filtering bad ones out still
+// leaves room to reach a full list.
+const AGITATOR_COMPS_CANDIDATE_POOL = 6;
 async function computeAgitatorComps(symbol, mentionedSymbols) {
-  const peers = (mentionedSymbols && mentionedSymbols.length)
-    ? mentionedSymbols.slice(0, AGITATOR_COMPS_LIMIT)
-    : (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_LIMIT);
-  const quotes = await Promise.all(peers.map(sym => fetchQuote(sym)));
-  return peers.map((sym, i) => {
+  const candidatePeers = (mentionedSymbols && mentionedSymbols.length)
+    ? mentionedSymbols.slice(0, AGITATOR_COMPS_CANDIDATE_POOL)
+    : (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+  const quotes = await Promise.all(candidatePeers.map(sym => fetchQuote(sym)));
+  const valid = [];
+  candidatePeers.forEach((sym, i) => {
     const q = quotes[i];
-    return q ? { symbol: sym, price: q.price, change: q.change, direction: q.direction } : { symbol: sym, price: null, change: null, direction: "flat" };
+    const price = q ? parseFloat(q.price) : 0;
+    if (q && price > 0) valid.push({ symbol: sym, price: q.price, change: q.change, direction: q.direction });
   });
+  return valid.slice(0, AGITATOR_COMPS_LIMIT);
 }
 
 // Real operational-cost safeguard, not part of the original Notion scope:
@@ -2750,12 +2767,18 @@ app.get("/agitator", async (req, res) => {
     // when raw is already a bare ticker; every searchSymbolByName call
     // here is cache-backed, and several will already have run (success or
     // fail) during primary resolution above.
+    // Not capped by how many are FOUND -- only by how many candidates get
+    // SCANNED. computeAgitatorComps validates each one against a real live
+    // quote before it's ever shown, so a resolved-but-junk candidate (a
+    // common capitalized word from a Title-Case headline fuzzy-matching an
+    // unrelated ticker) needs to not consume one of the display slots --
+    // it needs a chance to be replaced by a later, real candidate instead.
     const mentionedSymbols = [];
     if (!/^[A-Z]{1,6}$/.test(raw)) {
       const MENTION_SCAN_CAP = 6;
       let scanned = 0;
       for (const candidate of extractCompanyCandidates(raw)) {
-        if (mentionedSymbols.length >= AGITATOR_COMPS_LIMIT || scanned >= MENTION_SCAN_CAP) break;
+        if (scanned >= MENTION_SCAN_CAP) break;
         scanned++;
         const candSym = await searchSymbolByName(candidate);
         if (candSym && candSym.toUpperCase() !== symbol && !mentionedSymbols.includes(candSym.toUpperCase())) {

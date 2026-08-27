@@ -2010,17 +2010,41 @@ async function fetchEarningsCalendarFlag(symbol) {
   }
 }
 
+// Finnhub's /search matches against a company's registered legal name
+// (e.g. "ALPHABET INC-CL A"), not the consumer brand name it trades
+// under in everyday speech -- so a plain-text search for "Google" or
+// "Facebook" finds nothing at all, since neither word appears anywhere
+// in "Alphabet Inc"/"Meta Platforms Inc". Confirmed live (Aug 27, 2026):
+// the Agitator Gauge reported "Couldn't find a company for 'Google'"
+// even though GOOGL/GOOG obviously exist -- same bug class as the DRAM
+// SEC-CIK gap documented elsewhere in this file, fixed the same way: a
+// small, hand-confirmed override, checked first, guaranteed correct
+// regardless of whatever Finnhub's own fuzzy search actually does with
+// the term. Deliberately narrow -- only the reported case plus the
+// other universally-known instance of this exact bug class, not a
+// speculative general brand-name database.
+const KNOWN_BRAND_TICKER_OVERRIDES = {
+  google: "GOOGL",
+  alphabet: "GOOGL",
+  youtube: "GOOGL",
+  facebook: "META",
+  instagram: "META",
+  whatsapp: "META",
+};
+
 // Company-name -> ticker resolution for Import's free-text entry (Aug
 // 2026). Only ever called for an Import entry that already failed the
 // plain-ticker regex client-side (shared/watchlist.ts's parseTickers) --
 // typing a real ticker directly never round-trips through this at all.
-// Routed through the same finnhubGet()/finnhubThrottle() queue as every
-// other Finnhub call in this file. Results (including misses) are cached
-// in symbolSearchCache above so a popular name isn't re-searched on every
-// Import across every user.
+// Also the shared resolver behind the Agitator Gauge's own free-text
+// query. Routed through the same finnhubGet()/finnhubThrottle() queue as
+// every other Finnhub call in this file. Results (including misses) are
+// cached in symbolSearchCache above so a popular name isn't re-searched
+// on every Import/Agitator lookup across every user.
 async function searchSymbolByName(query) {
   const key = query.trim().toLowerCase();
   if (!key) return null;
+  if (KNOWN_BRAND_TICKER_OVERRIDES[key]) return KNOWN_BRAND_TICKER_OVERRIDES[key];
   const cached = symbolSearchCache.get(key);
   if (cached && Date.now() - cached.time < SYMBOL_SEARCH_MAX_AGE_MS) return cached.symbol;
   let symbol = null;

@@ -55,7 +55,7 @@ const TIERS = {
     earnings:      false,
     iv:            false,
     scorecard:     false,       // Proposal 7, Aug 26 2026 -- rolling out Pro-first, trickling down
-    agitator:      false,       // Proposal 5, Aug 26 2026 -- rolling out Pro-first, trickling down
+    agitator:      true,        // Proposal 5, Aug 27 2026 -- Free Phase, trickled down from Starter; tracker:false above already forces the simple gauge (isFull = !!req.tierConfig?.tracker in /agitator), same as Starter
     dial:          false,       // Proposal 6, Aug 26 2026 -- rolling out Pro-first, trickling down
     startingCredits: 3,         // hard cap: 3 credits, reset weekly (see checkWeeklyReset)
   },

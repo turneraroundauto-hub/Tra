@@ -1755,7 +1755,31 @@ function evaluateGate4(metricsData) {
 
 const MAX_NEWS_AGE_HOURS = 300; // 14 days / last business week
 
-async function fetchFinnhubNews(symbol) {
+// A per-ticker news feed can legitimately include a broad market-wide
+// "top gainers and losers" / sector-roundup article tagged against every
+// large constituent of an index the ticker belongs to -- technically "in
+// AAPL's feed" because Apple gets a passing mention, not actually a story
+// about Apple. Confirmed live (Aug 27, 2026, Agitator Gauge bare-name
+// search): reported as "not getting related news at all" even though a
+// real article was returned. Used to PREFER a relevant candidate out of
+// several, never to hide news entirely -- every call site still falls
+// back to the plain most-recent article when nothing scores as relevant,
+// so this can only improve or neutrally match prior behavior.
+function isHeadlineRelevant(headline, symbol, companyName) {
+  if (!headline) return false;
+  const h = String(headline).toLowerCase();
+  if (symbol && new RegExp("\\b" + symbol.toLowerCase() + "\\b").test(h)) return true;
+  if (!companyName) return false;
+  const core = String(companyName)
+    .replace(/\b(inc|incorporated|corp|corporation|co|company|ltd|limited|plc|the|holdings?|group|class\s+[a-z])\b\.?/gi, "")
+    .replace(/[.,]/g, "")
+    .trim()
+    .split(/\s+/)[0];
+  if (!core || core.length < 3) return false;
+  return new RegExp("\\b" + core.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i").test(h);
+}
+
+async function fetchFinnhubNews(symbol, companyName) {
   try {
     const now    = new Date();
     const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
@@ -1767,7 +1791,7 @@ async function fetchFinnhubNews(symbol) {
       .filter(i => (now - new Date(i.datetime * 1000)) / 3600000 <= MAX_NEWS_AGE_HOURS)
       .sort((a, b) => b.datetime - a.datetime);
     if (!filtered.length) return null;
-    const item   = filtered[0];
+    const item = (companyName ? filtered.find(i => isHeadlineRelevant(i.headline, symbol, companyName)) : null) || filtered[0];
     const ageHrs = Math.round((now - new Date(item.datetime * 1000)) / 3600000);
     return {
       headline: item.headline,
@@ -1797,7 +1821,7 @@ async function fetchFinnhubNews(symbol) {
 // from this sandbox. Fails safe (null) on any error including a 403 if the
 // account genuinely lacks the entitlement -- confirm after deploy that a
 // real symbol returns a real headline, not just silent nulls.
-async function fetchAlpacaNews(symbol) {
+async function fetchAlpacaNews(symbol, companyName) {
   if (!alpacaKeys()) return null;
   try {
     const now    = new Date();
@@ -1807,7 +1831,10 @@ async function fetchAlpacaNews(symbol) {
     );
     const articles = data?.news;
     if (!Array.isArray(articles) || !articles.length) return null;
-    const item     = articles[0]; // sort=desc -> most recent first
+    // sort=desc -> most recent first; prefer a relevant one among the
+    // fetched batch (see isHeadlineRelevant), same fallback posture as
+    // fetchFinnhubNews.
+    const item = (companyName ? articles.find(a => isHeadlineRelevant(a.headline, symbol, companyName)) : null) || articles[0];
     const itemTime = new Date(item.created_at);
     const ageHrs   = Math.round((now - itemTime) / 3600000);
     if (!(ageHrs <= MAX_NEWS_AGE_HOURS)) return null; // guards against a bad/missing created_at too (NaN comparisons are always false)
@@ -1830,10 +1857,10 @@ async function fetchAlpacaNews(symbol) {
 // actually more recent, rather than only falling back to Alpaca when
 // Finnhub comes back completely empty (see fetchAlpacaNews's comment for
 // why that distinction mattered in practice).
-async function fetchNews(symbol) {
+async function fetchNews(symbol, companyName) {
   const [fh, al] = await Promise.allSettled([
-    fetchFinnhubNews(symbol),
-    fetchAlpacaNews(symbol),
+    fetchFinnhubNews(symbol, companyName),
+    fetchAlpacaNews(symbol, companyName),
   ]);
   const finnhub = fh.status === "fulfilled" ? fh.value : null;
   const alpaca  = al.status === "fulfilled" ? al.value : null;
@@ -2186,7 +2213,20 @@ async function computeAgitatorComps(symbol, mentionedSymbols) {
     const price = q ? parseFloat(q.price) : 0;
     if (q && price > 0) valid.push({ symbol: sym, price: q.price, change: q.change, direction: q.direction });
   });
-  return valid.slice(0, AGITATOR_COMPS_LIMIT);
+  const finalComps = valid.slice(0, AGITATOR_COMPS_LIMIT);
+  // Each related company gets the same real, relevance-filtered news
+  // fetch as the primary ticker -- "with news links all the same" per
+  // direct instruction, not a lesser/different treatment. Bounded to the
+  // final (already-validated, capped) comp list, not the wider candidate
+  // pool, and fetchTickerFundamentals is 24h-cached, so repeat comps
+  // across different searches are usually free.
+  await Promise.all(finalComps.map(async (c) => {
+    const fund = await fetchTickerFundamentals(c.symbol);
+    const name = fund?.sectorInfo?.name || null;
+    const news = await fetchNews(c.symbol, name).catch(() => null);
+    c.news = news ? { headline: news.headline, url: news.url, ageHours: news.ageHours } : null;
+  }));
+  return finalComps;
 }
 
 // Real operational-cost safeguard, not part of the original Notion scope:
@@ -2788,11 +2828,26 @@ app.get("/agitator", async (req, res) => {
     }
 
     const isFull = !!req.tierConfig?.tracker;
-    const [fundamentals, quote, news] = await Promise.all([
-      fetchTickerFundamentals(symbol),
-      fetchQuote(symbol),
-      headlineOverride ? Promise.resolve(null) : fetchNews(symbol).catch(() => null),
-    ]);
+    let fundamentals, quote, news;
+    if (headlineOverride) {
+      // No real news fetch needed here -- company-name relevance
+      // filtering doesn't apply, keep the original fully-parallel fetch.
+      [fundamentals, quote] = await Promise.all([fetchTickerFundamentals(symbol), fetchQuote(symbol)]);
+      news = null;
+    } else {
+      // Fundamentals fetched first so the company's real name (Finnhub's
+      // own profile2.name) is available to filter news for actual
+      // relevance -- see isHeadlineRelevant()'s own comment. A per-ticker
+      // news feed can legitimately return a broad market-wide roundup
+      // article that only passingly mentions this company; reported live
+      // as "not getting related news at all" even though a real article
+      // came back. Costs a small amount of sequential latency only on a
+      // cold fundamentals cache (24h TTL) -- acceptable for this free,
+      // rate-limited discovery endpoint.
+      fundamentals = await fetchTickerFundamentals(symbol);
+      const companyName = fundamentals?.sectorInfo?.name || null;
+      [quote, news] = await Promise.all([fetchQuote(symbol), fetchNews(symbol, companyName).catch(() => null)]);
+    }
     const effectiveHeadline = headlineOverride || (news ? news.headline : null);
     const price = quote ? parseFloat(quote.price) : null;
 

@@ -1442,13 +1442,32 @@ async function finnhubGet(path, attempt = 0) {
 
 async function fetchQuote(symbol) {
   try {
-    const sym  = symbol === "X:BTCUSD" ? "BINANCE:BTCUSDT" : symbol;
+    const isCrypto = symbol === "X:BTCUSD";
+    const sym  = isCrypto ? "BINANCE:BTCUSDT" : symbol;
     const data = await finnhubGet(`/quote?symbol=${sym}`);
     if (!data.c || data.c === 0) throw new Error("No price");
-    const pct  = data.dp || ((data.c - data.pc) / data.pc * 100);
+    let price  = data.c;
+    let pct    = data.dp || ((data.c - data.pc) / data.pc * 100);
+    // Same pre/post-market substitution fetchTickerMetrics() already does
+    // for card display -- Finnhub's free /quote.c freezes at the last
+    // regular-session trade through the 4-8pm ET post-market window, so a
+    // real after-close move (a common shape: earnings released after the
+    // bell) was invisible here even though the rest of the app already
+    // accounts for it. Confirmed live (Aug 27, 2026): the Agitator Gauge
+    // showed CRM flat at its regular-session close while a real
+    // post-earnings rally was already "all over the news." Skipped for
+    // crypto -- it trades 24/7 with no market-hours concept, and Alpaca
+    // has no listing for the Binance-mapped symbol used above anyway.
+    if (!isCrypto && isExtendedHoursWindow()) {
+      const ext = await fetchExtendedHoursPrice(symbol);
+      if (ext && typeof data.pc === "number" && data.pc > 0) {
+        price = ext.price;
+        pct   = ((ext.price - data.pc) / data.pc) * 100;
+      }
+    }
     const sign = pct >= 0 ? "+" : "";
     return {
-      price:     data.c.toFixed(2),
+      price:     price.toFixed(2),
       change:    `${sign}${pct.toFixed(2)}%`,
       pct,
       direction: pct >= 0.5 ? "green" : pct <= -0.5 ? "red" : "flat",

@@ -516,6 +516,16 @@ const PRE_GATE_FORMS = "8-K,10-Q,10-K,S-1,S-3,424B2,424B3,424B4,424B5";
 const PRE_GATE_LOOKBACK_DAYS = 45;
 const PRE_GATE_ESCALATION_WINDOW_DAYS = 30;
 const PRE_GATE_ESCALATION_COUNT = 2;
+// Real filings from a single registered offering routinely land under
+// several distinct SEC accession numbers within days of each other (a
+// preliminary + final 424B5 for the same deal, the closing 8-K, a later
+// 10-Q mention) -- confirmed live (Aug 27, 2026): TWST showed 4 distinct
+// accessions, sequentially numbered by the same filing agent, all
+// detected in one evaluatePreGate() sweep. Scoped via AskUserQuestion:
+// filings within this many days of each other collapse into one
+// escalation-counted event, since they're almost always the paperwork
+// trail for one real transaction, not repeated separate raises.
+const PRE_GATE_CLUSTER_WINDOW_DAYS = 7;
 const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeTribunal research contact@example.com";
 
 // SEC's fair-access policy caps requests at 10/sec. Unlike Finnhub/Alpaca
@@ -828,31 +838,95 @@ async function searchEdgarFilings(cik, keywords) {
   }
 }
 
+// Groups sorted trigger timestamps (ms) into clusters — any two
+// consecutive triggers within PRE_GATE_CLUSTER_WINDOW_DAYS of each other
+// join the same cluster (chained, not each one measured against only the
+// cluster's first element), so a whole run of closely-spaced filings for
+// one real transaction collapses into a single escalation-counted event.
+function countTriggerClusters(sortedTimestampsMs) {
+  if (!sortedTimestampsMs.length) return 0;
+  const windowMs = PRE_GATE_CLUSTER_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  let clusters = 1;
+  for (let i = 1; i < sortedTimestampsMs.length; i++) {
+    if (sortedTimestampsMs[i] - sortedTimestampsMs[i - 1] > windowMs) clusters++;
+  }
+  return clusters;
+}
+
 // 30-day soft-trigger escalation history — see pre_gate_triggers table
 // (Supabase DDL handed off separately). Gracefully no-ops (never escalates
 // via history, only same-request hard triggers still work) if Supabase
 // isn't configured or the table doesn't exist yet.
+//
+// Two-part fix (Aug 27, 2026) — confirmed live: TWST escalated to a HARD
+// trigger, forcing DOWN, off what turned out to be one real registered
+// offering, not a genuine repeated-dilution pattern:
+// 1. logPreGateTrigger() had no dedup, so the SAME already-known filing
+//    got INSERTed as a "new" soft trigger every single day it stayed
+//    inside the 45-day lookback window as evaluatePreGate()'s 24h cache
+//    expired. Real Supabase data showed this wasn't TWST-specific — every
+//    ticker that had ever logged a soft trigger showed far more rows than
+//    distinct filings (e.g. IMVT: 15 rows, 1 distinct filing). Grouping
+//    by distinct filing_accession alone fixes every one of those.
+// 2. TWST itself still had 4 genuinely distinct SEC accessions even after
+//    that fix — but all 4 (one 8-K + exhibits, a preliminary + final
+//    424B5 for the same deal, a later 10-Q mention) were first detected
+//    in the same evaluatePreGate() sweep, sequentially numbered by the
+//    same filing agent — the normal multi-document paperwork trail for
+//    ONE transaction, not 4 separate raises. countTriggerClusters() (see
+//    above) collapses filings within PRE_GATE_CLUSTER_WINDOW_DAYS of each
+//    other into one counted event, so a real second, independently-timed
+//    filing still escalates correctly while one clustered transaction's
+//    own required disclosures never can.
 async function getRecentSoftTriggerCount(symbol) {
   if (!supabase) return 0;
   try {
     const since = new Date(Date.now() - PRE_GATE_ESCALATION_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const { data, error } = await supabase
       .from("pre_gate_triggers")
-      .select("id")
+      .select("filing_accession, detected_at")
       .eq("ticker", symbol)
       .eq("hard_or_soft", "soft")
       .gte("detected_at", since);
     if (error || !data) return 0;
-    return data.length;
+    // One timestamp per distinct filing — earliest detection, in case a
+    // rare race slipped a duplicate past logPreGateTrigger's own check.
+    // A missing accession (shouldn't normally happen) gets its own
+    // singleton key so it never falsely collapses with another row.
+    const byAccession = new Map();
+    data.forEach((row, i) => {
+      const t = new Date(row.detected_at).getTime();
+      const key = row.filing_accession || `__null_${i}`;
+      if (!byAccession.has(key) || t < byAccession.get(key)) byAccession.set(key, t);
+    });
+    const sorted = [...byAccession.values()].sort((a, b) => a - b);
+    return countTriggerClusters(sorted);
   } catch (e) {
     console.error(`getRecentSoftTriggerCount ${symbol}:`, e.message);
     return 0;
   }
 }
 
+// Companion fix, same root cause as above: skip the insert entirely when
+// this exact (ticker, category, filing_accession) is already logged,
+// instead of relying solely on the read-side dedup to paper over an
+// unboundedly growing table. Not perfectly race-proof (no unique
+// constraint/upsert — a no-DDL-migration fix was preferred here, and
+// evaluatePreGate()'s own 24h preGateCache already makes concurrent
+// double-inserts for the same ticker rare in practice), but the
+// DISTINCT-count read above stays correct even if a rare duplicate slips
+// through.
 async function logPreGateTrigger(symbol, category, hardOrSoft, filingAccession) {
   if (!supabase) return;
   try {
+    if (filingAccession) {
+      const { data: existing } = await supabase
+        .from("pre_gate_triggers")
+        .select("id")
+        .eq("ticker", symbol).eq("category", category).eq("filing_accession", filingAccession)
+        .limit(1);
+      if (existing && existing.length) return;
+    }
     await supabase.from("pre_gate_triggers").insert({
       ticker: symbol, category, hard_or_soft: hardOrSoft,
       filing_accession: filingAccession || null, detected_at: new Date().toISOString(),

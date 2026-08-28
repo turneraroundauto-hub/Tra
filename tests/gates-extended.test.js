@@ -291,19 +291,7 @@ test('hasForceDownAuthority', async (t) => {
   });
 });
 
-// ── contextTextMatches / buildupPatternCheck / corroborateSessionContext ─
-test('contextTextMatches', async (t) => {
-  await t.test('2+ distinct overlapping words -> match', () => {
-    assert.equal(gx.contextTextMatches('AI partnership data center', 'Company announces new AI partnership expanding data center footprint'), true);
-  });
-  await t.test('single coincidental word overlap -> no match', () => {
-    assert.equal(gx.contextTextMatches('the market', 'A completely unrelated headline about a market'), false);
-  });
-  await t.test('stopword-only context -> no match (never reaches the 2-word floor)', () => {
-    assert.equal(gx.contextTextMatches('the and or', 'the and or is are'), false);
-  });
-});
-
+// ── buildupPatternCheck / computeGate2Corroboration ─────────────────────
 test('buildupPatternCheck', async (t) => {
   await t.test('all computable signals agree -> ok', () => {
     const r = gx.buildupPatternCheck({ volRatio: 2.0, tickerPct: 3.0, proxyPct: 1.0, hasFreshNews: false });
@@ -322,22 +310,30 @@ test('buildupPatternCheck', async (t) => {
   });
 });
 
-test('corroborateSessionContext', async (t) => {
-  await t.test('2 of 3 sources agree -> corroborated', () => {
-    const r = gx.corroborateSessionContext({ newsMatch: true, buildup: { ok: true }, hasEarningsEvent: false });
+test('computeGate2Corroboration', async (t) => {
+  await t.test('both deterministic sources agree -> corroborated', () => {
+    const r = gx.computeGate2Corroboration({ buildup: { ok: true }, hasEarningsEvent: true });
     assert.equal(r.corroborated, true);
     assert.equal(r.matchCount, 2);
-    assert.equal(r.modifier, 'CONTEXT-CORROBORATED');
+    assert.equal(r.modifier, 'GATE2-CORROBORATED');
+    assert.deepEqual(r.matchedLabels, ['gate3_buildup_pattern', 'earnings_calendar_event']);
   });
-  await t.test('only 1 of 3 sources agree -> not corroborated, informational only', () => {
-    const r = gx.corroborateSessionContext({ newsMatch: true, buildup: { ok: false }, hasEarningsEvent: false });
+  await t.test('only 1 of 2 sources agree -> not corroborated, informational only', () => {
+    const r = gx.computeGate2Corroboration({ buildup: { ok: true }, hasEarningsEvent: false });
     assert.equal(r.corroborated, false);
+    assert.equal(r.matchCount, 1);
     assert.equal(r.modifier, null);
   });
   await t.test('zero sources -> not corroborated', () => {
-    const r = gx.corroborateSessionContext();
+    const r = gx.computeGate2Corroboration();
     assert.equal(r.matchCount, 0);
     assert.equal(r.corroborated, false);
+  });
+  await t.test('never requires user-typed text -- both sources are deterministic market data', () => {
+    // No newsMatch/context field exists on the input shape at all anymore;
+    // confirms the Aug 28, 2026 rework actually dropped that dependency.
+    const r = gx.computeGate2Corroboration({ buildup: { ok: true }, hasEarningsEvent: true });
+    assert.equal(r.sources.some(s => s.key === 'news_content_match'), false);
   });
 });
 

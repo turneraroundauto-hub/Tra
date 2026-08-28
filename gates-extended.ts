@@ -408,30 +408,31 @@ function hasForceDownAuthority(gateKey: string, tickerGating?: string[], regime?
   return { authorized: true, reason: entry.reason };
 }
 
-/* ---------- 6. Proposal 4 — Context-Weighted Gate 2 Corroboration ---------- */
+/* ---------- 6. Gate 2 Corroboration — deterministic signals (Aug 28, 2026 rework) ---------- */
 
-// Same word set and 2-distinct-word-overlap threshold as
-// shared/context-highlight.js's highlightContextMatches() on the frontend --
-// kept in lockstep on purpose so "corroborated" here and "highlighted" there
-// always agree on what counts as a real topical match, not two independently
-// tuned heuristics that can silently drift apart.
-const CONTEXT_STOPWORDS = new Set(['a','an','the','and','or','but','if','of','in','on','for','to','with','at','by','from','as',
-  'is','are','was','were','be','been','being','it','its','this','that','these','those','after','before','over','under',
-  'into','out','up','down','than','then','so','not','no','yes','has','have','had','will','would','could','should','can',
-  'may','might','must','more','most','also','still','just','now','new','via','their','his','her','your','you','we','our']);
-
-function tokenizeContext(text: string): string[] {
-  return (text || '').toLowerCase().match(/[a-z0-9$%]+/g) || [];
-}
-
-function contextTextMatches(contextText: string, bodyText: string): boolean {
-  const ctxWords = new Set(tokenizeContext(contextText).filter(function (w) { return w.length > 2 && !CONTEXT_STOPWORDS.has(w); }));
-  if (ctxWords.size < 2) return false;
-  const bodyWords = new Set(tokenizeContext(bodyText));
-  let matches = 0;
-  bodyWords.forEach(function (w) { if (ctxWords.has(w)) matches++; });
-  return matches >= 2;
-}
+// Originally "Context-Weighted Gate 2 Corroboration" (Proposal 4, Aug 13
+// 2026) -- checked a user-typed Session Context claim against real news
+// body text, Gate 3's buildup pattern, and a real earnings-calendar
+// event, requiring 2 of those 3 to agree before treating the typed claim
+// as real Gate 2 evidence. Session Context (the free-text textarea this
+// fed on) was retired app-wide (Aug 26-27, 2026, replaced by the
+// Agitator Gauge) -- every tier's client has sent an empty marketContext
+// ever since, so the news-content-match leg (the old contextTextMatches(),
+// removed here) could never fire again and the whole mechanism silently
+// went dark: real Supabase data confirmed zero corroboration_log rows
+// since the retirement, and every verdict_log row logged since Scorecard
+// shipped had a null gate2_corroboration_state.
+//
+// Fix: drop the user-claim framing entirely. The other two sources
+// (buildupPatternCheck()'s deterministic volume/price-outperformance/
+// fresh-news read, and a real scheduled earnings event) never depended
+// on any typed text in the first place -- they're genuine,
+// always-computable market signals. computeGate2Corroboration() now runs
+// unconditionally on every /analyze call using only those two, requiring
+// both (the same CONTEXT_CORROBORATION_THRESHOLD=2 constant, now
+// literally "both must agree" since only 2 sources remain) -- a real,
+// deterministic confirmation that an active catalyst is actually in
+// play, not a check against a UI element that no longer exists.
 
 interface BuildupInput {
   volRatio?: number | null;
@@ -484,7 +485,6 @@ function buildupPatternCheck(input?: BuildupInput): BuildupResult {
 const CONTEXT_CORROBORATION_THRESHOLD = 2;
 
 interface CorroborateInput {
-  newsMatch?: boolean;
   buildup?: { ok: boolean };
   hasEarningsEvent?: boolean | null;
 }
@@ -499,15 +499,16 @@ interface CorroborateResult {
 }
 
 /**
- * Session Context is an unverified user claim, not a fact. >=2 of 3
- * independent sources agreeing promotes it to a CONTEXT-CORROBORATED
- * modifier on Gate 2; fewer than 2 leaves it visible (existing client-side
- * highlight behavior unchanged) but verdict-inert.
+ * Deterministic Gate 2 corroboration: does real, already-computed market
+ * data (Gate 3's buildup pattern, a real scheduled earnings event)
+ * confirm an active catalyst is actually in play. Both sources must
+ * agree (2-of-2) to promote to a GATE2-CORROBORATED modifier; fewer
+ * leaves the catalyst read as ordinary Gate 2 evidence, unweighted by
+ * this check.
  */
-function corroborateSessionContext(input?: CorroborateInput): CorroborateResult {
+function computeGate2Corroboration(input?: CorroborateInput): CorroborateResult {
   input = input || {};
   const sources = [
-    { key: 'news_content_match',      ok: !!input.newsMatch },
     { key: 'gate3_buildup_pattern',   ok: !!(input.buildup && input.buildup.ok) },
     { key: 'earnings_calendar_event', ok: input.hasEarningsEvent === true }
   ];
@@ -516,10 +517,10 @@ function corroborateSessionContext(input?: CorroborateInput): CorroborateResult 
   const matchedLabels = sources.filter(function (s) { return s.ok; }).map(function (s) { return s.key; });
   return {
     corroborated: corroborated, matchCount: matchCount, sources: sources, matchedLabels: matchedLabels,
-    modifier: corroborated ? 'CONTEXT-CORROBORATED' : null,
+    modifier: corroborated ? 'GATE2-CORROBORATED' : null,
     note: corroborated
-      ? 'Session Context CONTEXT-CORROBORATED (' + matchCount + '/3: ' + matchedLabels.join(', ') + ').'
-      : 'Session Context uncorroborated (' + matchCount + '/3) -- informational only, not weighted in verdict.'
+      ? 'Gate 2 corroborated by ' + matchCount + '/2 deterministic signal(s): ' + matchedLabels.join(', ') + '.'
+      : 'Gate 2 corroboration: ' + matchCount + '/2 deterministic signal(s) agree -- not enough to weight as confirmed.'
   };
 }
 
@@ -534,8 +535,7 @@ module.exports = {
   FORCEDOWN_EXEMPT: FORCEDOWN_EXEMPT,
   GATE1_LONG_SESSIONS: GATE1_LONG_SESSIONS,
   GATE1_SHORT_SESSIONS: GATE1_SHORT_SESSIONS,
-  contextTextMatches: contextTextMatches,
   buildupPatternCheck: buildupPatternCheck,
-  corroborateSessionContext: corroborateSessionContext,
+  computeGate2Corroboration: computeGate2Corroboration,
   CONTEXT_CORROBORATION_THRESHOLD: CONTEXT_CORROBORATION_THRESHOLD
 };

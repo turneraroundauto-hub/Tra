@@ -3091,6 +3091,13 @@ app.get("/track", async (req, res) => {
 // Suppressed to insufficientData until n>=20 graded rows either way (an
 // early 100%/0% off 2-3 samples is worse than no number).
 const SCORECARD_MIN_GRADED = 20;
+// Per-ticker slices see far fewer graded rows than the overall scorecard
+// (one ticker out of a whole watchlist), so requiring 20 here would almost
+// never populate any ticker row early on -- still enforce a real floor
+// (not 1-2 samples) rather than publishing a noisy 100%/0% per ticker,
+// same reasoning as SCORECARD_MIN_GRADED itself, just scaled to the
+// smaller sample size this narrower breakdown actually sees.
+const SCORECARD_TICKER_MIN_GRADED = 5;
 function computeAccuracyStats(rows) {
   const total = rows.length;
   if (!total) return { gradedCount: 0, strictPct: null, directionalPct: null };
@@ -3101,6 +3108,11 @@ function computeAccuracyStats(rows) {
     strictPct:      +(trueCount / total * 100).toFixed(1),
     directionalPct: +((trueCount + marginalCount) / total * 100).toFixed(1),
   };
+}
+function tickerStatsWithFloor(rows, minGraded) {
+  const stats = computeAccuracyStats(rows);
+  if (stats.gradedCount < minGraded) return { gradedCount: stats.gradedCount, insufficientData: true };
+  return stats;
 }
 app.get("/scorecard", async (req, res) => {
   // Gated Pro-first (credits.js TIERS.<tier>.scorecard) -- flip the flag
@@ -3127,7 +3139,7 @@ app.get("/scorecard", async (req, res) => {
     const email = req.userEmail.trim().toLowerCase();
     const { data, error } = await supabase
       .from("verdict_log")
-      .select("grade, pre_gate_state, gate1_branch, gate0_read, gate2_corroboration_state")
+      .select("grade, ticker, pre_gate_state, gate1_branch, gate0_read, gate2_corroboration_state")
       .eq("user_email", email).not("graded_at", "is", null);
     if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
     const rows  = data || [];
@@ -3136,6 +3148,42 @@ app.get("/scorecard", async (req, res) => {
       return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
     }
     const result = { scope: "personal", strictPct: stats.strictPct, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount };
+
+    // Per-ticker breakdown — Proposal 7's own spec named this as Starter's
+    // literal scope line ("Personalized to user's tickers"), distinct from
+    // the Pro-only gate/branch breakdown below — available to every paid
+    // tier with a personal scope, not gated behind tierConfig.tracker.
+    // Alongside each ticker's PERSONAL stat, also surface the POOL stat —
+    // the same ticker's graded accuracy across every user, not just this
+    // one — so a user can see whether the app's read on a ticker they
+    // personally track is consistent with everyone else's graded history
+    // on it, not just their own (often thin) sample. This is the same
+    // verdict_log data either way; pooling costs one extra indexed query
+    // scoped to only the tickers already in this user's own breakdown,
+    // not a full-table scan.
+    const tickerGroups = {};
+    rows.forEach(r => { const k = r.ticker || "(unknown)"; (tickerGroups[k] = tickerGroups[k] || []).push(r); });
+    const tickers = Object.keys(tickerGroups);
+    result.tickerAccuracy = {};
+    tickers.forEach(t => {
+      result.tickerAccuracy[t] = { personal: tickerStatsWithFloor(tickerGroups[t], SCORECARD_TICKER_MIN_GRADED) };
+    });
+    if (tickers.length) {
+      const { data: poolData, error: poolError } = await supabase
+        .from("verdict_log")
+        .select("grade, ticker")
+        .in("ticker", tickers)
+        .not("graded_at", "is", null);
+      if (poolError) {
+        console.error("GET /scorecard (pool):", poolError.message);
+      } else {
+        const poolGroups = {};
+        (poolData || []).forEach(r => { const k = r.ticker || "(unknown)"; (poolGroups[k] = poolGroups[k] || []).push(r); });
+        tickers.forEach(t => {
+          result.tickerAccuracy[t].pool = tickerStatsWithFloor(poolGroups[t] || [], SCORECARD_TICKER_MIN_GRADED);
+        });
+      }
+    }
 
     // Full breakdown by gate/branch fired — reuses tierConfig.tracker
     // (already Pro/Shark-only, already means "real accuracy tracking is

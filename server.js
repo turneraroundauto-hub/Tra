@@ -2173,14 +2173,17 @@ async function fetchGeneralNews() {
 
 const MACRO_TOPIC_PROMPT = `You are given a user's typed topic or headline
 and a numbered list of real, currently published news article headlines.
-Pick the SINGLE article whose real-world subject matter is genuinely the
-same as the user's typed topic -- it does not need to share exact words,
-only be about the same real story or theme (e.g. a Fed policy event and an
-inflation-data headline can be the same topic). If none of the listed
-articles are genuinely about the same subject, use index -1. Return ONLY
-this exact JSON shape, no other text, no markdown fences:
+Always pick the SINGLE article from the list whose real-world subject
+matter is closest to the user's typed topic -- it does not need to share
+exact words, only be about a related real story or theme (e.g. a Fed
+policy event and an inflation-data headline can be the same topic). Never
+decline to pick one; always choose the closest available match, even if
+the connection is broad rather than exact -- picking the best available
+option is always more useful than refusing. Return ONLY this exact JSON
+shape, no other text, no markdown fences:
 {"index":N,"sentiment":"BULLISH"|"BEARISH"|"NEUTRAL","summary":"..."}
-- index: the number of the most topically relevant article, or -1
+- index: the number of the closest article -- always a real number from
+  the list, never omitted
 - sentiment: the likely overall market read implied by that one article
 - summary: one plain sentence distilling what that article means for
   markets -- about the article you picked, not the user's original text`;
@@ -2237,23 +2240,23 @@ async function computeMacroTopicalSentiment(query) {
           console.error(`computeMacroTopicalSentiment "${query}": no JSON object in AI response: ${text.slice(0, 200)}`);
         } else {
           const parsed = JSON.parse(match[0]);
-          const idx = Number.isInteger(parsed.index) ? parsed.index : -1;
-          if (idx === -1) {
-            console.log(`computeMacroTopicalSentiment "${query}": model found no topical match among ${articles.length} articles`);
+          // The prompt no longer offers a "no match" option -- the model
+          // always commits to the closest available article now, so any
+          // index that isn't a real, in-range number is a genuine
+          // response error, not a legitimate decline.
+          const idx = Number.isInteger(parsed.index) ? parsed.index : null;
+          const article = idx !== null && idx >= 1 && idx <= articles.length ? articles[idx - 1] : null;
+          const sentiment = ["BULLISH", "BEARISH", "NEUTRAL"].includes(parsed.sentiment) ? parsed.sentiment : null;
+          if (!article || !sentiment || typeof parsed.summary !== "string" || !parsed.summary.trim()) {
+            console.error(`computeMacroTopicalSentiment "${query}": AI response failed validation: ${JSON.stringify(parsed)}`);
           } else {
-            const article = idx >= 1 && idx <= articles.length ? articles[idx - 1] : null;
-            const sentiment = ["BULLISH", "BEARISH", "NEUTRAL"].includes(parsed.sentiment) ? parsed.sentiment : null;
-            if (!article || !sentiment || typeof parsed.summary !== "string" || !parsed.summary.trim()) {
-              console.error(`computeMacroTopicalSentiment "${query}": AI response failed validation: ${JSON.stringify(parsed)}`);
-            } else {
-              result = {
-                headline: article.headline,
-                url:      article.url,
-                source:   article.source,
-                sentiment,
-                summary:  parsed.summary.trim(),
-              };
-            }
+            result = {
+              headline: article.headline,
+              url:      article.url,
+              source:   article.source,
+              sentiment,
+              summary:  parsed.summary.trim(),
+            };
           }
         }
       }

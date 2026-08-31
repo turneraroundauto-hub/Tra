@@ -2190,6 +2190,13 @@ this exact JSON shape, no other text, no markdown fences:
 // general-news fetch above has its own shorter TTL, but re-checking the
 // identical typed query within this window needs neither call again).
 const MACRO_TOPIC_MAX_AGE_MS = 15 * 60 * 1000;
+// Only ever caches a REAL match, never a miss/failure -- a "no topical
+// article found" outcome can easily be transient (a fetch hiccup, or the
+// general news feed just not having caught up to a breaking story yet),
+// and caching that for 15 minutes would make every retry within the
+// window replay the identical stale miss with zero chance to succeed.
+// The endpoint's existing per-user rate limit (20/hr) already bounds
+// worst-case repeated-attempt cost, so there's no real trade-off here.
 const macroTopicCache = new Map(); // normalized query -> { result, time }
 async function computeMacroTopicalSentiment(query) {
   const key = String(query).trim().toLowerCase();
@@ -2201,7 +2208,11 @@ async function computeMacroTopicalSentiment(query) {
   let result = null;
   try {
     const articles = await fetchGeneralNews();
-    if (apiKey && articles.length) {
+    if (!apiKey) {
+      console.error(`computeMacroTopicalSentiment "${query}": ANTHROPIC_API_KEY not set`);
+    } else if (!articles.length) {
+      console.error(`computeMacroTopicalSentiment "${query}": fetchGeneralNews returned 0 articles (Finnhub/Alpaca both empty or failed)`);
+    } else {
       const now = Date.now();
       const listing = articles.map((a, i) => {
         const ageHrs = Math.round((now - a.timestamp) / 3600000);
@@ -2216,23 +2227,33 @@ async function computeMacroTopicalSentiment(query) {
           messages: [{ role: "user", content: `Topic: "${query}"\n\nArticles:\n${listing}` }],
         }),
       }, 20000);
-      if (res.ok) {
+      if (!res.ok) {
+        console.error(`computeMacroTopicalSentiment "${query}": Anthropic ${res.status}`);
+      } else {
         const data = await res.json();
         const text = data.content?.[0]?.text || "";
         const match = text.match(/\{[^}]*\}/);
-        if (match) {
+        if (!match) {
+          console.error(`computeMacroTopicalSentiment "${query}": no JSON object in AI response: ${text.slice(0, 200)}`);
+        } else {
           const parsed = JSON.parse(match[0]);
           const idx = Number.isInteger(parsed.index) ? parsed.index : -1;
-          const article = idx >= 1 && idx <= articles.length ? articles[idx - 1] : null;
-          const sentiment = ["BULLISH", "BEARISH", "NEUTRAL"].includes(parsed.sentiment) ? parsed.sentiment : null;
-          if (article && sentiment && typeof parsed.summary === "string" && parsed.summary.trim()) {
-            result = {
-              headline: article.headline,
-              url:      article.url,
-              source:   article.source,
-              sentiment,
-              summary:  parsed.summary.trim(),
-            };
+          if (idx === -1) {
+            console.log(`computeMacroTopicalSentiment "${query}": model found no topical match among ${articles.length} articles`);
+          } else {
+            const article = idx >= 1 && idx <= articles.length ? articles[idx - 1] : null;
+            const sentiment = ["BULLISH", "BEARISH", "NEUTRAL"].includes(parsed.sentiment) ? parsed.sentiment : null;
+            if (!article || !sentiment || typeof parsed.summary !== "string" || !parsed.summary.trim()) {
+              console.error(`computeMacroTopicalSentiment "${query}": AI response failed validation: ${JSON.stringify(parsed)}`);
+            } else {
+              result = {
+                headline: article.headline,
+                url:      article.url,
+                source:   article.source,
+                sentiment,
+                summary:  parsed.summary.trim(),
+              };
+            }
           }
         }
       }
@@ -2240,7 +2261,7 @@ async function computeMacroTopicalSentiment(query) {
   } catch (e) {
     console.error(`computeMacroTopicalSentiment "${query}":`, e.message);
   }
-  macroTopicCache.set(key, { result, time: Date.now() });
+  if (result) macroTopicCache.set(key, { result, time: Date.now() });
   return result;
 }
 

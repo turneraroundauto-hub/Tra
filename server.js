@@ -2116,6 +2116,134 @@ async function searchSymbolByName(query) {
   return symbol;
 }
 
+// ─── AGITATOR GAUGE — no-company topical sentiment fallback (Aug 31, 2026) ───
+// When a typed query doesn't resolve to any specific company (a macro/policy
+// event name like "Jackson Hole Economic Policy Symposium" has no ticker to
+// begin with), the old behavior was a dead-end "Couldn't find a company for
+// ..." message -- even when the query is genuinely about a real, current
+// macro topic (rates, inflation, etc.) with real news coverage. This finds
+// the newest real general-news article that's actually about the same
+// subject and distills it to one sentence, rather than leaving the check
+// empty-handed just because no single company applies.
+//
+// Deliberately does NOT keyword-match the query's own literal words against
+// article text -- "Jackson Hole Economic Policy Symposium" shares no words
+// at all with a real "inflation data cools, futures rally" headline even
+// though they're the same real-world story (a Fed event and its market
+// read). Instead, a real batch of currently-published general-news
+// headlines is fetched from Finnhub + Alpaca (never one the model invents),
+// and the model is asked to pick the ARTICLE'S OWN INDEX in that list --
+// never asked to produce its own headline or URL text -- so the citation
+// link served back to the user always resolves to a real fetched article,
+// never a hallucinated one, even though matching "is this the same topic"
+// is inherently a semantic judgment call plain keyword overlap can't make.
+const GENERAL_NEWS_MAX_AGE_MS = 5 * 60 * 1000; // general feed churns fast -- short TTL
+let generalNewsCache = { data: null, time: 0 };
+async function fetchGeneralNews() {
+  if (generalNewsCache.data && Date.now() - generalNewsCache.time < GENERAL_NEWS_MAX_AGE_MS) {
+    return generalNewsCache.data;
+  }
+  const now = Date.now();
+  const [fhResult, alResult] = await Promise.allSettled([
+    finnhubGet(`/news?category=general`),
+    alpacaKeys() ? alpacaGet(`/v1beta1/news?limit=15&sort=desc`) : Promise.resolve(null),
+  ]);
+  const items = [];
+  if (fhResult.status === "fulfilled" && Array.isArray(fhResult.value)) {
+    for (const a of fhResult.value.slice(0, 15)) {
+      if (!a?.headline || !a?.url || !a?.datetime) continue;
+      items.push({ headline: a.headline, url: a.url, source: a.source || "Finnhub", timestamp: a.datetime * 1000 });
+    }
+  }
+  if (alResult.status === "fulfilled" && Array.isArray(alResult.value?.news)) {
+    for (const a of alResult.value.news.slice(0, 15)) {
+      if (!a?.headline || !a?.url || !a?.created_at) continue;
+      items.push({ headline: a.headline, url: a.url, source: a.source || "Benzinga", timestamp: new Date(a.created_at).getTime() });
+    }
+  }
+  // Newest first, deduped by URL, capped so the AI prompt stays small.
+  const seen = new Set();
+  const merged = items
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .filter(a => { if (seen.has(a.url)) return false; seen.add(a.url); return true; })
+    .slice(0, 20);
+  generalNewsCache = { data: merged, time: now };
+  return merged;
+}
+
+const MACRO_TOPIC_PROMPT = `You are given a user's typed topic or headline
+and a numbered list of real, currently published news article headlines.
+Pick the SINGLE article whose real-world subject matter is genuinely the
+same as the user's typed topic -- it does not need to share exact words,
+only be about the same real story or theme (e.g. a Fed policy event and an
+inflation-data headline can be the same topic). If none of the listed
+articles are genuinely about the same subject, use index -1. Return ONLY
+this exact JSON shape, no other text, no markdown fences:
+{"index":N,"sentiment":"BULLISH"|"BEARISH"|"NEUTRAL","summary":"..."}
+- index: the number of the most topically relevant article, or -1
+- sentiment: the likely overall market read implied by that one article
+- summary: one plain sentence distilling what that article means for
+  markets -- about the article you picked, not the user's original text`;
+
+// Cached on the fully-resolved result (a real article + sentiment), not
+// raw AI output -- a cache hit costs zero API calls of either kind (the
+// general-news fetch above has its own shorter TTL, but re-checking the
+// identical typed query within this window needs neither call again).
+const MACRO_TOPIC_MAX_AGE_MS = 15 * 60 * 1000;
+const macroTopicCache = new Map(); // normalized query -> { result, time }
+async function computeMacroTopicalSentiment(query) {
+  const key = String(query).trim().toLowerCase();
+  if (!key) return null;
+  const cached = macroTopicCache.get(key);
+  if (cached && Date.now() - cached.time < MACRO_TOPIC_MAX_AGE_MS) return cached.result;
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  let result = null;
+  try {
+    const articles = await fetchGeneralNews();
+    if (apiKey && articles.length) {
+      const now = Date.now();
+      const listing = articles.map((a, i) => {
+        const ageHrs = Math.round((now - a.timestamp) / 3600000);
+        return `${i + 1}. [${ageHrs < 1 ? "just now" : ageHrs + "h ago"}] ${a.headline}`;
+      }).join("\n");
+      const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6", max_tokens: 150, temperature: 0,
+          system: MACRO_TOPIC_PROMPT,
+          messages: [{ role: "user", content: `Topic: "${query}"\n\nArticles:\n${listing}` }],
+        }),
+      }, 20000);
+      if (res.ok) {
+        const data = await res.json();
+        const text = data.content?.[0]?.text || "";
+        const match = text.match(/\{[^}]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          const idx = Number.isInteger(parsed.index) ? parsed.index : -1;
+          const article = idx >= 1 && idx <= articles.length ? articles[idx - 1] : null;
+          const sentiment = ["BULLISH", "BEARISH", "NEUTRAL"].includes(parsed.sentiment) ? parsed.sentiment : null;
+          if (article && sentiment && typeof parsed.summary === "string" && parsed.summary.trim()) {
+            result = {
+              headline: article.headline,
+              url:      article.url,
+              source:   article.source,
+              sentiment,
+              summary:  parsed.summary.trim(),
+            };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`computeMacroTopicalSentiment "${query}":`, e.message);
+  }
+  macroTopicCache.set(key, { result, time: Date.now() });
+  return result;
+}
+
 // ─── PROPOSAL 5 — AGITATOR GAUGE (Aug 26, 2026) ───────────────────────
 // Standalone discovery/validation tool -- proofing a new stock interest or
 // a media rumor BEFORE it enters the watchlist. Sits alongside the CRF,
@@ -2880,7 +3008,10 @@ app.get("/agitator", async (req, res) => {
         }
       }
     }
-    if (!symbol) return res.json({ resolved: false, query: raw });
+    if (!symbol) {
+      const topical = await computeMacroTopicalSentiment(raw);
+      return res.json({ resolved: false, query: raw, topical });
+    }
     symbol = symbol.toUpperCase();
     if (!directMatch && !headlineOverride) headlineOverride = raw;
 

@@ -2938,13 +2938,29 @@ const CANDIDATE_STOPWORDS = new Set(["The","This","That","These","Those","A","An
 // single-word fallback below -- the Round 6 "must have a real positive
 // quote" guard in computeAgitatorComps can't catch this, since JXN is a
 // perfectly legitimate real symbol, just for the wrong company. A real
-// company headline essentially never ends in one of these, so it's a
-// narrow, cheap, confirmed signal: skip single-word decomposition for a
-// run containing one (the full run itself is still tried as its own
-// candidate, which correctly fails to match any company and returns
-// resolved:false -- an honest "couldn't find a company" beats a
-// confidently wrong one).
+// company headline essentially never contains one of these, so it's a
+// narrow, cheap, confirmed signal.
+//
+// Live-reported again (Aug 31, 2026) with the identical query typed in
+// lowercase -- the first fix only excluded a marker-containing run's
+// single-WORD candidates, but still tried the run's own FULL text as a
+// candidate, on the (wrong, since disproven live) assumption that a
+// 5-word phrase could never itself fuzzy-match a company. It can:
+// Finnhub's search apparently still surfaces Jackson Financial Inc for
+// the entire "jackson hole economic policy symposium" string, not just
+// the bare word "jackson". A marker-containing run now contributes NO
+// candidates at all -- neither the full run nor any of its words --
+// and containsEventNameMarker() below additionally guards the /agitator
+// handler's own direct searchSymbolByName(raw) attempt, which runs
+// BEFORE this function is ever called and was the actual path this
+// live report went through (a full lowercase phrase never even forms a
+// capitalized "run" here in the first place, so this function alone
+// can't protect that case).
 const EVENT_NAME_MARKERS = new Set(["Symposium","Summit","Conference","Forum","Hearing","Testimony","Convention"]);
+const EVENT_NAME_MARKER_RE = new RegExp("\\b(?:" + Array.from(EVENT_NAME_MARKERS).join("|") + ")\\b", "i");
+function containsEventNameMarker(text) {
+  return EVENT_NAME_MARKER_RE.test(String(text));
+}
 function extractCompanyCandidates(text) {
   const words = String(text).split(/\s+/);
   const runs = [];
@@ -2972,9 +2988,10 @@ function extractCompanyCandidates(text) {
   // run, never instead of one.
   const candidates = [];
   for (const run of runs) {
-    candidates.push(run);
     const parts = run.split(" ");
-    if (parts.length > 1 && !parts.some(p => EVENT_NAME_MARKERS.has(p))) candidates.push(...parts);
+    if (parts.some(p => EVENT_NAME_MARKERS.has(p))) continue; // scheduled macro/policy event name -- never a company candidate, whole run or any of its words
+    candidates.push(run);
+    if (parts.length > 1) candidates.push(...parts);
   }
   // Longest runs first -- "Roundhill Memory ETF" is a better candidate than
   // its own substring "Roundhill" alone -- then dedupe while preserving order.
@@ -3019,6 +3036,16 @@ app.get("/agitator", async (req, res) => {
     if (/^[A-Z]{1,6}$/.test(raw)) {
       symbol = raw;
       directMatch = true;
+    } else if (containsEventNameMarker(raw)) {
+      // A scheduled macro/policy event name (Symposium/Summit/Conference/
+      // etc., any casing) never resolves to a company here, full stop --
+      // Finnhub's own fuzzy search can match the ENTIRE raw phrase to an
+      // incidentally-named company (Jackson Hole Economic Policy Symposium
+      // -> Jackson Financial Inc), not just a decomposed single word, so
+      // this has to be checked before searchSymbolByName(raw) is even
+      // called, not just inside extractCompanyCandidates()'s own
+      // candidate list (see that function's comment for the full history).
+      symbol = null;
     } else {
       symbol = await searchSymbolByName(raw);
       if (symbol) directMatch = true;

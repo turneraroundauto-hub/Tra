@@ -2137,6 +2137,15 @@ const KNOWN_BRAND_TICKER_OVERRIDES = {
   facebook: "META",
   instagram: "META",
   whatsapp: "META",
+  // QNX -- BlackBerry's automotive/embedded real-time OS, widely used in
+  // connected vehicles -- is a product/division name that shares zero
+  // words with BlackBerry's own canonical name ("BLACKBERRY LTD"), the
+  // same class of gap as Google/Alphabet above. Confirmed live (Sep 1,
+  // 2026): querying "Qnx automotive iot" found no company and fell
+  // through to the topical fallback, which then picked an unrelated Dell
+  // supply-chain article as the closest available match -- exactly the
+  // failure mode this override map exists to close.
+  qnx: "BB",
 };
 
 // ─── FIX 1 (Notion "Proposal 5 — Amendment: Entity Resolution, News
@@ -2414,6 +2423,51 @@ async function fetchMarketauxNews(query) {
     console.error(`fetchMarketauxNews "${query}":`, e.message);
     return [];
   }
+}
+
+// Marketaux-based primary resolution (Sep 1, 2026) -- when Finnhub's own
+// /search + classifyEntityMatch can't bridge a query to a company because
+// the query is a product/brand name rather than the company's own
+// canonical legal name (confirmed live: "Qnx automotive iot" found
+// nothing -- QNX is BlackBerry's automotive/embedded OS brand, sharing
+// zero words with "BLACKBERRY LTD" -- and fell through to Path B, which
+// then surfaced an unrelated Dell article as the closest available
+// topic), Marketaux's real keyword search + vendor-tagged entities
+// generalizes the fix KNOWN_BRAND_TICKER_OVERRIDES can only ever patch
+// one hand-added case at a time: a real search for the raw query often
+// surfaces real articles already tagged with the real parent company, no
+// guessing or hardcoding required.
+//
+// Only tried once Finnhub's own free path has already failed, and on the
+// RAW query only (never every decomposed candidate) to bound Marketaux's
+// own ~90/day quota -- and since fetchMarketauxNews() caches by query
+// text, this costs nothing extra even on a request that still falls
+// through to Path B below, which would otherwise make the identical call
+// itself moments later.
+//
+// The returned entity is trusted directly, the same trust level Path B
+// already gives Marketaux entities -- it's a real, vendor-resolved
+// ticker, not an AI guess, so it doesn't need classifyEntityMatch's
+// hallucination-guarding validation. Takes the first entity of the
+// first (most relevant, per Marketaux's own ranking) result -- a real
+// article's own primary tagged company, not a guess at which of several
+// mentioned companies matters most. The real article itself is returned
+// too, so the caller can show it as the actual analyzed headline (with a
+// real, clickable URL) instead of falling back to a synthetic "the raw
+// query text is the headline" placeholder.
+async function resolveViaMarketaux(query) {
+  const articles = await fetchMarketauxNews(query);
+  for (const a of articles) {
+    const first = (a.entities || [])[0];
+    if (first) {
+      return {
+        symbol: first.symbol,
+        companyName: first.name,
+        article: { headline: a.headline, url: a.url, source: a.source },
+      };
+    }
+  }
+  return null;
 }
 
 // Fix 5 (Notion "Proposal 5 — Amendment," Sep 1 2026) — Path B rework.
@@ -3529,6 +3583,9 @@ app.get("/agitator", async (req, res) => {
     // ships alongside it so there's always something to look at either way.
     let symbol = null, directMatch = false;
     let suggestion = null;
+    // Set only when primary resolution came via Marketaux -- a REAL,
+    // already-fetched, linkable article, never a synthetic placeholder.
+    let marketauxArticle = null;
     if (/^[A-Z]{1,6}$/.test(raw)) {
       symbol = raw;
       directMatch = true;
@@ -3543,6 +3600,22 @@ app.get("/agitator", async (req, res) => {
           const cand = await resolveCompanyEntity(candidate, knownSymbols);
           if (cand && cand.matchType === "exact") { symbol = cand.symbol; break; }
           if (cand && cand.matchType === "partial" && !bestPartial) bestPartial = cand;
+        }
+        // Finnhub's own search + classifyEntityMatch can only ever bridge
+        // a query to a company whose CANONICAL LEGAL NAME shares the
+        // query's own words -- a real, structural gap for a product/brand
+        // name (see resolveViaMarketaux's own comment for the live-
+        // reported "Qnx" -> BlackBerry case) that KNOWN_BRAND_TICKER_
+        // OVERRIDES can only ever patch one hand-added entry at a time.
+        // Tried here, once, on the raw query only, before falling to
+        // Path B -- see resolveViaMarketaux's comment for why this costs
+        // nothing extra even on a request that still falls through below.
+        if (!symbol) {
+          const viaMarketaux = await resolveViaMarketaux(raw);
+          if (viaMarketaux) {
+            symbol = viaMarketaux.symbol;
+            marketauxArticle = viaMarketaux.article;
+          }
         }
         if (!symbol && bestPartial) {
           suggestion = { company: bestPartial.companyName, ticker: bestPartial.symbol };
@@ -3564,7 +3637,11 @@ app.get("/agitator", async (req, res) => {
       });
     }
     symbol = symbol.toUpperCase();
-    if (!directMatch && !headlineOverride) headlineOverride = raw;
+    // A real Marketaux article always wins over the synthetic "the raw
+    // query text is the headline" placeholder -- only fall back to that
+    // when resolution succeeded with nothing real to show for it (a
+    // decomposed candidate matched via Finnhub, no article in hand).
+    if (!directMatch && !marketauxArticle && !headlineOverride) headlineOverride = raw;
 
     // Scan the SAME candidate list for other real companies the user
     // already named alongside the primary one -- e.g. "Salesforce,
@@ -3602,7 +3679,15 @@ app.get("/agitator", async (req, res) => {
 
     const isFull = !!req.tierConfig?.tracker;
     let fundamentals, quote, news;
-    if (headlineOverride) {
+    if (marketauxArticle) {
+      // Primary resolution came from a real, already-fetched, keyword-
+      // matched Marketaux article -- use it directly as the analyzed
+      // headline (real, linkable, and already fresh) instead of either
+      // the synthetic raw-text headlineOverride or a fresh fetchNews()
+      // call that would just discard a real article already in hand.
+      [fundamentals, quote] = await Promise.all([fetchTickerFundamentals(symbol), fetchQuote(symbol)]);
+      news = marketauxArticle;
+    } else if (headlineOverride) {
       // No real news fetch needed here -- company-name relevance
       // filtering doesn't apply, keep the original fully-parallel fetch.
       [fundamentals, quote] = await Promise.all([fetchTickerFundamentals(symbol), fetchQuote(symbol)]);

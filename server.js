@@ -16,6 +16,7 @@ const credits   = require("./credits");
 const gx        = require("./gates-extended");
 const ah        = require("./analyze-helpers");
 const { createClient } = require("@supabase/supabase-js");
+const kg = require("./neo4j-graph");
 
 // ── SUPABASE CLIENT ───────────────────────────────────────────────
 // This is the ONLY client that should ever be used for service_role-
@@ -5260,6 +5261,20 @@ app.listen(PORT, async () => {
   console.log(`Stripe key:  ${!!process.env.STRIPE_SECRET_KEY}`);
   console.log(`Supabase:    ${!!supabase}`);
   console.log(`Stripe WH:   ${!!process.env.STRIPE_WEBHOOK_SECRET}`);
+  console.log(`Neo4j:       ${kg.isConfigured()}`);
+
+  // Company/Industry Knowledge Graph (Phase 1) — idempotent, never thrown
+  // into boot: a Neo4j outage/misconfig at startup must not take the API
+  // down with it, same fail-safe posture as every other external
+  // dependency here.
+  if (kg.isConfigured()) {
+    try {
+      const result = await kg.ensureSchema();
+      console.log(`Neo4j schema: ${result.ok ? "ok" : "FAILED — " + result.reason}`);
+    } catch (e) {
+      console.error("Neo4j schema setup failed:", e.message);
+    }
+  }
 
   // Pre-warm market data cache on startup so first user request is instant
   console.log(`Pre-warming market data cache...`);

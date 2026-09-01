@@ -2316,6 +2316,105 @@ async function fetchGeneralNews() {
   return merged;
 }
 
+// ─── Marketaux — real keyword/topic search for the topical fallback ───
+// (Sep 1 2026, direct follow-up to the "Shein Hong Kong listing" report:
+// even with excerpts fed to the AI, computeTopicalFallback can only ever
+// pick from whatever fetchGeneralNews()'s generic Finnhub-category +
+// Alpaca-symbol-less pool happened to contain -- and confirmed directly
+// against both vendors' own documented params (not assumed, given this
+// codebase's own repeated lesson about unverified API-shape guesses),
+// neither Finnhub's /news nor Alpaca's /v1beta1/news supports genuine
+// free-text/keyword search at all. So a real, topical "hot" story a user
+// actually typed about can be entirely invisible to this feature even
+// when it exists, if it just didn't land in that day's generic pool.
+// Marketaux's /v1/news/all?search= does real keyword search, AND ships
+// each article pre-tagged with real, vendor-resolved entities (ticker +
+// name + sentiment) -- so a genuinely related company (PDD/AMZN/GAP/WMT/
+// TGT/META/GOOGL for a Shein story, the user's own researched example)
+// can be surfaced directly from the vendor's own entity recognition
+// instead of hoping the AI infers it from a generic article's excerpt.
+//
+// Optional dependency, by construction: MARKETAUX_API_KEY unset, any
+// request/parse error, or the free tier's ~100/day quota being spent all
+// fail safe to an empty array -- computeTopicalFallback below then runs
+// exactly its pre-Marketaux behavior (the general Finnhub/Alpaca pool
+// alone). Nothing regresses if the key is never set or ever runs dry.
+//
+// UNVERIFIED AGAINST A LIVE RESPONSE -- same standing posture as every
+// other integration in this file that this sandbox's egress proxy blocks
+// outright (api.marketaux.com included, confirmed via a direct fetch
+// attempt). Field names below (title/description/entities[].symbol/
+// entities[].sentiment_score) are triangulated across Marketaux's own
+// published docs summary, a PHP integration example, and an MCP-server
+// tool description -- not confirmed against a real response -- so every
+// field read has a defensive fallback and the whole function fails safe
+// to []. Check Render logs for fetchMarketauxNews errors after deploy,
+// and re-run the exact reported Shein query to confirm PDD/AMZN/etc. (or
+// whatever Marketaux's own tagging actually surfaces) show up under
+// RELATED instead of "No related companies found."
+const MARKETAUX_MAX_AGE_MS = 10 * 60 * 1000; // query-specific results, not a generic feed -- can afford a longer TTL than fetchGeneralNews's
+const marketauxSearchCache = new Map(); // normalized query -> { data, time }
+const MARKETAUX_DAILY_LIMIT = 90; // headroom under the ~100/day free-tier ceiling
+let marketauxDailyCount = 0;
+let marketauxDailyResetAt = 0;
+function marketauxBudgetOk() {
+  const now = Date.now();
+  if (now >= marketauxDailyResetAt) {
+    marketauxDailyCount = 0;
+    const d = new Date();
+    d.setUTCHours(24, 0, 0, 0); // next UTC midnight, matching Marketaux's own daily-quota clock
+    marketauxDailyResetAt = d.getTime();
+  }
+  return marketauxDailyCount < MARKETAUX_DAILY_LIMIT;
+}
+async function fetchMarketauxNews(query) {
+  const key = String(query).trim().toLowerCase();
+  if (!key) return [];
+  const cached = marketauxSearchCache.get(key);
+  if (cached && Date.now() - cached.time < MARKETAUX_MAX_AGE_MS) return cached.data;
+  const apiKey = process.env.MARKETAUX_API_KEY;
+  if (!apiKey) return [];
+  if (!marketauxBudgetOk()) {
+    console.error(`fetchMarketauxNews "${query}": daily budget (${MARKETAUX_DAILY_LIMIT}) exhausted, skipping`);
+    return [];
+  }
+  try {
+    marketauxDailyCount++;
+    const url = `https://api.marketaux.com/v1/news/all?search=${encodeURIComponent(query)}&language=en&limit=10&filter_entities=true&api_token=${apiKey}`;
+    const res = await fetchWithTimeout(url, {}, 10000);
+    if (!res.ok) {
+      console.error(`fetchMarketauxNews "${query}": HTTP ${res.status}`);
+      return [];
+    }
+    const data = await res.json();
+    const items = Array.isArray(data?.data) ? data.data : [];
+    const mapped = items.map(a => {
+      const headline = a.title || a.headline || "";
+      const publishedRaw = a.published_at || a.publishedAt || a.published_on;
+      const entities = Array.isArray(a.entities) ? a.entities : [];
+      return {
+        headline,
+        summary: a.description || a.snippet || a.summary || "",
+        url: a.url || "",
+        source: (typeof a.source === "string" && a.source) || "Marketaux",
+        timestamp: publishedRaw ? new Date(publishedRaw).getTime() : Date.now(),
+        entities: entities
+          .map(e => ({
+            symbol: (e && (e.symbol || e.ticker) || "").toUpperCase(),
+            name: (e && (e.name || e.company_name)) || null,
+            sentimentScore: e && typeof e.sentiment_score === "number" ? e.sentiment_score : null,
+          }))
+          .filter(e => /^[A-Z]{1,5}$/.test(e.symbol) && e.name),
+      };
+    }).filter(a => a.headline && a.url && Number.isFinite(a.timestamp));
+    marketauxSearchCache.set(key, { data: mapped, time: Date.now() });
+    return mapped;
+  } catch (e) {
+    console.error(`fetchMarketauxNews "${query}":`, e.message);
+    return [];
+  }
+}
+
 // Fix 5 (Notion "Proposal 5 — Amendment," Sep 1 2026) — Path B rework.
 // Supersedes the single-sentiment-plus-link version that used to live
 // here: corroborate first against real general news (no AI at all if
@@ -2440,11 +2539,24 @@ async function computeTopicalFallback(query, knownSymbols) {
     // Step 1 -- corroborate first, before any AI involvement: a real,
     // non-empty batch of currently-published general news. If nothing
     // corroborates, stop here -- no AI call, no invented article.
-    const articles = await fetchGeneralNews();
+    // Marketaux's real keyword search runs alongside (not instead of) the
+    // generic pool -- its hits are genuinely about the typed query, so
+    // they're listed first, but the generic pool stays as a real fallback
+    // if Marketaux has no key set / is out of quota / returns nothing.
+    const [marketauxArticles, generalArticles] = await Promise.all([
+      fetchMarketauxNews(query),
+      fetchGeneralNews(),
+    ]);
+    const seenUrls = new Set();
+    const articles = [...marketauxArticles, ...generalArticles].filter(a => {
+      if (!a.url || seenUrls.has(a.url)) return false;
+      seenUrls.add(a.url);
+      return true;
+    });
     if (!apiKey) {
       console.error(`computeTopicalFallback "${query}": ANTHROPIC_API_KEY not set`);
     } else if (!articles.length) {
-      console.error(`computeTopicalFallback "${query}": fetchGeneralNews returned 0 articles (Finnhub/Alpaca both empty or failed) -- nothing corroborates`);
+      console.error(`computeTopicalFallback "${query}": fetchMarketauxNews + fetchGeneralNews returned 0 articles combined -- nothing corroborates`);
     } else {
       const now = Date.now();
       // Excerpt, not just headline -- a company is frequently named in an
@@ -2493,15 +2605,31 @@ async function computeTopicalFallback(query, knownSymbols) {
           if (!article || !sentiment || typeof parsed.summary !== "string" || !parsed.summary.trim()) {
             console.error(`computeTopicalFallback "${query}": AI response failed validation: ${JSON.stringify(parsed)}`);
           } else {
-            // Step 3 -- re-validate every AI-named company through the same
-            // deterministic exact-match gate a real user query goes
-            // through. This is what prevents the hallucination risk from
-            // just moving down one layer -- an AI-invented or misremembered
-            // name is rejected here exactly like a bad query would be
-            // upstream.
+            // Step 3 -- companies come from two sources, both gated to real,
+            // resolved tickers before ever reaching the response, but
+            // gated differently since only one of them is an AI guess:
+            // (a) if the picked article came from Marketaux, its own
+            // vendor-tagged entities are ALREADY a real, pre-resolved
+            // ticker + name (not an AI guess) -- trusted directly, at the
+            // same trust level this app already gives Finnhub's own
+            // symbol tagging elsewhere; (b) names the AI extracted from
+            // the excerpt text still go through the exact same
+            // classifyEntityMatch gate as before, since those ARE an AI
+            // guess and carry the same hallucination risk that gate has
+            // always existed to catch. Marketaux entities are listed
+            // first (real > inferred), combined list capped at 5 to match
+            // the AI-extraction path's own existing cap.
             const validated = [];
             const seenSymbols = new Set();
+            for (const e of (article.entities || [])) {
+              if (validated.length >= 5) break;
+              if (!seenSymbols.has(e.symbol)) {
+                seenSymbols.add(e.symbol);
+                validated.push({ symbol: e.symbol, name: e.name });
+              }
+            }
             for (const name of extractedNames) {
+              if (validated.length >= 5) break;
               const m = await resolveCompanyEntity(name, knownSymbols);
               if (m && m.matchType === "exact" && !seenSymbols.has(m.symbol)) {
                 seenSymbols.add(m.symbol);

@@ -3427,7 +3427,22 @@ function extractCompanyCandidates(text) {
     // matters most in a real headline like "Nvidia's Real Story...".
     let clean = w.replace(/['’]s$/i, "");
     clean = clean.replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "");
-    if (clean && /^[A-Z][a-zA-Z]*$/.test(clean) && !CANDIDATE_STOPWORDS.has(clean)) {
+    // A token that itself contains a digit (Q3, G20, iPhone15) is
+    // alphanumeric jargon, not a plain capitalized word -- stripping its
+    // trailing digits down to a bare leftover letter ("G20" -> "G") lets
+    // that fragment pass the shape test below and silently splice two
+    // otherwise-unrelated runs together across it. Confirmed live (Sep 1,
+    // 2026): a real Agitator query ending "...From His G20 Speech"
+    // decomposed into "...From His G Speech" as one meaningless merged
+    // candidate, wasting a Finnhub call (422) on a string that was never
+    // going to resolve. Force a run break on the ORIGINAL token here
+    // instead, exactly like a lowercase word already does -- this also
+    // improves the "Tesla Q3 Earnings" case the comment above already
+    // anticipated: "Tesla" now becomes its own clean run immediately
+    // rather than only surfacing as a fallback individual word after a
+    // "Tesla Q Earnings" merged run is tried and fails first.
+    const hasDigit = /\d/.test(w);
+    if (!hasDigit && clean && /^[A-Z][a-zA-Z]*$/.test(clean) && !CANDIDATE_STOPWORDS.has(clean)) {
       current.push(clean);
     } else {
       if (current.length) runs.push(current.join(" "));

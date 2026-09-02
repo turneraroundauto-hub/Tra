@@ -2944,10 +2944,34 @@ const AGITATOR_COMPS_LIMIT = 3;
 // candidate pool than the display limit so filtering bad ones out still
 // leaves room to reach a full list.
 const AGITATOR_COMPS_CANDIDATE_POOL = 6;
+// Company/Industry Knowledge Graph (Neo4j, Phase 1+) checked ahead of
+// Finnhub's generic /stock/peers, which can come back genuinely empty for
+// a company Finnhub simply has no peer data for -- confirmed live: BB
+// (BlackBerry) returned zero Finnhub peers, even though real, well-known
+// competitor/supplier relationships exist and are now in the graph (see
+// neo4j-seed.js). Falls back to fetchTickerPeers when the graph has no
+// data yet for this symbol -- the graph's coverage grows via deliberate
+// population over time, it was never meant to have universal day-one
+// coverage, and kg.getCompanyRelationships() already fails safe to []
+// when Neo4j is unconfigured/down, so this degrades to today's exact
+// pre-graph behavior with zero risk. Only real, ticker-bearing graph
+// neighbors are usable here (a node like Wind River Systems is
+// deliberately ticker:null -- a private subsidiary, real in the graph,
+// but nothing to fetch a quote for).
+async function fetchGraphPeers(symbol) {
+  const related = await kg.getCompanyRelationships(symbol);
+  return related.filter(r => r.ticker).map(r => r.ticker.toUpperCase());
+}
+
 async function computeAgitatorComps(symbol, mentionedSymbols) {
-  const candidatePeers = (mentionedSymbols && mentionedSymbols.length)
-    ? mentionedSymbols.slice(0, AGITATOR_COMPS_CANDIDATE_POOL)
-    : (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+  let candidatePeers;
+  if (mentionedSymbols && mentionedSymbols.length) {
+    candidatePeers = mentionedSymbols.slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+  } else {
+    const graphPeers = await fetchGraphPeers(symbol);
+    candidatePeers = (graphPeers.length ? graphPeers : await fetchTickerPeers(symbol))
+      .slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+  }
   const quotes = await Promise.all(candidatePeers.map(sym => fetchQuote(sym)));
   const valid = [];
   candidatePeers.forEach((sym, i) => {

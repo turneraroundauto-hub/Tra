@@ -98,6 +98,11 @@ const SCHEMA_STATEMENTS = [
   "CREATE CONSTRAINT event_id_unique IF NOT EXISTS FOR (e:Event) REQUIRE e.event_id IS UNIQUE",
   "CREATE INDEX event_type_idx IF NOT EXISTS FOR (e:Event) ON (e.event_type)",
   "CREATE INDEX event_timestamp_idx IF NOT EXISTS FOR (e:Event) ON (e.timestamp)",
+  // Sector nodes (Sep 2, 2026) — Phase 1.5, wiring the Dynamic Proxy
+  // Resolution Algorithm (Gate 5) and the fixed-proxy classification rules
+  // (PROXY_RULES/DEFAULT_PROXY) into the graph as real CORRELATES_WITH/
+  // CLASSIFIED_AS edges. See the design note further down this file.
+  "CREATE CONSTRAINT sector_id_unique IF NOT EXISTS FOR (s:Sector) REQUIRE s.sector_id IS UNIQUE",
 ];
 
 async function ensureSchema() {
@@ -200,6 +205,160 @@ async function getCompanyRelationships(tickerOrCompanyId) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// PHASE 1.5 — CORRELATION/CLASSIFICATION GRAPH (Sep 2, 2026)
+// ═══════════════════════════════════════════════════════════════
+// Wires the app's two existing, already-computed sources of "which
+// tickers relate to which sector/proxy" into the same graph the Agitator
+// Gauge's RELATED companies already walks for supply-chain/competitor
+// edges (:RELATED_TO, above) — not a new computation, a persistence
+// side-channel for math server.js was already doing:
+//   - the Dynamic Proxy Resolution Algorithm (Gate 5, Patch 2) already
+//     computes a real correlation coefficient between an ambiguous
+//     ticker and its resolved sector-proxy candidate (see server.js's
+//     resolveGate5()/saveProxyResolution()) — persisted as
+//     :CORRELATES_WITH.
+//   - the static PROXY_RULES/DEFAULT_PROXY classification every ticker
+//     already gets (server.js's classifyTicker()) — persisted as
+//     :CLASSIFIED_AS against a small set of :Sector nodes (the same
+//     category strings already shown in the UI, e.g. "AI/Semiconductor",
+//     "Biotech/Medical" — no new taxonomy invented).
+// Together these make "find tickers within 2 hops of X via a shared
+// proxy or sector" (getComparableTickers below) a single real traversal,
+// instead of recomputing correlation math or chaining Supabase queries —
+// consumed by both the Agitator Gauge (Proposal 5, comps) and the
+// Verdict Accuracy Scorecard (Proposal 7, peer/pool accuracy — see
+// server.js's /scorecard).
+//
+// A ticker referenced only as a correlation/classification target (e.g.
+// SPY, TSM as a proxy) may not already exist as a fully-detailed
+// :Company node the way upsertCompany() creates one — these functions
+// lazily create a minimal stand-in (company_id = ticker, name = ticker)
+// via MERGE on the ticker property so a later, richer upsertCompany()
+// call for the same ticker still matches and fills in the real name/
+// industry/etc. rather than creating a duplicate node.
+
+async function upsertCompanyStub(ticker) {
+  const session = getSession();
+  try {
+    await session.run(
+      `MERGE (c:Company {ticker: $ticker})
+       ON CREATE SET c.company_id = $ticker, c.name = $ticker`,
+      { ticker },
+    );
+  } finally {
+    await session.close();
+  }
+}
+
+async function upsertSector(sector) {
+  if (!driver) return null;
+  const { sector_id, name } = sector || {};
+  if (!sector_id || !name) throw new Error("upsertSector requires sector_id and name");
+  const session = getSession();
+  try {
+    const result = await session.run(
+      `MERGE (s:Sector {sector_id: $sector_id}) SET s.name = $name RETURN s`,
+      { sector_id, name },
+    );
+    return result.records[0]?.get("s").properties || null;
+  } finally {
+    await session.close();
+  }
+}
+
+// ticker -[:CLASSIFIED_AS {tier, confidence}]-> Sector. `tier` mirrors
+// resolveGate5's own tier vocabulary ("primary"/"secondary"/
+// "fundamentals-confirmed"/"fundamentals-speculative") so a later reader
+// doesn't need a second vocabulary to reconcile.
+async function upsertClassification(ticker, sectorId, opts) {
+  if (!driver) return null;
+  const { tier = null, confidence = null } = opts || {};
+  await upsertCompanyStub(ticker);
+  const session = getSession();
+  try {
+    const result = await session.run(
+      `MATCH (c:Company {ticker: $ticker})
+       MATCH (s:Sector {sector_id: $sectorId})
+       MERGE (c)-[r:CLASSIFIED_AS]->(s)
+       SET r.tier = $tier, r.confidence = $confidence
+       RETURN r`,
+      { ticker, sectorId, tier, confidence },
+    );
+    return result.records[0]?.get("r").properties || null;
+  } finally {
+    await session.close();
+  }
+}
+
+// ticker <-[:CORRELATES_WITH {coefficient, tier, source}]-> proxyTicker.
+// Symmetric by nature (a correlation coefficient has no direction), so
+// this MERGEs an undirected pattern between two already-matched nodes —
+// standard Neo4j idiom for a relationship whose meaning doesn't have a
+// direction, distinct from :RELATED_TO's directed supply-chain edges
+// above. Re-running this for the same pair updates the existing edge's
+// properties (a fresher correlation reading) rather than creating a
+// second edge, regardless of which node was "from" on an earlier call.
+async function upsertCorrelation(fromTicker, toTicker, rel) {
+  if (!driver) return null;
+  if (!fromTicker || !toTicker || fromTicker === toTicker) return null;
+  const { coefficient = null, tier = null, source = null } = rel || {};
+  await upsertCompanyStub(fromTicker);
+  await upsertCompanyStub(toTicker);
+  const session = getSession();
+  try {
+    const result = await session.run(
+      `MATCH (a:Company {ticker: $fromTicker})
+       MATCH (b:Company {ticker: $toTicker})
+       MERGE (a)-[r:CORRELATES_WITH]-(b)
+       SET r.coefficient = $coefficient, r.tier = $tier, r.source = $source,
+           r.computed_at = $computedAt
+       RETURN r`,
+      { fromTicker, toTicker, coefficient, tier, source, computedAt: new Date().toISOString() },
+    );
+    return result.records[0]?.get("r").properties || null;
+  } finally {
+    await session.close();
+  }
+}
+
+// The literal "find tickers within 2 hops of X via a shared proxy or
+// sector" traversal from the original design conversation. A 1-hop
+// CORRELATES_WITH lands directly on another ticker (its resolved proxy);
+// a 2-hop CORRELATES_WITH->CORRELATES_WITH or CLASSIFIED_AS->CLASSIFIED_AS
+// (reversed) lands on a ticker sharing the same proxy or sector
+// respectively. Neo4j doesn't accept a parameter for a variable-length
+// pattern's bound, so *1..2 is a literal, not user-controlled input.
+// Sector nodes themselves (no `ticker` property) are naturally excluded
+// by the WHERE filter, same as a ticker-less Company stub (e.g. a
+// private subsidiary) would be.
+async function getComparableTickers(ticker) {
+  if (!driver) return [];
+  const session = getSession();
+  try {
+    const result = await session.run(
+      `MATCH (c:Company {ticker: $ticker})
+       MATCH path = (c)-[:CORRELATES_WITH|CLASSIFIED_AS*1..2]-(other:Company)
+       WHERE other.ticker IS NOT NULL AND other.ticker <> $ticker
+       WITH other, min(length(path)) AS hops
+       RETURN DISTINCT other.ticker AS ticker, other.name AS name, hops
+       ORDER BY hops ASC
+       LIMIT 10`,
+      { ticker },
+    );
+    return result.records.map(rec => {
+      const hopsVal = rec.get("hops");
+      return {
+        ticker: rec.get("ticker"),
+        name: rec.get("name"),
+        hops: (hopsVal && typeof hopsVal.toNumber === "function") ? hopsVal.toNumber() : hopsVal,
+      };
+    });
+  } finally {
+    await session.close();
+  }
+}
+
 module.exports = {
   isConfigured,
   getSession,
@@ -208,4 +367,8 @@ module.exports = {
   upsertCompany,
   upsertRelationship,
   getCompanyRelationships,
+  upsertSector,
+  upsertClassification,
+  upsertCorrelation,
+  getComparableTickers,
 };

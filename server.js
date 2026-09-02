@@ -2963,14 +2963,27 @@ async function fetchGraphPeers(symbol) {
   return related.filter(r => r.ticker).map(r => r.ticker.toUpperCase());
 }
 
-async function computeAgitatorComps(symbol, mentionedSymbols) {
+// marketauxMentioned (optional): real, vendor-tagged company symbols
+// found during resolution-time Marketaux enrichment (see /agitator's own
+// comment) -- a lower-priority fallback than the Knowledge Graph, since
+// the graph is deliberately hand-curated/fact-checked and these are
+// whatever a live keyword search happened to tag, but still a real,
+// topically-relevant signal worth preferring over a generic same-
+// industry guess from Finnhub's peer list. Priority order, end to end:
+// literal mentions > graph > Marketaux > generic Finnhub peers.
+async function computeAgitatorComps(symbol, mentionedSymbols, marketauxMentioned) {
   let candidatePeers;
   if (mentionedSymbols && mentionedSymbols.length) {
     candidatePeers = mentionedSymbols.slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
   } else {
     const graphPeers = await fetchGraphPeers(symbol);
-    candidatePeers = (graphPeers.length ? graphPeers : await fetchTickerPeers(symbol))
-      .slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+    if (graphPeers.length) {
+      candidatePeers = graphPeers.slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+    } else if (marketauxMentioned && marketauxMentioned.length) {
+      candidatePeers = marketauxMentioned.slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+    } else {
+      candidatePeers = (await fetchTickerPeers(symbol)).slice(0, AGITATOR_COMPS_CANDIDATE_POOL);
+    }
   }
   const quotes = await Promise.all(candidatePeers.map(sym => fetchQuote(sym)));
   const valid = [];
@@ -3661,10 +3674,46 @@ app.get("/agitator", async (req, res) => {
       });
     }
     symbol = symbol.toUpperCase();
+    // Whenever resolution didn't already come WITH a real Marketaux
+    // article (a bare ticker/name match, or a brand override like
+    // "qnx" -> BB that resolves the symbol but consults no news source
+    // at all), still try a real Marketaux search on the raw query for
+    // enrichment -- a real article and real related-company candidates,
+    // not just a bare symbol with nothing else to show. Confirmed live
+    // (Sep 1, 2026): "Qnx automotive iot" correctly resolved to BB via
+    // the override, but then showed the raw query text as a fake,
+    // unlinked "headline" AND (before the Knowledge Graph was wired in
+    // and populated for this case) "No related companies found." Only
+    // skipped for a real directMatch (a plain ticker or exact company
+    // name), since that case already gets a real, relevance-filtered
+    // fetchNews() call below.
+    //
+    // marketauxMentioned is kept SEPARATE from mentionedSymbols (the
+    // scan just below, for companies literally named in the user's own
+    // text) -- it's passed to computeAgitatorComps as a lower-priority
+    // fallback than the Knowledge Graph, since the graph is deliberately
+    // hand-curated/fact-checked and Marketaux's entities here are just
+    // whatever a live keyword search happened to tag. Priority order,
+    // end to end: literal mentions > graph > Marketaux > generic Finnhub
+    // peers.
+    let marketauxMentioned = [];
+    if (!directMatch && !marketauxArticle) {
+      const enrichArticles = await fetchMarketauxNews(raw);
+      if (enrichArticles.length) {
+        const top = enrichArticles[0];
+        marketauxArticle = { headline: top.headline, url: top.url, source: top.source };
+        for (const a of enrichArticles) {
+          for (const e of (a.entities || [])) {
+            if (e.symbol !== symbol && !marketauxMentioned.includes(e.symbol)) {
+              marketauxMentioned.push(e.symbol);
+            }
+          }
+        }
+      }
+    }
     // A real Marketaux article always wins over the synthetic "the raw
     // query text is the headline" placeholder -- only fall back to that
-    // when resolution succeeded with nothing real to show for it (a
-    // decomposed candidate matched via Finnhub, no article in hand).
+    // when nothing real is available at all.
     if (!directMatch && !marketauxArticle && !headlineOverride) headlineOverride = raw;
 
     // Scan the SAME candidate list for other real companies the user
@@ -3765,7 +3814,7 @@ app.get("/agitator", async (req, res) => {
     // below), not folded into the single score every tier sees.
     const composite = computeAgitatorComposite(factorsForComposite);
 
-    const comps = await computeAgitatorComps(symbol, mentionedSymbols);
+    const comps = await computeAgitatorComps(symbol, mentionedSymbols, marketauxMentioned);
 
     res.json({
       resolved: true, symbol,

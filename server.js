@@ -541,7 +541,20 @@ const SEC_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT || "TradeTribunal resear
 // stricter per-second limit instead of per-minute, and on the one path with
 // no queue in front of it at all.
 const SEC_MAX_PER_SEC = 8;
+// Minimum gap enforced between any two releases, on top of the rolling
+// per-second cap above. Confirmed live (Sep 2, 2026): a cold-start burst of
+// Pre-Gate evaluations for many different tickers was releasing several SEC
+// full-text-search calls within the same millisecond (all still legal under
+// the 8/sec rolling-window check on their own) and efts.sec.gov started
+// returning "Internal server error" 500s for that whole burst -- consistent
+// with a real backend choking on concurrent simultaneous connections, not
+// just aggregate rate. Spacing every release out evenly (~125ms apart)
+// keeps the same 8/sec ceiling but removes the near-instant bursts that
+// theory points at. Unconfirmed against SEC directly (this sandbox can't
+// reach sec.gov) -- watch Render logs for whether the 500 bursts stop.
+const SEC_MIN_GAP_MS = Math.ceil(1000 / SEC_MAX_PER_SEC);
 const secCallTimes = [];
+let secLastRelease = 0;
 let secQueue = Promise.resolve();
 
 function secThrottle() {
@@ -549,11 +562,15 @@ function secThrottle() {
     for (;;) {
       const now = Date.now();
       while (secCallTimes.length && now - secCallTimes[0] > 1000) secCallTimes.shift();
-      if (secCallTimes.length < SEC_MAX_PER_SEC) {
+      const sinceLastRelease = now - secLastRelease;
+      if (secCallTimes.length < SEC_MAX_PER_SEC && sinceLastRelease >= SEC_MIN_GAP_MS) {
         secCallTimes.push(now);
+        secLastRelease = now;
         return;
       }
-      await new Promise(r => setTimeout(r, 1000 - (now - secCallTimes[0]) + 20));
+      const waitForWindow = secCallTimes.length >= SEC_MAX_PER_SEC ? (1000 - (now - secCallTimes[0]) + 20) : 0;
+      const waitForGap = sinceLastRelease < SEC_MIN_GAP_MS ? (SEC_MIN_GAP_MS - sinceLastRelease) : 0;
+      await new Promise(r => setTimeout(r, Math.max(waitForWindow, waitForGap, 10)));
     }
   });
   secQueue = turn.catch(() => {}); // one slow/failed turn must not wedge the queue for everyone behind it
@@ -1361,6 +1378,18 @@ async function fetchOpeningBar(symbol) {
     const now = new Date();
     const et  = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
     const today = et.toISOString().split("T")[0];
+
+    // No opening bar can exist yet before 9:30am ET -- requesting
+    // start=<today>T09:30 while it's still pre-market asks Alpaca for a bar
+    // that's in the future relative to the request. Confirmed live (Sep 2,
+    // 2026): Alpaca rejects that with a 400 (not an empty bars array), so
+    // every fetchOpeningBar call during the 8-9:30am ET pre-market window
+    // was failing for every ticker, silently degrading Gate 1's blind-
+    // sequence data for that whole window every single day. Skip the call
+    // outright rather than let it fail -- there's genuinely nothing to
+    // return yet.
+    const mins = et.getHours() * 60 + et.getMinutes();
+    if (mins < 570) return null; // before 9:30am ET
 
     // Fetch 15-min bars for today — first bar is the opening bar
     const data = await alpacaGet(`/v2/stocks/${symbol}/bars?timeframe=15Min&start=${today}T09:30:00-04:00&limit=5&feed=iex`);

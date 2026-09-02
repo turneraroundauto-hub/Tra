@@ -3795,10 +3795,25 @@ app.get("/agitator", async (req, res) => {
         }
       }
     }
-    // A real Marketaux article always wins over the synthetic "the raw
-    // query text is the headline" placeholder -- only fall back to that
-    // when nothing real is available at all.
-    if (!directMatch && !marketauxArticle && !headlineOverride) headlineOverride = raw;
+    // Sep 2, 2026 -- real bug found and fixed: this used to set
+    // headlineOverride = raw right here whenever enrichment came back
+    // empty, and headlineOverride's own presence is what the block below
+    // uses to decide whether to skip the real per-ticker fetchNews() call
+    // entirely. So a resolved-but-un-enriched ticker (exactly the BB/QNX
+    // case -- Marketaux has no article for an artificial query like "Qnx
+    // automotive iot") never even TRIED the same real fetchNews(symbol,
+    // companyName) call every other resolved ticker gets -- it went
+    // straight to echoing the raw query text as a fake, unlinked
+    // "headline," even though a real BlackBerry article was one real
+    // fetch away. Fixed by not tainting headlineOverride here at all --
+    // it now only ever reflects a genuine, explicit client-supplied
+    // `headline` param (see its declaration above), so the block below's
+    // `else if (headlineOverride)` branch means exactly what it always
+    // should have: skip fetchNews only when the CLIENT explicitly handed
+    // us a specific headline/rumor to score, never as a side effect of
+    // enrichment coming up empty. The raw-text echo is still there as a
+    // genuine last resort -- see effectiveHeadline below -- just moved to
+    // AFTER the real news fetch has actually had a chance to run.
 
     // Scan the SAME candidate list for other real companies the user
     // already named alongside the primary one -- e.g. "Salesforce,
@@ -3863,7 +3878,14 @@ app.get("/agitator", async (req, res) => {
       const companyName = fundamentals?.sectorInfo?.name || null;
       [quote, news] = await Promise.all([fetchQuote(symbol), fetchNews(symbol, companyName).catch(() => null)]);
     }
-    const effectiveHeadline = headlineOverride || (news ? news.headline : null);
+    // Last resort: nothing real anywhere (no Marketaux article, no
+    // explicit client-supplied headline, and the real per-ticker
+    // fetchNews() above -- now actually attempted regardless of why
+    // symbol resolved -- also came back empty). Echoes the raw query
+    // text so the card still shows something instead of a blank
+    // headline, same fallback as before, just reached only after a real
+    // source has actually been tried rather than instead of trying one.
+    const effectiveHeadline = headlineOverride || (news ? news.headline : null) || raw;
     const price = quote ? parseFloat(quote.price) : null;
 
     // Fix 3 (Notion amendment): Alpaca's /snapshots options data extends

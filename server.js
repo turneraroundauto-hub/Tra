@@ -2385,8 +2385,19 @@ async function fetchCommodityPrice(code) {
     const raw = typeof data?.price === "number" ? data.price
       : (typeof data?.bid === "number" && typeof data?.ask === "number") ? (data.bid + data.ask) / 2
       : null;
-    if (raw == null || raw <= 0) return null;
+    // A shape mismatch (200 OK, but no numeric price/bid/ask where
+    // expected) previously returned null silently -- indistinguishable
+    // from "everything is fine, nothing to report" in the logs, and a
+    // real live report confirmed this was happening: a consistent
+    // failure with zero trace either way. Logging the raw body here
+    // (truncated) is how the real response shape gets confirmed instead
+    // of guessed at a second time.
+    if (raw == null || raw <= 0) {
+      console.error(`fetchCommodityPrice ${code}: unexpected response shape:`, JSON.stringify(data).slice(0, 500));
+      return null;
+    }
     const result = { name: entry.name, code: code.toUpperCase(), price: raw, unit: entry.unit, url: entry.url };
+    console.log(`fetchCommodityPrice ${code}: resolved $${raw}`);
     goldpriceCache.set(code, { result, time: Date.now() });
     return result;
   } catch (e) {

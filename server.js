@@ -2339,6 +2339,30 @@ const COMMODITY_CODES = {
   xau: { name: "Gold", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd", proxyTicker: "GLD" },
   xag: { name: "Silver", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd", proxyTicker: "SLV" },
 };
+// Guaranteed-real, hand-picked backfill for the commodity path's RELATED
+// section (CLAUDE.md, "every query gets a news article + 2-3
+// recommendations, EVERY TIME" -- a permanent rule, not per-request
+// polish). computeTopicalFallback()'s own dynamic company extraction from
+// real gold/silver news is tried FIRST (below) since it's the more
+// specific, currently-relevant answer -- this list only pads the result
+// up to a real minimum when that dynamic extraction comes back short
+// (a real, live possibility: a macro-only gold story can legitimately
+// name zero companies). Each metal's own tradable proxy (GLD for xau,
+// SLV for xag) is deliberately excluded here since it's already shown in
+// its own "Tradable proxy" line -- listing it twice would be redundant,
+// not a second real recommendation.
+const COMMODITY_RELATED_FALLBACK = {
+  xau: [
+    { symbol: "GDX", name: "VanEck Gold Miners ETF" },
+    { symbol: "NEM", name: "Newmont Corporation" },
+    { symbol: "SLV", name: "iShares Silver Trust" },
+  ],
+  xag: [
+    { symbol: "SIL", name: "Global X Silver Miners ETF" },
+    { symbol: "PAAS", name: "Pan American Silver Corp." },
+    { symbol: "GLD", name: "SPDR Gold Shares" },
+  ],
+};
 // Real spot price via goldprice.dev's public /v1/prices endpoint -- a
 // purpose-built, keyless (no signup/API key for basic use) commodity
 // spot-price API, chosen after a live report that Finnhub's OANDA:XAU_USD/
@@ -3818,10 +3842,49 @@ app.get("/agitator", async (req, res) => {
   const commodityEntry = COMMODITY_CODES[raw.toLowerCase()];
   if (commodityEntry) {
     const commodityCode = raw.toLowerCase();
-    const [spot, proxyQuote] = await Promise.all([
+    // Mandatory rule (CLAUDE.md, Sep 5 2026): every Agitator query,
+    // commodities included, gets a real cited news article and 2-3
+    // real recommendations -- reuses computeTopicalFallback() (the same
+    // corroborated-article + validated-company mechanism every other
+    // Agitator result already goes through) with the metal's own name
+    // ("Gold"/"Silver") as the query, rather than building a second,
+    // parallel news/related mechanism just for this one path.
+    const [spot, proxyQuote, topical] = await Promise.all([
       fetchCommodityPrice(commodityCode),
       fetchQuote(commodityEntry.proxyTicker),
+      computeTopicalFallback(commodityEntry.name, new Set()),
     ]);
+    // Related recommendations: the dynamic, currently-relevant companies
+    // computeTopicalFallback() actually found in real gold/silver news
+    // come first (real > static); padded up to 3 from the guaranteed
+    // hand-picked list only when the dynamic extraction came back short
+    // (it legitimately can -- a macro-only gold story can name zero
+    // companies) -- excluding this metal's own proxy ticker either way,
+    // since that's already shown in its own line, not a second
+    // recommendation. Each final symbol gets a fresh, real live quote --
+    // computeTopicalFallback()'s own `reactionPct` is a since-publish
+    // delta, not a live price, so this isn't reusable as-is here.
+    const relatedSymbols = [];
+    const seenRelated = new Set([commodityEntry.proxyTicker]);
+    for (const c of (topical?.companies || [])) {
+      if (relatedSymbols.length >= 3) break;
+      if (seenRelated.has(c.symbol)) continue;
+      seenRelated.add(c.symbol);
+      relatedSymbols.push(c.symbol);
+    }
+    for (const c of (COMMODITY_RELATED_FALLBACK[commodityCode] || [])) {
+      if (relatedSymbols.length >= 3) break;
+      if (seenRelated.has(c.symbol)) continue;
+      seenRelated.add(c.symbol);
+      relatedSymbols.push(c.symbol);
+    }
+    const relatedQuotes = await Promise.all(relatedSymbols.map(s => fetchQuote(s)));
+    const related = relatedSymbols.map((symbol, i) => {
+      const q = relatedQuotes[i];
+      const known = COMMODITY_RELATED_FALLBACK[commodityCode]?.find(c => c.symbol === symbol);
+      const fromTopical = topical?.companies?.find(c => c.symbol === symbol);
+      return { symbol, name: known?.name || fromTopical?.name || symbol, price: q ? q.price : null, change: q ? q.change : null, direction: q ? q.direction : "flat" };
+    });
     return res.json({
       resolved: false,
       query: raw,
@@ -3834,6 +3897,8 @@ app.get("/agitator", async (req, res) => {
         proxyTicker: commodityEntry.proxyTicker,
         proxyPrice: proxyQuote ? proxyQuote.price : null,
         proxyChange: proxyQuote ? proxyQuote.change : null,
+        news: topical ? { headline: topical.headline, url: topical.url, source: topical.source, sentiment: topical.sentiment, summary: topical.summary } : null,
+        related,
       },
     });
   }

@@ -3842,6 +3842,11 @@ app.get("/agitator", async (req, res) => {
   const commodityEntry = COMMODITY_CODES[raw.toLowerCase()];
   if (commodityEntry) {
     const commodityCode = raw.toLowerCase();
+    // Same isFull gate Path B uses just below (req.tierConfig?.tracker,
+    // true for Pro/Shark) -- kept consistent so every Agitator result
+    // shape follows the identical "composite always, sub-factors Pro-only"
+    // rule, not a commodity-specific variant.
+    const isFullCommodity = !!req.tierConfig?.tracker;
     // Mandatory rule (CLAUDE.md, Sep 5 2026): every Agitator query,
     // commodities included, gets a real cited news article and 2-3
     // real recommendations -- reuses computeTopicalFallback() (the same
@@ -3899,6 +3904,14 @@ app.get("/agitator", async (req, res) => {
         proxyChange: proxyQuote ? proxyQuote.change : null,
         news: topical ? { headline: topical.headline, url: topical.url, source: topical.source, sentiment: topical.sentiment, summary: topical.summary } : null,
         related,
+        // Signal breakdown -- computeTopicalFallback() already computes
+        // this (it's the same function Path B uses), previously discarded
+        // here rather than forwarded. Same shape/gate as Path B's own
+        // topical.composite/topical.factors below, so a commodity query
+        // gets the identical signal treatment as any other unresolved
+        // query, not a lesser one.
+        composite: topical ? topical.composite : null,
+        factors: (topical && isFullCommodity) ? topical.factors : undefined,
       },
     });
   }

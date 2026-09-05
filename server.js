@@ -2387,14 +2387,72 @@ const COMMODITY_RELATED_FALLBACK = {
 // GOLDPRICE_API_KEY, same handoff convention as every other credential
 // in this file (never pasted into chat/committed). Missing the env var
 // fails safe to null immediately, same as a missing FINNHUB_KEY etc.
-const GOLDPRICE_SYMBOLS = { xau: "XAU-USD-SPOT", xag: "XAG-USD-SPOT" };
+// XAG (silver) specifically -- confirmed live (Sep 5, 2026, real Render
+// logs, `goldprice.dev 403` on every XAG request while XAU resolves
+// cleanly on the same key) and via the provider's own docs that
+// goldprice.dev's free plan does NOT include silver/copper spot at all --
+// "Silver (XAG) and copper (HG) spot need Pro tier access." This is a
+// permanent plan gate, not a transient error, so XAG is routed to a
+// separate, independent source instead of ever calling goldprice.dev for
+// it (see fetchSilverSpotFallback below) -- paying to upgrade just for
+// one metal, or leaving XAG stuck on the SLV tradable-proxy fallback
+// forever, were both rejected in favor of finding a second free source.
+const GOLDPRICE_SYMBOLS = { xau: "XAU-USD-SPOT" };
 const GOLDPRICE_MAX_AGE_MS = 2 * 60 * 1000;
 const goldpriceCache = new Map(); // code -> { result, time }
 
+// gold-api.com -- a keyless, single-endpoint free gold/silver/crypto price
+// API, chosen specifically because it (unlike goldprice.dev) includes
+// silver on its free/keyless tier per its own public docs. UNVERIFIED
+// AGAINST A LIVE RESPONSE: gold-api.com is unreachable from this sandbox
+// (egress-blocked, same as every other finance API documented elsewhere
+// in this file) -- the endpoint/shape below is reasoned from public
+// documentation/write-ups describing it as a clean single-endpoint JSON
+// API, not confirmed against a real fetched response. Learning directly
+// from the goldprice.dev silent-shape-mismatch bug (a shape mismatch
+// used to return null with zero log trace, costing two full "check the
+// logs" rounds before the real shape was found): this parses defensively
+// against several plausible field names AND logs the raw response body
+// on any mismatch, so the real shape can be confirmed from Render logs
+// in one round instead of guessed at twice. Fails safe to null (falling
+// back to the existing SLV tradable-proxy display) on any error or
+// shape mismatch, same posture as fetchCommodityPrice itself.
+const SILVER_FALLBACK_MAX_AGE_MS = 2 * 60 * 1000;
+let silverFallbackCache = { result: null, time: 0 };
+
+async function fetchSilverSpotFallback() {
+  if (silverFallbackCache.result && Date.now() - silverFallbackCache.time < SILVER_FALLBACK_MAX_AGE_MS) {
+    return silverFallbackCache.result;
+  }
+  const entry = COMMODITY_CODES.xag;
+  try {
+    const res = await fetchWithTimeout(
+      "https://api.gold-api.com/price/XAG",
+      { headers: { "User-Agent": "TradeTribunal/4.0" } }, 8000
+    );
+    if (!res.ok) throw new Error(`gold-api.com ${res.status}`);
+    const data = await res.json();
+    const raw = Number(data?.price ?? data?.rate ?? data?.value ?? NaN);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      console.error(`fetchSilverSpotFallback: unexpected response shape:`, JSON.stringify(data).slice(0, 500));
+      return null;
+    }
+    const result = { name: entry.name, code: "XAG", price: raw, unit: entry.unit, url: entry.url };
+    console.log(`fetchSilverSpotFallback: resolved $${raw}`);
+    silverFallbackCache = { result, time: Date.now() };
+    return result;
+  } catch (e) {
+    console.error(`fetchSilverSpotFallback:`, e.message);
+    return null;
+  }
+}
+
 async function fetchCommodityPrice(code) {
   const entry = COMMODITY_CODES[code];
+  if (!entry) return null;
+  if (code === "xag") return fetchSilverSpotFallback();
   const symbol = GOLDPRICE_SYMBOLS[code];
-  if (!entry || !symbol) return null;
+  if (!symbol) return null;
   const apiKey = process.env.GOLDPRICE_API_KEY;
   if (!apiKey) { console.error(`fetchCommodityPrice ${code}: no GOLDPRICE_API_KEY set`); return null; }
   const cached = goldpriceCache.get(code);

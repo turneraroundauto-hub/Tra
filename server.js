@@ -2312,6 +2312,46 @@ async function resolveCompanyEntity(query, knownSymbols) {
   return result;
 }
 
+// ─── AGITATOR GAUGE — commodity/currency spot codes (Sep 2026) ────────────
+// Deliberately its own mechanism, NOT folded into KNOWN_BRAND_TICKER_
+// OVERRIDES above -- a live report of "xau"/"xag" not resolving was first
+// (wrongly) fixed by rerouting those queries to GLD/SLV as if they were
+// company-name aliases, then reverted on direct correction: XAU/XAG are
+// ISO 4217 currency codes for gold/silver (troy ounce), not equity tickers
+// or company names at all -- there is no company to "figure out" for a
+// metal, the same way there's none for typing "USD". Silently rerouting
+// them to an ETF's ticker misrepresents what the user actually asked for
+// (a spot commodity price) as if it were a company match. This is that
+// literal, narrower thing instead: a real live spot price, shown as its
+// own distinct Agitator result (no company, no comps, no Gate data --
+// none of those concepts apply to a commodity spot price), never as a
+// resolved ticker/company.
+const COMMODITY_CODES = {
+  xau: { name: "Gold", forexSymbol: "OANDA:XAU_USD", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd" },
+  xag: { name: "Silver", forexSymbol: "OANDA:XAG_USD", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd" },
+};
+// Finnhub's /quote accepts an arbitrary EXCHANGE:SYMBOL string for a forex
+// pair the same way this file's own fetchQuote() already does for crypto
+// (BINANCE:BTCUSDT) -- OANDA:XAU_USD/XAG_USD is Finnhub's own documented
+// convention for a broker-fed spot gold/silver quote. UNVERIFIED AGAINST A
+// LIVE RESPONSE -- this sandbox can't reach Finnhub, same standing
+// limitation as every other integration in this file -- fails safe to
+// null on any error, a missing/zero price, or (plausibly, on a free-tier
+// key) a 403 for lacking forex entitlement, exactly like every other
+// unverified-from-sandbox integration here.
+async function fetchCommodityPrice(code) {
+  const entry = COMMODITY_CODES[code];
+  if (!entry) return null;
+  try {
+    const data = await finnhubGet(`/quote?symbol=${encodeURIComponent(entry.forexSymbol)}`);
+    if (!data || typeof data.c !== "number" || data.c <= 0) return null;
+    return { name: entry.name, code: code.toUpperCase(), price: data.c, unit: entry.unit, url: entry.url };
+  } catch (e) {
+    console.error(`fetchCommodityPrice ${code}:`, e.message);
+    return null;
+  }
+}
+
 // ─── AGITATOR GAUGE — no-company topical sentiment fallback (Aug 31, 2026) ───
 // When a typed query doesn't resolve to any specific company (a macro/policy
 // event name like "Jackson Hole Economic Policy Symposium" has no ticker to
@@ -3701,6 +3741,20 @@ app.get("/agitator", async (req, res) => {
   // Legacy separate `headline` param still honored if a not-yet-updated
   // client sends it, but the single-box client below never does.
   let headlineOverride = req.query.headline ? String(req.query.headline).trim() : null;
+
+  // Commodity/currency spot code (xau/xag) -- checked first and short-
+  // circuits entirely: none of the ticker-resolution logic below applies
+  // (there's no company to resolve), and a successful live price means
+  // there's nothing to fall through to the topical-news fallback for
+  // either. A failed/unavailable price fetch (no forex entitlement, a
+  // transient error) falls through to the normal resolution flow below,
+  // where it will correctly find no company and land on the topical
+  // fallback -- same fail-safe posture as every other integration here.
+  const commodityEntry = COMMODITY_CODES[raw.toLowerCase()];
+  if (commodityEntry) {
+    const commodity = await fetchCommodityPrice(raw.toLowerCase());
+    if (commodity) return res.json({ resolved: false, query: raw, commodity });
+  }
 
   try {
     // Fix 1 known-ticker shortcut inputs: the system-tracked list, plus

@@ -2326,43 +2326,59 @@ async function resolveCompanyEntity(query, knownSymbols) {
 // own distinct Agitator result (no company, no comps, no Gate data --
 // none of those concepts apply to a commodity spot price), never as a
 // resolved ticker/company.
-// proxyTicker: a real, tradable ETP that tracks this metal (GLD/SLV) --
-// added after a live report confirmed two things: (1) the forex spot-price
-// fetch below is (as flagged when it shipped) failing on this Finnhub key,
-// plausibly a free-tier forex-entitlement gap, so xau/xag were producing NO
-// live price at all; (2) with no price, the code fell through to ordinary
-// company resolution, which correctly found no company and landed on the
-// Path B topical-news fallback -- surfacing an unrelated Benzinga article
-// for a metal, which reads as broken, not as a graceful degrade. GLD/SLV
-// are genuinely reliable here (regular NYSE-listed ETPs, the same
-// already-proven fetchQuote() path every other ticker on this page uses),
-// so they're the guaranteed fallback the spot-price attempt never was.
-// They are NOT the same instrument as the metal itself (GLD tracks ~1/10oz
-// of gold minus expenses, not 1:1) -- always labeled "tradable proxy," never
-// presented as an equivalent price, same posture as the two-repo XAU/GLD
-// aliasing correction earlier in this file's history.
+// proxyTicker: a real, tradable ETP that tracks this metal (GLD/SLV), via
+// the same already-proven fetchQuote() path every other ticker on this
+// page uses -- kept alongside the real spot price below (not just a
+// fallback for it) since it's what actually lets a user act on the
+// price with a real hyperlinked ticker. NOT the same instrument as the
+// metal itself (GLD tracks ~1/10oz of gold minus expenses, not 1:1) --
+// always labeled "tradable proxy," never presented as an equivalent
+// price, same posture as the two-repo XAU/GLD aliasing correction
+// earlier in this file's history.
 const COMMODITY_CODES = {
-  xau: { name: "Gold", forexSymbol: "OANDA:XAU_USD", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd", proxyTicker: "GLD" },
-  xag: { name: "Silver", forexSymbol: "OANDA:XAG_USD", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd", proxyTicker: "SLV" },
+  xau: { name: "Gold", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd", proxyTicker: "GLD" },
+  xag: { name: "Silver", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd", proxyTicker: "SLV" },
 };
-// Finnhub's /quote accepts an arbitrary EXCHANGE:SYMBOL string for a forex
-// pair the same way this file's own fetchQuote() already does for crypto
-// (BINANCE:BTCUSDT) -- OANDA:XAU_USD/XAG_USD is Finnhub's own documented
-// convention for a broker-fed spot gold/silver quote. UNVERIFIED AGAINST A
-// LIVE RESPONSE -- this sandbox can't reach Finnhub, same standing
-// limitation as every other integration in this file -- fails safe to
-// null on any error, a missing/zero price, or (confirmed live, Sep 2026,
-// plausibly a free-tier key lacking forex entitlement) a failure that
-// leaves `price` null -- the caller (below) never treats a null price here
-// as a reason to abandon the whole commodity result, only to omit the
-// spot-price line and rely on proxyTicker's own quote instead.
+// Real spot price via goldprice.dev's public /v1/prices endpoint -- a
+// purpose-built, keyless (no signup/API key for basic use) commodity
+// spot-price API, chosen after a live report that Finnhub's OANDA:XAU_USD/
+// XAG_USD forex quote was producing nothing (plausibly a free-tier
+// forex-entitlement gap on Finnhub, whose own documented product is
+// stock/company data, not a commodities feed). Confirmed via the
+// provider's own published docs (WebSearch; this sandbox's egress proxy
+// blocks goldprice.dev itself, so the live response was never fetched
+// directly here) to accept `symbol=XAU-USD-SPOT`/`XAG-USD-SPOT` and
+// return `{price, bid, ask, computed_at, is_stale}`. UNVERIFIED AGAINST A
+// LIVE RESPONSE -- parsed defensively (accepts a top-level numeric
+// `price`, or the bid/ask midpoint if `price` itself is absent) and
+// fails safe to null on any shape mismatch or network error, same
+// posture as every other unverified-from-sandbox integration in this
+// file. A short cache absorbs rapid repeat checks of the same metal
+// without hammering a keyless, presumably rate-limited endpoint.
+const GOLDPRICE_SYMBOLS = { xau: "XAU-USD-SPOT", xag: "XAG-USD-SPOT" };
+const GOLDPRICE_MAX_AGE_MS = 2 * 60 * 1000;
+const goldpriceCache = new Map(); // code -> { result, time }
+
 async function fetchCommodityPrice(code) {
   const entry = COMMODITY_CODES[code];
-  if (!entry) return null;
+  const symbol = GOLDPRICE_SYMBOLS[code];
+  if (!entry || !symbol) return null;
+  const cached = goldpriceCache.get(code);
+  if (cached && Date.now() - cached.time < GOLDPRICE_MAX_AGE_MS) return cached.result;
   try {
-    const data = await finnhubGet(`/quote?symbol=${encodeURIComponent(entry.forexSymbol)}`);
-    if (!data || typeof data.c !== "number" || data.c <= 0) return null;
-    return { name: entry.name, code: code.toUpperCase(), price: data.c, unit: entry.unit, url: entry.url };
+    const res = await fetchWithTimeout(
+      `https://api.goldprice.dev/v1/prices?symbol=${encodeURIComponent(symbol)}`,
+      { headers: { "User-Agent": "TradeTribunal/4.0" } }, 8000
+    );
+    if (!res.ok) throw new Error(`goldprice.dev ${res.status}`);
+    const data = await res.json();
+    const raw = typeof data?.price === "number" ? data.price
+      : (typeof data?.bid === "number" && typeof data?.ask === "number") ? (data.bid + data.ask) / 2
+      : null;
+    if (raw == null || raw <= 0) return null;
+    const result = { name: entry.name, code: code.toUpperCase(), price: raw, unit: entry.unit, url: entry.url };
+    goldpriceCache.set(code, { result, time: Date.now() });
+    return result;
   } catch (e) {
     console.error(`fetchCommodityPrice ${code}:`, e.message);
     return null;

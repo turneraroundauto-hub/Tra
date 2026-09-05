@@ -2348,13 +2348,21 @@ const COMMODITY_CODES = {
 // provider's own published docs (WebSearch; this sandbox's egress proxy
 // blocks goldprice.dev itself, so the live response was never fetched
 // directly here) to accept `symbol=XAU-USD-SPOT`/`XAG-USD-SPOT` and
-// return `{price, bid, ask, computed_at, is_stale}`. UNVERIFIED AGAINST A
-// LIVE RESPONSE -- parsed defensively (accepts a top-level numeric
-// `price`, or the bid/ask midpoint if `price` itself is absent) and
-// fails safe to null on any shape mismatch or network error, same
-// posture as every other unverified-from-sandbox integration in this
-// file. A short cache absorbs rapid repeat checks of the same metal
-// without hammering a keyless, presumably rate-limited endpoint.
+// return `{price, bid, ask, computed_at, is_stale}`. Parsed defensively
+// (accepts a top-level numeric `price`, or the bid/ask midpoint if
+// `price` itself is absent) and fails safe to null on any shape mismatch
+// or network error. A short cache absorbs rapid repeat checks of the
+// same metal.
+//
+// REQUIRES GOLDPRICE_API_KEY -- confirmed live (Sep 5, 2026, real Render
+// logs) that unauthenticated requests get a flat 403, contradicting the
+// provider's own "no API key required for basic access" documentation
+// this integration was originally built from. A real, free-tier signup
+// key (Bearer token) is required; sent as `Authorization: Bearer <key>`
+// per the provider's documented auth scheme. Set on Render as
+// GOLDPRICE_API_KEY, same handoff convention as every other credential
+// in this file (never pasted into chat/committed). Missing the env var
+// fails safe to null immediately, same as a missing FINNHUB_KEY etc.
 const GOLDPRICE_SYMBOLS = { xau: "XAU-USD-SPOT", xag: "XAG-USD-SPOT" };
 const GOLDPRICE_MAX_AGE_MS = 2 * 60 * 1000;
 const goldpriceCache = new Map(); // code -> { result, time }
@@ -2363,12 +2371,14 @@ async function fetchCommodityPrice(code) {
   const entry = COMMODITY_CODES[code];
   const symbol = GOLDPRICE_SYMBOLS[code];
   if (!entry || !symbol) return null;
+  const apiKey = process.env.GOLDPRICE_API_KEY;
+  if (!apiKey) { console.error(`fetchCommodityPrice ${code}: no GOLDPRICE_API_KEY set`); return null; }
   const cached = goldpriceCache.get(code);
   if (cached && Date.now() - cached.time < GOLDPRICE_MAX_AGE_MS) return cached.result;
   try {
     const res = await fetchWithTimeout(
       `https://api.goldprice.dev/v1/prices?symbol=${encodeURIComponent(symbol)}`,
-      { headers: { "User-Agent": "TradeTribunal/4.0" } }, 8000
+      { headers: { "User-Agent": "TradeTribunal/4.0", "Authorization": `Bearer ${apiKey}` } }, 8000
     );
     if (!res.ok) throw new Error(`goldprice.dev ${res.status}`);
     const data = await res.json();
@@ -5686,6 +5696,7 @@ app.listen(PORT, async () => {
   console.log(`Supabase:    ${!!supabase}`);
   console.log(`Stripe WH:   ${!!process.env.STRIPE_WEBHOOK_SECRET}`);
   console.log(`Neo4j:       ${kg.isConfigured()}`);
+  console.log(`Goldprice:   ${!!process.env.GOLDPRICE_API_KEY}`);
 
   // Company/Industry Knowledge Graph (Phase 1) — idempotent, never thrown
   // into boot: a Neo4j outage/misconfig at startup must not take the API

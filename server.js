@@ -2382,9 +2382,16 @@ async function fetchCommodityPrice(code) {
     );
     if (!res.ok) throw new Error(`goldprice.dev ${res.status}`);
     const data = await res.json();
-    const raw = typeof data?.price === "number" ? data.price
-      : (typeof data?.bid === "number" && typeof data?.ask === "number") ? (data.bid + data.ask) / 2
-      : null;
+    // Real shape confirmed live (Sep 5, 2026, via the diagnostic logging
+    // added in PR #97): `{ symbols: [ { symbol, price, bid, ask, ... } ] }`
+    // -- nested under a `symbols` array, not top-level as first assumed,
+    // and price/bid/ask are all STRINGS ("4429.83"), not numbers. Both
+    // mistakes independently guaranteed the old top-level-numeric check
+    // could never match, regardless of which fallback branch it tried.
+    const sym0 = Array.isArray(data?.symbols) ? data.symbols[0] : null;
+    const raw = sym0 && sym0.price != null ? Number(sym0.price)
+      : sym0 && sym0.bid != null && sym0.ask != null ? (Number(sym0.bid) + Number(sym0.ask)) / 2
+      : NaN;
     // A shape mismatch (200 OK, but no numeric price/bid/ask where
     // expected) previously returned null silently -- indistinguishable
     // from "everything is fine, nothing to report" in the logs, and a
@@ -2392,7 +2399,7 @@ async function fetchCommodityPrice(code) {
     // failure with zero trace either way. Logging the raw body here
     // (truncated) is how the real response shape gets confirmed instead
     // of guessed at a second time.
-    if (raw == null || raw <= 0) {
+    if (!Number.isFinite(raw) || raw <= 0) {
       console.error(`fetchCommodityPrice ${code}: unexpected response shape:`, JSON.stringify(data).slice(0, 500));
       return null;
     }

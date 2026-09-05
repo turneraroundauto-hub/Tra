@@ -2338,7 +2338,44 @@ async function resolveCompanyEntity(query, knownSymbols) {
 const COMMODITY_CODES = {
   xau: { name: "Gold", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd", proxyTicker: "GLD" },
   xag: { name: "Silver", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd", proxyTicker: "SLV" },
+  // Added Sep 5, 2026 -- no confirmed free real-spot vendor exists for any
+  // of these five (goldprice.dev's own docs cap out at XAU/XAG/copper even
+  // on its paid Pro tier, with no platinum/palladium on any tier; gold-
+  // api.com markets itself as gold/silver/crypto only) -- so these are
+  // proxy-only from day one, never attempting a spot fetch. This is not a
+  // degraded state for them the way it would be for XAU/XAG on a vendor
+  // outage: fetchCommodityPrice() below returns null immediately for any
+  // code other than xau/xag, and the existing "spot price unavailable --
+  // showing its tradable proxy instead" copy already reads honestly for
+  // "no source exists," not just "the source failed this once."
+  wti: { name: "Crude Oil (WTI)", unit: "bbl", url: "https://www.investing.com/commodities/crude-oil", proxyTicker: "USO" },
+  natgas: { name: "Natural Gas", unit: "MMBtu", url: "https://www.investing.com/commodities/natural-gas", proxyTicker: "UNG" },
+  copper: { name: "Copper", unit: "lb", url: "https://www.investing.com/commodities/copper", proxyTicker: "CPER" },
+  platinum: { name: "Platinum", unit: "oz t", url: "https://www.investing.com/commodities/platinum", proxyTicker: "PPLT" },
+  palladium: { name: "Palladium", unit: "oz t", url: "https://www.investing.com/commodities/palladium", proxyTicker: "PALL" },
 };
+// Word-level aliases so a normal typed word ("gold", "oil", "natural gas")
+// actually reaches the commodity path above -- a real, confirmed gap found
+// during a Sep 5, 2026 audit: the commodity match used to be a bare
+// `COMMODITY_CODES[raw.toLowerCase()]` lookup, which only matches the
+// literal ISO-style code strings ("xau"/"xag") a normal user would never
+// actually type. Every alias here is matched against the ENTIRE trimmed/
+// lowercased query, never a substring inside a longer phrase -- "gas
+// prices surge" does not match "gas" and falls through to normal
+// resolution exactly as before, so this is purely additive, not a new way
+// for the commodity path to misfire on an unrelated query.
+const COMMODITY_ALIASES = {
+  xau: "xau", gold: "xau",
+  xag: "xag", silver: "xag",
+  wti: "wti", oil: "wti", crude: "wti", "crude oil": "wti", "wti crude": "wti",
+  natgas: "natgas", gas: "natgas", "natural gas": "natgas", "nat gas": "natgas",
+  copper: "copper", hg: "copper",
+  platinum: "platinum", xpt: "platinum",
+  palladium: "palladium", xpd: "palladium",
+};
+function resolveCommodityCode(raw) {
+  return COMMODITY_ALIASES[String(raw || "").trim().toLowerCase()] || null;
+}
 // Guaranteed-real, hand-picked backfill for the commodity path's RELATED
 // section (CLAUDE.md, "every query gets a news article + 2-3
 // recommendations, EVERY TIME" -- a permanent rule, not per-request
@@ -2361,6 +2398,31 @@ const COMMODITY_RELATED_FALLBACK = {
     { symbol: "SIL", name: "Global X Silver Miners ETF" },
     { symbol: "PAAS", name: "Pan American Silver Corp." },
     { symbol: "GLD", name: "SPDR Gold Shares" },
+  ],
+  wti: [
+    { symbol: "XOM", name: "Exxon Mobil Corporation" },
+    { symbol: "CVX", name: "Chevron Corporation" },
+    { symbol: "OXY", name: "Occidental Petroleum Corporation" },
+  ],
+  natgas: [
+    { symbol: "LNG", name: "Cheniere Energy, Inc." },
+    { symbol: "EQT", name: "EQT Corporation" },
+    { symbol: "RRC", name: "Range Resources Corporation" },
+  ],
+  copper: [
+    { symbol: "FCX", name: "Freeport-McMoRan Inc." },
+    { symbol: "SCCO", name: "Southern Copper Corporation" },
+    { symbol: "COPX", name: "Global X Copper Miners ETF" },
+  ],
+  platinum: [
+    { symbol: "SBSW", name: "Sibanye Stillwater Limited" },
+    { symbol: "PLG", name: "Platinum Group Metals Ltd." },
+    { symbol: "GLD", name: "SPDR Gold Shares" },
+  ],
+  palladium: [
+    { symbol: "SBSW", name: "Sibanye Stillwater Limited" },
+    { symbol: "PLG", name: "Platinum Group Metals Ltd." },
+    { symbol: "SLV", name: "iShares Silver Trust" },
   ],
 };
 // Real spot price via goldprice.dev's public /v1/prices endpoint -- a
@@ -3897,9 +3959,9 @@ app.get("/agitator", async (req, res) => {
   // every other ticker on this page uses) concurrently, and build a
   // result from whichever succeeded -- the proxy quote is the guaranteed
   // half, since it doesn't depend on any forex-data entitlement.
-  const commodityEntry = COMMODITY_CODES[raw.toLowerCase()];
+  const commodityCode = resolveCommodityCode(raw);
+  const commodityEntry = commodityCode ? COMMODITY_CODES[commodityCode] : null;
   if (commodityEntry) {
-    const commodityCode = raw.toLowerCase();
     // Same isFull gate Path B uses just below (req.tierConfig?.tracker,
     // true for Pro/Shark) -- kept consistent so every Agitator result
     // shape follows the identical "composite always, sub-factors Pro-only"

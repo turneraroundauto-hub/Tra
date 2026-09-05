@@ -2326,9 +2326,24 @@ async function resolveCompanyEntity(query, knownSymbols) {
 // own distinct Agitator result (no company, no comps, no Gate data --
 // none of those concepts apply to a commodity spot price), never as a
 // resolved ticker/company.
+// proxyTicker: a real, tradable ETP that tracks this metal (GLD/SLV) --
+// added after a live report confirmed two things: (1) the forex spot-price
+// fetch below is (as flagged when it shipped) failing on this Finnhub key,
+// plausibly a free-tier forex-entitlement gap, so xau/xag were producing NO
+// live price at all; (2) with no price, the code fell through to ordinary
+// company resolution, which correctly found no company and landed on the
+// Path B topical-news fallback -- surfacing an unrelated Benzinga article
+// for a metal, which reads as broken, not as a graceful degrade. GLD/SLV
+// are genuinely reliable here (regular NYSE-listed ETPs, the same
+// already-proven fetchQuote() path every other ticker on this page uses),
+// so they're the guaranteed fallback the spot-price attempt never was.
+// They are NOT the same instrument as the metal itself (GLD tracks ~1/10oz
+// of gold minus expenses, not 1:1) -- always labeled "tradable proxy," never
+// presented as an equivalent price, same posture as the two-repo XAU/GLD
+// aliasing correction earlier in this file's history.
 const COMMODITY_CODES = {
-  xau: { name: "Gold", forexSymbol: "OANDA:XAU_USD", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd" },
-  xag: { name: "Silver", forexSymbol: "OANDA:XAG_USD", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd" },
+  xau: { name: "Gold", forexSymbol: "OANDA:XAU_USD", unit: "oz t", url: "https://www.investing.com/currencies/xau-usd", proxyTicker: "GLD" },
+  xag: { name: "Silver", forexSymbol: "OANDA:XAG_USD", unit: "oz t", url: "https://www.investing.com/currencies/xag-usd", proxyTicker: "SLV" },
 };
 // Finnhub's /quote accepts an arbitrary EXCHANGE:SYMBOL string for a forex
 // pair the same way this file's own fetchQuote() already does for crypto
@@ -2336,9 +2351,11 @@ const COMMODITY_CODES = {
 // convention for a broker-fed spot gold/silver quote. UNVERIFIED AGAINST A
 // LIVE RESPONSE -- this sandbox can't reach Finnhub, same standing
 // limitation as every other integration in this file -- fails safe to
-// null on any error, a missing/zero price, or (plausibly, on a free-tier
-// key) a 403 for lacking forex entitlement, exactly like every other
-// unverified-from-sandbox integration here.
+// null on any error, a missing/zero price, or (confirmed live, Sep 2026,
+// plausibly a free-tier key lacking forex entitlement) a failure that
+// leaves `price` null -- the caller (below) never treats a null price here
+// as a reason to abandon the whole commodity result, only to omit the
+// spot-price line and rely on proxyTicker's own quote instead.
 async function fetchCommodityPrice(code) {
   const entry = COMMODITY_CODES[code];
   if (!entry) return null;
@@ -3744,16 +3761,37 @@ app.get("/agitator", async (req, res) => {
 
   // Commodity/currency spot code (xau/xag) -- checked first and short-
   // circuits entirely: none of the ticker-resolution logic below applies
-  // (there's no company to resolve), and a successful live price means
-  // there's nothing to fall through to the topical-news fallback for
-  // either. A failed/unavailable price fetch (no forex entitlement, a
-  // transient error) falls through to the normal resolution flow below,
-  // where it will correctly find no company and land on the topical
-  // fallback -- same fail-safe posture as every other integration here.
+  // (there's no company to resolve). Always returns its own commodity
+  // result and never falls through to company resolution/the topical-news
+  // fallback -- a live report confirmed the old fall-through behavior
+  // surfaced an unrelated Benzinga article for a metal once the forex
+  // spot-price fetch failed, which reads as broken, not a graceful
+  // degrade. The real fix: fetch the spot price AND the tradable proxy
+  // ticker's own live quote (GLD/SLV, via the same reliable fetchQuote()
+  // every other ticker on this page uses) concurrently, and build a
+  // result from whichever succeeded -- the proxy quote is the guaranteed
+  // half, since it doesn't depend on any forex-data entitlement.
   const commodityEntry = COMMODITY_CODES[raw.toLowerCase()];
   if (commodityEntry) {
-    const commodity = await fetchCommodityPrice(raw.toLowerCase());
-    if (commodity) return res.json({ resolved: false, query: raw, commodity });
+    const commodityCode = raw.toLowerCase();
+    const [spot, proxyQuote] = await Promise.all([
+      fetchCommodityPrice(commodityCode),
+      fetchQuote(commodityEntry.proxyTicker),
+    ]);
+    return res.json({
+      resolved: false,
+      query: raw,
+      commodity: {
+        name: commodityEntry.name,
+        code: commodityCode.toUpperCase(),
+        price: spot ? spot.price : null,
+        unit: commodityEntry.unit,
+        url: commodityEntry.url,
+        proxyTicker: commodityEntry.proxyTicker,
+        proxyPrice: proxyQuote ? proxyQuote.price : null,
+        proxyChange: proxyQuote ? proxyQuote.change : null,
+      },
+    });
   }
 
   try {

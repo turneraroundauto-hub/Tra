@@ -22,17 +22,25 @@
 // long-lived token then never has to be the raw shared secret itself.
 //
 // In-memory stores (registeredClients/authCodes/accessTokens/
-// refreshTokens) -- same posture as this codebase's existing
-// authCache/marketCache/etc: a single Render process, a restart clears
-// them and the client just re-registers/re-authorizes, which is an
-// acceptable cost for a single-user connector, not a real availability
-// concern.
+// refreshTokens) back every real request -- same fast-path pattern as
+// this codebase's existing authCache/marketCache/etc -- but are now
+// also write-through persisted to Supabase's mcp_oauth_state table and
+// re-hydrated from it once at boot (see hydrateAll()), so a Render
+// restart/redeploy no longer silently invalidates every registered
+// client and every issued token: the very first real case this bit,
+// PR #107's own deploy forced a full claude.ai re-authorization for no
+// reason other than the in-memory map being empty again. Falls back to
+// in-memory-only (no persistence at all) when no supabase client is
+// configured -- same posture as credits.js's own Supabase/local-fallback
+// split, and what every local dev/test boot in this project's history
+// already runs with.
 
 const crypto = require("crypto");
 
 const CODE_TTL_MS    = 5  * 60 * 1000;   // authorization codes: 5 min, single-use
 const ACCESS_TTL_MS  = 30 * 24 * 60 * 60 * 1000; // access tokens: 30 days
 const REFRESH_TTL_MS = 180 * 24 * 60 * 60 * 1000; // refresh tokens: 180 days
+const CLIENT_TTL_MS  = 10 * 365 * 24 * 60 * 60 * 1000; // registered clients: effectively permanent
 
 const registeredClients = new Map(); // client_id -> { redirect_uris: string[] }
 const authCodes         = new Map(); // code -> { client_id, redirect_uri, code_challenge, expires }
@@ -42,6 +50,62 @@ const refreshTokens      = new Map(); // token -> { expires }
 function pruneExpired(map) {
   const now = Date.now();
   for (const [k, v] of map.entries()) if (v.expires < now) map.delete(k);
+}
+
+// ── Supabase persistence (write-through cache pattern) ──────────────
+// One shared table, one row per (store, key) -- store is one of
+// "clients"/"codes"/"access"/"refresh", matching the four in-memory
+// Maps above. Fails safe: any Supabase error is logged and swallowed,
+// never thrown into a real request -- same posture as every other
+// unverified-from-sandbox integration in this codebase. The in-memory
+// Maps stay the actual source of truth for every request handled
+// within a single process lifetime; Supabase only exists to survive
+// the gap between one process dying and the next one's hydrateAll().
+async function persistUpsert(supabase, store, key, value, expiresAtMs) {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase
+      .from("mcp_oauth_state")
+      .upsert({ store, key, value, expires_at: new Date(expiresAtMs).toISOString() }, { onConflict: "store,key" });
+    if (error) throw error;
+  } catch (e) {
+    console.error(`[OAUTH] persistUpsert(${store}) failed:`, e.message);
+  }
+}
+
+async function persistDelete(supabase, store, key) {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase.from("mcp_oauth_state").delete().eq("store", store).eq("key", key);
+    if (error) throw error;
+  } catch (e) {
+    console.error(`[OAUTH] persistDelete(${store}) failed:`, e.message);
+  }
+}
+
+async function hydrateAll(supabase) {
+  if (!supabase) {
+    console.log("[OAUTH] no Supabase client configured -- OAuth state is in-memory only, a restart will force re-authorization");
+    return;
+  }
+  try {
+    const { data, error } = await supabase
+      .from("mcp_oauth_state")
+      .select("store, key, value, expires_at")
+      .gt("expires_at", new Date().toISOString());
+    if (error) throw error;
+    let clients = 0, codes = 0, access = 0, refresh = 0;
+    for (const row of data || []) {
+      const expires = new Date(row.expires_at).getTime();
+      if (row.store === "clients") { registeredClients.set(row.key, row.value); clients++; }
+      else if (row.store === "codes") { authCodes.set(row.key, { ...row.value, expires }); codes++; }
+      else if (row.store === "access") { accessTokens.set(row.key, { expires }); access++; }
+      else if (row.store === "refresh") { refreshTokens.set(row.key, { expires }); refresh++; }
+    }
+    console.log(`[OAUTH] hydrated from Supabase: ${clients} clients, ${codes} codes, ${access} access tokens, ${refresh} refresh tokens`);
+  } catch (e) {
+    console.error("[OAUTH] hydrateAll failed:", e.message);
+  }
 }
 
 function randomToken(bytes = 32) {
@@ -87,7 +151,9 @@ ${hidden}
 </form></body></html>`;
 }
 
-function mountOAuthRoutes(app) {
+function mountOAuthRoutes(app, supabase) {
+  hydrateAll(supabase); // fire-and-forget -- routes register synchronously below regardless
+
   // ── RFC 8414: Authorization Server Metadata ──────────────────────
   app.get("/.well-known/oauth-authorization-server", (req, res) => {
     const issuer = issuerFrom(req);
@@ -131,6 +197,7 @@ function mountOAuthRoutes(app) {
     }
     const clientId = randomToken(16);
     registeredClients.set(clientId, { redirect_uris: redirectUris });
+    persistUpsert(supabase, "clients", clientId, { redirect_uris: redirectUris }, Date.now() + CLIENT_TTL_MS);
     console.log(`[OAUTH] /register issued client_id=${clientId} redirect_uris=${JSON.stringify(redirectUris)} (registeredClients now has ${registeredClients.size} entries)`);
     res.status(201).json({
       client_id: clientId,
@@ -173,12 +240,16 @@ function mountOAuthRoutes(app) {
     }
     pruneExpired(authCodes);
     const code = randomToken(24);
+    const codeExpires = Date.now() + CODE_TTL_MS;
     authCodes.set(code, {
       client_id: String(client_id),
       redirect_uri: String(redirect_uri),
       code_challenge: String(code_challenge),
-      expires: Date.now() + CODE_TTL_MS,
+      expires: codeExpires,
     });
+    persistUpsert(supabase, "codes", code, {
+      client_id: String(client_id), redirect_uri: String(redirect_uri), code_challenge: String(code_challenge),
+    }, codeExpires);
     const redirect = new URL(String(redirect_uri));
     redirect.searchParams.set("code", code);
     if (state) redirect.searchParams.set("state", String(state));
@@ -197,6 +268,7 @@ function mountOAuthRoutes(app) {
         return res.status(400).json({ error: "invalid_grant", error_description: "Unknown or expired code." });
       }
       authCodes.delete(String(body.code)); // single-use
+      persistDelete(supabase, "codes", String(body.code));
 
       if (entry.client_id !== String(body.client_id || "") || entry.redirect_uri !== String(body.redirect_uri || "")) {
         return res.status(400).json({ error: "invalid_grant", error_description: "client_id/redirect_uri mismatch." });
@@ -210,8 +282,12 @@ function mountOAuthRoutes(app) {
       pruneExpired(refreshTokens);
       const accessToken  = randomToken(32);
       const refreshToken = randomToken(32);
-      accessTokens.set(accessToken, { expires: Date.now() + ACCESS_TTL_MS });
-      refreshTokens.set(refreshToken, { expires: Date.now() + REFRESH_TTL_MS });
+      const accessExpires  = Date.now() + ACCESS_TTL_MS;
+      const refreshExpires = Date.now() + REFRESH_TTL_MS;
+      accessTokens.set(accessToken, { expires: accessExpires });
+      refreshTokens.set(refreshToken, { expires: refreshExpires });
+      persistUpsert(supabase, "access", accessToken, {}, accessExpires);
+      persistUpsert(supabase, "refresh", refreshToken, {}, refreshExpires);
       return res.json({
         access_token: accessToken,
         token_type: "Bearer",
@@ -227,7 +303,9 @@ function mountOAuthRoutes(app) {
 
       pruneExpired(accessTokens);
       const accessToken = randomToken(32);
-      accessTokens.set(accessToken, { expires: Date.now() + ACCESS_TTL_MS });
+      const accessExpires = Date.now() + ACCESS_TTL_MS;
+      accessTokens.set(accessToken, { expires: accessExpires });
+      persistUpsert(supabase, "access", accessToken, {}, accessExpires);
       return res.json({
         access_token: accessToken,
         token_type: "Bearer",

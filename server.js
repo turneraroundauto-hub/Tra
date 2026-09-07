@@ -5959,6 +5959,7 @@ setInterval(async () => {
 
 // ─── START ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
+require("./mcp-server").mountMcpRoutes(app, PORT);
 credits.loadCredits(); // no-op with Supabase backend
 app.listen(PORT, async () => {
   console.log(`Trade Tribunal API v4.0.0 on port ${PORT}`);

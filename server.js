@@ -273,6 +273,18 @@ const TIER_KEYS = {
   shark:   process.env.SHARK_KEY,
 };
 
+// A dedicated, separate credential for the MCP server's own automated
+// use (see mcp-server.js) -- deliberately its own env var, not a reuse
+// of PRO_KEY, so an MCP client's usage can never be confused with, or
+// drain the credit pool of, any real paying tier-key-based access.
+// Fixed pro-tier access, fixed dedicated credits key ("mcp:agent") --
+// that key's own credits/tier row is provisioned once directly via
+// Supabase (get_or_create_user_credits/set_user_tier/
+// add_purchased_credits, same RPCs credits.js itself calls), not
+// per-caller and not through any signup flow.
+const MCP_AGENT_KEY = process.env.MCP_AGENT_KEY;
+const MCP_AGENT_CREDITS_KEY = "mcp:agent";
+
 app.use(async (req, res, next) => {
   if (req.path === "/") return next();
   if (req.path === "/auth/login") return next();
@@ -294,6 +306,14 @@ app.use(async (req, res, next) => {
     req.userTier   = resolved.tier;
     req.userKey    = `sub:${resolved.user.email}`;  // stable key — email not JWT
     req.tierConfig = credits.TIERS[resolved.tier];
+    return next();
+  }
+
+  // ── PATH 1.5: dedicated MCP-agent credential (fixed pro tier) ──
+  if (provided && MCP_AGENT_KEY && provided === MCP_AGENT_KEY) {
+    req.userTier   = "pro";
+    req.userKey    = MCP_AGENT_CREDITS_KEY;
+    req.tierConfig = credits.TIERS.pro;
     return next();
   }
 
@@ -5959,6 +5979,7 @@ setInterval(async () => {
 
 // ─── START ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
+require("./mcp-server").mountMcpRoutes(app, PORT);
 credits.loadCredits(); // no-op with Supabase backend
 app.listen(PORT, async () => {
   console.log(`Trade Tribunal API v4.0.0 on port ${PORT}`);

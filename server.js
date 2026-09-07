@@ -290,15 +290,69 @@ app.use(async (req, res, next) => {
 });
 
 // ─── MARKET HOURS DETECTION ───────────────────────────────────────
+// Full-day NYSE/NASDAQ market holidays, keyed by ET calendar date (YYYY-MM-DD).
+// Hand-computed from NYSE's published holiday calendar (fixed dates plus the
+// standard weekend-observed-date shift) and cross-checked via web search
+// against NYSE Group's own 2025/2026/2027 holiday announcement — not fetched
+// live, so this needs a manual update for 2028+. Good Friday is the one that
+// most needs re-verifying each year (Easter has no simple closed-form date;
+// an early pass here miscalculated 2027's Good Friday by hand before it was
+// caught against a real Easter-date source) — verify against NYSE's own
+// published schedule (nyse.com/trade/hours-calendars) before trusting a
+// future year added here without a source check.
+const MARKET_HOLIDAYS = new Set([
+  // 2026
+  "2026-01-01", // New Year's Day
+  "2026-01-19", // Martin Luther King, Jr. Day
+  "2026-02-16", // Washington's Birthday (Presidents Day)
+  "2026-04-03", // Good Friday
+  "2026-05-25", // Memorial Day
+  "2026-06-19", // Juneteenth National Independence Day
+  "2026-07-03", // Independence Day (observed — Jul 4 falls on a Saturday)
+  "2026-09-07", // Labor Day
+  "2026-11-26", // Thanksgiving Day
+  "2026-12-25", // Christmas Day
+  // 2027
+  "2027-01-01", // New Year's Day
+  "2027-01-18", // Martin Luther King, Jr. Day
+  "2027-02-15", // Washington's Birthday (Presidents Day)
+  "2027-03-26", // Good Friday
+  "2027-05-31", // Memorial Day
+  "2027-06-18", // Juneteenth (observed — Jun 19 falls on a Saturday)
+  "2027-07-05", // Independence Day (observed — Jul 4 falls on a Sunday)
+  "2027-09-06", // Labor Day
+  "2027-11-25", // Thanksgiving Day
+  "2027-12-24", // Christmas Day (observed — Dec 25 falls on a Saturday)
+]);
+
+// Early-close (1:00pm ET, not a full closure) trading days. 2027 has no
+// separate Christmas Eve early close — Dec 25 falls on a Saturday, so
+// Christmas itself is already a full-holiday observed date (Dec 24, above).
+const MARKET_EARLY_CLOSE_DAYS = new Set([
+  "2026-11-27", // day after Thanksgiving
+  "2026-12-24", // Christmas Eve
+  "2027-11-26", // day after Thanksgiving
+]);
+
+function etDateStr(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function isMarketOpen() {
   const now = new Date();
   // Convert to ET
   const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const day = et.getDay(); // 0=Sun, 6=Sat
   if (day === 0 || day === 6) return false;
+  const dateStr = etDateStr(et);
+  if (MARKET_HOLIDAYS.has(dateStr)) return false;
   const h = et.getHours(), m = et.getMinutes();
   const mins = h * 60 + m;
-  return mins >= 570 && mins < 960; // 9:30am–4:00pm ET
+  const closeMins = MARKET_EARLY_CLOSE_DAYS.has(dateStr) ? 780 : 960; // 1:00pm vs 4:00pm ET
+  return mins >= 570 && mins < closeMins; // 9:30am–close ET
 }
 
 // Today's weekday in ET (0=Sun..6=Sat) — shared by every day-of-week check

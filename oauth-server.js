@@ -121,12 +121,15 @@ function mountOAuthRoutes(app) {
 
   // ── RFC 7591: Dynamic Client Registration ────────────────────────
   app.post("/register", (req, res) => {
+    console.log(`[OAUTH] POST /register body: ${JSON.stringify(req.body)}`);
     const redirectUris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
     if (redirectUris.length === 0) {
+      console.log("[OAUTH] /register rejected: no redirect_uris");
       return res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris is required" });
     }
     const clientId = randomToken(16);
     registeredClients.set(clientId, { redirect_uris: redirectUris });
+    console.log(`[OAUTH] /register issued client_id=${clientId} redirect_uris=${JSON.stringify(redirectUris)} (registeredClients now has ${registeredClients.size} entries)`);
     res.status(201).json({
       client_id: clientId,
       redirect_uris: redirectUris,
@@ -140,8 +143,10 @@ function mountOAuthRoutes(app) {
   // real MCP_AGENT_KEY and issues a one-time code on success ───────
   app.get("/authorize", (req, res) => {
     const { client_id, redirect_uri, code_challenge, code_challenge_method } = req.query;
+    console.log(`[OAUTH] GET /authorize client_id=${client_id} redirect_uri=${redirect_uri} (registeredClients has ${registeredClients.size} entries: ${JSON.stringify([...registeredClients.keys()])})`);
     const client = registeredClients.get(String(client_id || ""));
     if (!client || !client.redirect_uris.includes(String(redirect_uri || ""))) {
+      console.log(`[OAUTH] GET /authorize REJECTED -- client found: ${!!client}, client's own redirect_uris: ${JSON.stringify(client?.redirect_uris)}`);
       return res.status(400).send("Unknown client_id or redirect_uri.");
     }
     if (code_challenge_method !== "S256" || !code_challenge) {
@@ -152,8 +157,10 @@ function mountOAuthRoutes(app) {
 
   app.post("/authorize", (req, res) => {
     const { client_id, redirect_uri, code_challenge, code_challenge_method, state, mcp_key } = req.body || {};
+    console.log(`[OAUTH] POST /authorize client_id=${client_id} redirect_uri=${redirect_uri} (registeredClients has ${registeredClients.size} entries: ${JSON.stringify([...registeredClients.keys()])})`);
     const client = registeredClients.get(String(client_id || ""));
     if (!client || !client.redirect_uris.includes(String(redirect_uri || ""))) {
+      console.log(`[OAUTH] POST /authorize REJECTED -- client found: ${!!client}, client's own redirect_uris: ${JSON.stringify(client?.redirect_uris)}`);
       return res.status(400).send("Unknown client_id or redirect_uri.");
     }
     const agentKey = process.env.MCP_AGENT_KEY;
@@ -179,10 +186,14 @@ function mountOAuthRoutes(app) {
   // ── /token: authorization_code and refresh_token grants ──────────
   app.post("/token", (req, res) => {
     const body = req.body || {};
+    console.log(`[OAUTH] POST /token grant_type=${body.grant_type} client_id=${body.client_id} (authCodes has ${authCodes.size} entries)`);
     if (body.grant_type === "authorization_code") {
       pruneExpired(authCodes);
       const entry = authCodes.get(String(body.code || ""));
-      if (!entry) return res.status(400).json({ error: "invalid_grant", error_description: "Unknown or expired code." });
+      if (!entry) {
+        console.log(`[OAUTH] /token REJECTED -- code not found (authCodes keys: ${JSON.stringify([...authCodes.keys()])})`);
+        return res.status(400).json({ error: "invalid_grant", error_description: "Unknown or expired code." });
+      }
       authCodes.delete(String(body.code)); // single-use
 
       if (entry.client_id !== String(body.client_id || "") || entry.redirect_uri !== String(body.redirect_uri || "")) {

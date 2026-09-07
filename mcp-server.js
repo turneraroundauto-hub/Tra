@@ -13,11 +13,15 @@
 // exact same blocked sandbox), so this is a real, working path to close
 // that gap -- not a speculative one.
 //
-// Deliberately narrow for this first pass: three read-only, already-free
-// tools. No /analyze here -- that spends a real credit and needs a real
-// signed-in session/tier credential decision this project's own history
-// has learned not to make without asking first. Add it deliberately
-// later, not as a side effect of shipping this.
+// Three read-only, already-free tools (get_market/get_ticker/
+// check_agitator), plus one credit-spending tool (analyze) added in a
+// follow-up commit once a real credential decision was made: rather
+// than reuse the real PRO_KEY (shared with any real paying tier-key
+// traffic) or fabricate a Supabase Auth session, /analyze rides a new,
+// dedicated MCP_AGENT_KEY credential (server.js's own PATH 1.5) that
+// resolves to a fixed pro-tier request with its own dedicated,
+// separately-provisioned credits/tier row -- never touching any real
+// user's balance.
 //
 // /mcp is NOT added to server.js's own auth-bypass allowlist -- it goes
 // through the exact same global secret/token middleware every other
@@ -78,6 +82,73 @@ function buildInternalUrl(port, path, credential) {
   return `${url.toString()}${sep}${encodeURIComponent(credential.param)}=${encodeURIComponent(credential.value)}`;
 }
 
+// analyze() is a real, credit-spending call and needs a full Gate 0-5
+// request body assembled from two upstream reads first -- /market (for
+// sectorContext, the same shape every tier's own analyzeOne() builds:
+// each tracked proxy's .change string plus gateStatus/gateNote/
+// btcSignal) and /ticker/:symbol (for metrics/news/openingBar/
+// proxyRule/gate1/preGate/weeklyCarryover/regime). Mirrors
+// starter/app.ts's real analyzeOne() body assembly line for line --
+// not reinvented -- since this app's own history (the Aug 13, 2026
+// Gate 5 bug) is a direct lesson in how easily a re-derived version of
+// this exact wiring goes subtly wrong.
+async function fetchJson(url) {
+  const res = await fetch(url);
+  const data = await res.json().catch(() => ({ error: "non-JSON response", status: res.status }));
+  return { ok: res.ok, status: res.status, data };
+}
+
+function buildSectorContext(market) {
+  const chg = (k) => (market && market[k] ? market[k].change : "?");
+  return {
+    spy: chg("spy"), qqq: chg("qqq"), btc: chg("btc"), iwm: chg("iwm"),
+    soxx: chg("soxx"), xbi: chg("xbi"), ibb: chg("ibb"), gld: chg("gld"),
+    uso: chg("uso"), tsm: chg("tsm"), msft: chg("msft"),
+    gateStatus: (market && market.gateStatus) || "GREEN",
+    gateNote: (market && market.gateNote) || "",
+    btcSignal: (market && market.btcSignal) || "neutral",
+  };
+}
+
+async function runAnalyze(port, credential, ticker) {
+  const symbol = String(ticker || "").toUpperCase();
+  const marketUrl = buildInternalUrl(port, "/market", credential);
+  const tickerUrl = buildInternalUrl(port, `/ticker/${encodeURIComponent(symbol)}`, credential);
+
+  const [marketRes, tickerRes] = await Promise.all([fetchJson(marketUrl), fetchJson(tickerUrl)]);
+  if (!tickerRes.ok) {
+    return { error: true, step: "ticker", status: tickerRes.status, ...tickerRes.data };
+  }
+  const td = tickerRes.data || {};
+  const market = marketRes.ok ? marketRes.data : null;
+
+  const body = {
+    ticker: symbol,
+    sectorContext: buildSectorContext(market),
+    marketContext: "",
+    metricsData: td.metrics || null,
+    newsData: td.news || null,
+    openingBarData: td.openingBar || null,
+    proxyRule: td.proxyRule || null,
+    gate1Data: td.gate1 || null,
+    preGateData: td.preGate || null,
+    weeklyCarryoverData: td.weeklyCarryover || null,
+    regimeData: td.regime || null,
+    dialPosition: "NEUTRAL",
+    holdThroughEarnings: false,
+  };
+
+  const analyzeUrl = buildInternalUrl(port, "/analyze", credential);
+  const res = await fetch(analyzeUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({ error: "non-JSON response", status: res.status }));
+  if (!res.ok) return { error: true, step: "analyze", status: res.status, ...data };
+  return data;
+}
+
 function getServer(req, port) {
   const server = new McpServer({ name: "trade-tribunal-mcp", version: "1.0.0" });
   const credential = callerCredentialFrom(req);
@@ -101,6 +172,24 @@ function getServer(req, port) {
       },
     );
   }
+
+  server.registerTool(
+    "analyze",
+    {
+      description: "Run a real Trade Tribunal Catalyst Response Framework analysis (Pre-Gate + Gates 0-5, verdict, sizing, confidence, wait_for) for one ticker via /analyze, and return the full breakdown. Spends a real credit against whichever credential this MCP connection authenticated with -- not free like the other 3 tools.",
+      inputSchema: { ticker: z.string().describe("Ticker symbol to analyze, e.g. AAPL") },
+    },
+    async (args) => {
+      try {
+        const result = await runAnalyze(port, credential, args && args.ticker);
+        const isError = !!(result && result.error);
+        return { content: [{ type: "text", text: JSON.stringify(result) }], isError };
+      } catch (e) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: true, message: e.message }) }], isError: true };
+      }
+    },
+  );
+
   return server;
 }
 

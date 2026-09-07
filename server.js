@@ -17,6 +17,8 @@ const gx        = require("./gates-extended");
 const ah        = require("./analyze-helpers");
 const { createClient } = require("@supabase/supabase-js");
 const kg = require("./neo4j-graph");
+const mcpServer = require("./mcp-server");
+const oauth = require("./oauth-server");
 
 // ── SUPABASE CLIENT ───────────────────────────────────────────────
 // This is the ONLY client that should ever be used for service_role-
@@ -258,6 +260,10 @@ app.use("/stripe/webhook", express.raw({ type: "application/json" }));
 app.use("/stripe/credits", express.raw({ type: "application/json" }));
 
 app.use(express.json());
+// The OAuth shim's /authorize approval form and /token grant requests
+// use the standard application/x-www-form-urlencoded body (RFC 6749) --
+// this no-ops for every other route, which sends/expects JSON.
+app.use(express.urlencoded({ extended: true }));
 
 // ─── SECRET TOKEN ─────────────────────────────────────────────────
 // ── MULTI-TIER AUTH MIDDLEWARE ────────────────────────────────────
@@ -285,6 +291,19 @@ const TIER_KEYS = {
 const MCP_AGENT_KEY = process.env.MCP_AGENT_KEY;
 const MCP_AGENT_CREDITS_KEY = "mcp:agent";
 
+// OAuth discovery/registration/authorization endpoints are, by spec,
+// always reachable without the app's own secret/token -- they ARE the
+// gate (see oauth-server.js's own comment on how /authorize still
+// requires the real MCP_AGENT_KEY before issuing anything).
+const OAUTH_PUBLIC_PATHS = new Set([
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-protected-resource/mcp",
+  "/register",
+  "/authorize",
+  "/token",
+]);
+
 app.use(async (req, res, next) => {
   if (req.path === "/") return next();
   if (req.path === "/auth/login") return next();
@@ -293,9 +312,11 @@ app.use(async (req, res, next) => {
   if (req.path === "/auth/reset-confirm") return next();
   if (req.path === "/stripe/webhook") return next();
   if (req.path === "/stripe/credits") return next();
+  if (OAUTH_PUBLIC_PATHS.has(req.path)) return next();
 
   const provided  = req.query.secret || req.headers["x-app-secret"];
   const authToken = req.query.supabase_token || req.headers["x-supabase-token"];
+  const bearer    = (req.headers["authorization"] || "").match(/^Bearer\s+(.+)$/i)?.[1];
 
   // ── PATH 1: Supabase token (authenticated users) ──────────────
   if (authToken) {
@@ -310,7 +331,16 @@ app.use(async (req, res, next) => {
   }
 
   // ── PATH 1.5: dedicated MCP-agent credential (fixed pro tier) ──
+  // Either the raw shared secret (query/header, same as every other
+  // tier's own access pattern) or a bearer token minted by the OAuth
+  // shim above after that same secret was verified once at /authorize.
   if (provided && MCP_AGENT_KEY && provided === MCP_AGENT_KEY) {
+    req.userTier   = "pro";
+    req.userKey    = MCP_AGENT_CREDITS_KEY;
+    req.tierConfig = credits.TIERS.pro;
+    return next();
+  }
+  if (bearer && oauth.validateAccessToken(bearer)) {
     req.userTier   = "pro";
     req.userKey    = MCP_AGENT_CREDITS_KEY;
     req.tierConfig = credits.TIERS.pro;
@@ -5979,7 +6009,8 @@ setInterval(async () => {
 
 // ─── START ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-require("./mcp-server").mountMcpRoutes(app, PORT);
+mcpServer.mountMcpRoutes(app, PORT);
+oauth.mountOAuthRoutes(app);
 credits.loadCredits(); // no-op with Supabase backend
 app.listen(PORT, async () => {
   console.log(`Trade Tribunal API v4.0.0 on port ${PORT}`);

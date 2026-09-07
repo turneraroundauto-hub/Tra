@@ -103,21 +103,23 @@ function mountOAuthRoutes(app) {
     });
   });
 
-  // ── RFC 9728: Protected Resource Metadata (for /mcp itself) ──────
-  app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  // ── RFC 9728: Protected Resource Metadata ────────────────────────
+  // /mcp2 is a second mount of the identical MCP server (see
+  // mcp-server.js's own comment) -- exists purely because claude.ai's
+  // custom-connector UI got a stuck, unremovable entry pointed at /mcp
+  // before this OAuth shim existed, and enforces one connector per URL
+  // with no edit/delete path out of that state. Both resources get their
+  // own metadata document so discovery works correctly against either.
+  const protectedResourceHandler = (resourcePath) => (req, res) => {
     const issuer = issuerFrom(req);
     res.json({
-      resource: `${issuer}/mcp`,
+      resource: `${issuer}${resourcePath}`,
       authorization_servers: [issuer],
     });
-  });
-  app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
-    const issuer = issuerFrom(req);
-    res.json({
-      resource: `${issuer}/mcp`,
-      authorization_servers: [issuer],
-    });
-  });
+  };
+  app.get("/.well-known/oauth-protected-resource", protectedResourceHandler("/mcp"));
+  app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceHandler("/mcp"));
+  app.get("/.well-known/oauth-protected-resource/mcp2", protectedResourceHandler("/mcp2"));
 
   // ── RFC 7591: Dynamic Client Registration ────────────────────────
   app.post("/register", (req, res) => {

@@ -299,6 +299,7 @@ const OAUTH_PUBLIC_PATHS = new Set([
   "/.well-known/oauth-authorization-server",
   "/.well-known/oauth-protected-resource",
   "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-protected-resource/mcp2",
   "/register",
   "/authorize",
   "/token",

@@ -193,8 +193,8 @@ function getServer(req, port) {
   return server;
 }
 
-function mountMcpRoutes(app, port) {
-  app.post("/mcp", async (req, res) => {
+function mountMcpAt(app, port, path) {
+  app.post(path, async (req, res) => {
     const server = getServer(req, port);
     try {
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -212,13 +212,26 @@ function mountMcpRoutes(app, port) {
     }
   });
 
-  app.get("/mcp", (req, res) => {
+  app.get(path, (req, res) => {
     res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
   });
 
-  app.delete("/mcp", (req, res) => {
+  app.delete(path, (req, res) => {
     res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
   });
+}
+
+// /mcp itself has a stuck, unremovable/unrecoverable claude.ai custom-
+// connector entry from before the OAuth shim existed (see oauth-server.js's
+// own history) -- claude.ai enforces one connector per URL and gives no
+// way to edit or delete that entry, so a second /mcp2 mount, byte-
+// identical in every other respect, is what actually lets a real, working
+// connector get created without fighting that stuck entry at all. Keep
+// /mcp mounted too (still a real, working endpoint on its own) in case
+// the stuck entry ever gets cleared/fixed on claude.ai's side later.
+function mountMcpRoutes(app, port) {
+  mountMcpAt(app, port, "/mcp");
+  mountMcpAt(app, port, "/mcp2");
 }
 
 module.exports = { mountMcpRoutes };

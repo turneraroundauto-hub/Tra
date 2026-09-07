@@ -66,20 +66,34 @@ const READ_ONLY_TOOLS = [
   },
 ];
 
-// Mirrors the exact same PATH 1 / PATH 2 precedence the app-wide auth
-// middleware in server.js already uses -- whichever credential got THIS
-// /mcp request past that middleware is what every tool call forwards.
+// Mirrors the exact same PATH 1 / PATH 1.5 / PATH 2 precedence the
+// app-wide auth middleware in server.js already uses -- whichever
+// credential got THIS /mcp request past that middleware is what every
+// tool call forwards internally. Bearer is checked first since that's
+// what the OAuth shim's minted access tokens arrive as (see
+// oauth-server.js) -- a real, previously-missed gap: this function only
+// ever recognized the query/header forms, so an OAuth-connected caller's
+// every tool call silently forwarded an EMPTY credential internally and
+// 401'd, even though the /mcp request itself was correctly authenticated.
 function callerCredentialFrom(req) {
+  const authHeader = req.headers["authorization"];
+  const bearerMatch = typeof authHeader === "string" && authHeader.match(/^Bearer\s+(.+)$/i);
+  if (bearerMatch) return { kind: "bearer", token: bearerMatch[1] };
   const supabaseToken = req.query.supabase_token || req.headers["x-supabase-token"];
-  if (supabaseToken) return { param: "supabase_token", value: String(supabaseToken) };
+  if (supabaseToken) return { kind: "query", param: "supabase_token", value: String(supabaseToken) };
   const secret = req.query.secret || req.headers["x-app-secret"];
-  return { param: "secret", value: String(secret || "") };
+  return { kind: "query", param: "secret", value: String(secret || "") };
 }
 
 function buildInternalUrl(port, path, credential) {
   const url = new URL(path, `http://127.0.0.1:${port}`);
+  if (credential.kind !== "query") return url.toString();
   const sep = url.search ? "&" : "?";
   return `${url.toString()}${sep}${encodeURIComponent(credential.param)}=${encodeURIComponent(credential.value)}`;
+}
+
+function credentialHeaders(credential) {
+  return credential.kind === "bearer" ? { authorization: `Bearer ${credential.token}` } : {};
 }
 
 // analyze() is a real, credit-spending call and needs a full Gate 0-5
@@ -92,8 +106,8 @@ function buildInternalUrl(port, path, credential) {
 // not reinvented -- since this app's own history (the Aug 13, 2026
 // Gate 5 bug) is a direct lesson in how easily a re-derived version of
 // this exact wiring goes subtly wrong.
-async function fetchJson(url) {
-  const res = await fetch(url);
+async function fetchJson(url, headers) {
+  const res = await fetch(url, { headers });
   const data = await res.json().catch(() => ({ error: "non-JSON response", status: res.status }));
   return { ok: res.ok, status: res.status, data };
 }
@@ -114,8 +128,9 @@ async function runAnalyze(port, credential, ticker) {
   const symbol = String(ticker || "").toUpperCase();
   const marketUrl = buildInternalUrl(port, "/market", credential);
   const tickerUrl = buildInternalUrl(port, `/ticker/${encodeURIComponent(symbol)}`, credential);
+  const authHeaders = credentialHeaders(credential);
 
-  const [marketRes, tickerRes] = await Promise.all([fetchJson(marketUrl), fetchJson(tickerUrl)]);
+  const [marketRes, tickerRes] = await Promise.all([fetchJson(marketUrl, authHeaders), fetchJson(tickerUrl, authHeaders)]);
   if (!tickerRes.ok) {
     return { error: true, step: "ticker", status: tickerRes.status, ...tickerRes.data };
   }
@@ -141,7 +156,7 @@ async function runAnalyze(port, credential, ticker) {
   const analyzeUrl = buildInternalUrl(port, "/analyze", credential);
   const res = await fetch(analyzeUrl, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...authHeaders },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({ error: "non-JSON response", status: res.status }));
@@ -160,7 +175,7 @@ function getServer(req, port) {
       async (args) => {
         const url = buildInternalUrl(port, tool.path(args || {}), credential);
         try {
-          const res = await fetch(url);
+          const res = await fetch(url, { headers: credentialHeaders(credential) });
           const data = await res.json().catch(() => ({ error: "non-JSON response", status: res.status }));
           if (!res.ok) {
             return { content: [{ type: "text", text: JSON.stringify({ error: true, status: res.status, ...data }) }], isError: true };

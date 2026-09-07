@@ -40,11 +40,40 @@ const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
 // full-weight exception; single-RED-among-2/3/4 sizing exception).
 const CRF_VERSION = "2026-08-22";
 
-// Fixed default until Proposal 6 (Aggression Dial) ships its own dial
-// position -- the Dial's neutral position is documented as "= current CRF
-// behavior unchanged," so 3 trading days is this app's own de facto
-// holding-period assumption today, not a new invented number.
-const DEFAULT_GRADING_WINDOW_TRADING_DAYS = 3;
+// Grading windows -- redesigned Sep 7, 2026 from a single 3-trading-day
+// check, direct feedback: this app's own verdicts are scoped for opening-
+// drive/intraday decisions, so a single lagging multi-day check is both
+// too slow to say anything about the near-term call AND, on its own,
+// too thin to say anything about whether the read held up past the very
+// next session either. Two independent checks now run per verdict:
+//   - PRIMARY: a fixed 24 REAL (calendar) hours after issue -- catches
+//     the fast, intraday-relevant read this app is actually built to
+//     make, regardless of trading-day boundaries. Feeds directionalPct
+//     on its own, same "fast, low-bar accuracy read" role the single
+//     check used to fill.
+//   - SECONDARY: a fixed 5 TRADING days later. Deliberately NOT branched
+//     by day-of-week -- 5 trading days from ANY issue day lands on the
+//     same weekday the following week (Mon->Mon, Fri->Fri; a trading
+//     week is always 5 sessions, so adding 5 always crosses exactly one
+//     weekend once, regardless of start day), so it already represents a
+//     consistent ~7 real calendar days of elapsed time no matter which
+//     day of the week a verdict issues on -- confirmed by direct
+//     calculation before implementing, not assumed. Feeds strictPct
+//     ONLY, and only once BOTH checks are in (see computeAccuracyStats)
+//     -- direct instruction: the long check validates/tightens the
+//     strict score rather than being surfaced as a separate UI number.
+// Existing verdict_log rows logged before this shipped never get a
+// secondary window backfilled (no grade_due_at_secondary was ever
+// computed for them) -- deliberate, not an oversight: they keep
+// contributing to directionalPct exactly as before, they just never
+// enter the strict pool, which only ever counts rows that have a real
+// secondary grade.
+const PRIMARY_GRADING_WINDOW_HOURS = 24;
+const SECONDARY_GRADING_WINDOW_TRADING_DAYS = 5;
+
+function addHours(date, hours) {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000);
+}
 
 function addTradingDays(date, n) {
   const d = new Date(date.getTime());
@@ -3426,7 +3455,8 @@ async function logVerdict(fields) {
   if (!supabase) return;
   try {
     const issuedAt = new Date();
-    const dueAt = addTradingDays(issuedAt, fields.gradingWindowDays);
+    const dueAtPrimary = addHours(issuedAt, PRIMARY_GRADING_WINDOW_HOURS);
+    const dueAtSecondary = addTradingDays(issuedAt, SECONDARY_GRADING_WINDOW_TRADING_DAYS);
     await supabase.from("verdict_log").insert({
       ticker:                    fields.ticker,
       issued_at:                 issuedAt.toISOString(),
@@ -3439,8 +3469,16 @@ async function logVerdict(fields) {
       gate0_read:                fields.gate0Read || null,
       gate2_corroboration_state: fields.gate2CorroborationState || null,
       dial_position:             fields.dialPosition || null,
-      grading_window_days:       fields.gradingWindowDays,
-      grade_due_at:              dueAt.toISOString(),
+      // Informational only as of Sep 7, 2026 -- the primary due date is
+      // now computed from PRIMARY_GRADING_WINDOW_HOURS (a fixed 24h),
+      // not this column. Kept populated (as "1", the nearest whole-day
+      // equivalent) purely so this column still reads sensibly next to
+      // pre-redesign rows that recorded a real trading-day count under
+      // the old single-check rule; nothing reads it back for any live
+      // computation.
+      grading_window_days:       1,
+      grade_due_at:              dueAtPrimary.toISOString(),
+      grade_due_at_secondary:    dueAtSecondary.toISOString(),
       user_email:                fields.userEmail || null,
       tier:                      fields.tier,
     });
@@ -3508,50 +3546,64 @@ function classifyVerdictReturn(verdict, r) {
   return "FALSE";
 }
 
-// Runs every 30 minutes, grades any verdict_log row whose grade_due_at has
-// passed. Same "poll on an interval, no external cron infra" shape as the
-// Market-Open Cache Warm below -- this app's only other recurring
-// scheduled job, and (per Proposal 7's own plan) the "quarterly proxy
-// recompute" this was originally supposed to match is actually a lazy
-// on-request staleness check, not a real cron -- that pattern doesn't fit
-// a sweep across every user's due rows, so this reuses the interval
-// pattern instead. Batched (50 rows/tick) so a large backlog can't fire an
-// unbounded burst of Finnhub calls in one tick -- fetchQuote() already
-// rides the shared finnhubThrottle() queue regardless.
+// Runs every 30 minutes, grades any verdict_log row whose primary or
+// secondary due date has passed (see the grading-windows comment above
+// addTradingDays for what each one means and why). Same "poll on an
+// interval, no external cron infra" shape as the Market-Open Cache Warm
+// below -- this app's only other recurring scheduled job, and (per
+// Proposal 7's own plan) the "quarterly proxy recompute" this was
+// originally supposed to match is actually a lazy on-request staleness
+// check, not a real cron -- that pattern doesn't fit a sweep across every
+// user's due rows, so this reuses the interval pattern instead. Batched
+// (50 rows/tick, per window) so a large backlog can't fire an unbounded
+// burst of Finnhub calls in one tick -- fetchQuote() already rides the
+// shared finnhubThrottle() queue regardless.
 const GRADING_BATCH_SIZE = 50;
+// One shared grader for both windows -- the primary (grade/actual_return_pct/
+// graded_at) and secondary (grade_secondary/actual_return_pct_secondary/
+// graded_at_secondary) columns are structurally identical, just named
+// differently, so this takes the three column names as parameters rather
+// than duplicating the whole loop body per window.
+async function gradeDueRows(dueColumn, gradeColumn, returnColumn, gradedAtColumn) {
+  const nowIso = new Date().toISOString();
+  const { data: due, error } = await supabase
+    .from("verdict_log")
+    .select("id, ticker, verdict, issued_price")
+    .is(gradedAtColumn, null)
+    .lte(dueColumn, nowIso)
+    .limit(GRADING_BATCH_SIZE);
+  if (error) { console.error(`runVerdictGradingSweep query (${dueColumn}):`, error.message); return 0; }
+  if (!due || !due.length) return 0;
+
+  for (const row of due) {
+    if (row.issued_price == null) {
+      // No entry price captured (e.g. logged before this column existed,
+      // or metricsData.price was missing) -- can't compute a real return.
+      // Mark graded with no grade rather than re-querying it forever.
+      await supabase.from("verdict_log").update({ [gradedAtColumn]: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const quote = await fetchQuote(row.ticker);
+    if (!quote) continue; // fail-safe: leave ungraded, retry next sweep
+    const actualPrice = parseFloat(quote.price);
+    const r = (actualPrice - row.issued_price) / row.issued_price * 100;
+    const grade = classifyVerdictReturn(row.verdict, r);
+    await supabase.from("verdict_log").update({
+      [returnColumn]: r,
+      [gradeColumn]: grade,
+      [gradedAtColumn]: new Date().toISOString(),
+    }).eq("id", row.id);
+  }
+  return due.length;
+}
 async function runVerdictGradingSweep() {
   if (!supabase) return;
   try {
-    const nowIso = new Date().toISOString();
-    const { data: due, error } = await supabase
-      .from("verdict_log")
-      .select("id, ticker, verdict, issued_price")
-      .is("graded_at", null)
-      .lte("grade_due_at", nowIso)
-      .limit(GRADING_BATCH_SIZE);
-    if (error) { console.error("runVerdictGradingSweep query:", error.message); return; }
-    if (!due || !due.length) return;
-
-    for (const row of due) {
-      if (row.issued_price == null) {
-        // No entry price captured (e.g. logged before this column existed,
-        // or metricsData.price was missing) -- can't compute a real return.
-        // Mark graded with no grade rather than re-querying it forever.
-        await supabase.from("verdict_log").update({ graded_at: new Date().toISOString() }).eq("id", row.id);
-        continue;
-      }
-      const quote = await fetchQuote(row.ticker);
-      if (!quote) continue; // fail-safe: leave ungraded, retry next sweep
-      const actualPrice = parseFloat(quote.price);
-      const r = (actualPrice - row.issued_price) / row.issued_price * 100;
-      const grade = classifyVerdictReturn(row.verdict, r);
-      await supabase.from("verdict_log").update({
-        actual_return_pct: r,
-        grade,
-        graded_at: new Date().toISOString(),
-      }).eq("id", row.id);
+    const primaryCount = await gradeDueRows("grade_due_at", "grade", "actual_return_pct", "graded_at");
+    const secondaryCount = await gradeDueRows("grade_due_at_secondary", "grade_secondary", "actual_return_pct_secondary", "graded_at_secondary");
+    if (primaryCount || secondaryCount) {
+      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary row(s) processed.`);
     }
-    console.log(`Verdict grading sweep: ${due.length} row(s) processed.`);
   } catch (e) {
     console.error("runVerdictGradingSweep:", e.message);
   }
@@ -4463,14 +4515,26 @@ const SCORECARD_MIN_GRADED = 20;
 // same reasoning as SCORECARD_MIN_GRADED itself, just scaled to the
 // smaller sample size this narrower breakdown actually sees.
 const SCORECARD_TICKER_MIN_GRADED = 5;
+// Strict now requires BOTH the fast (24h, primary) and the longer
+// (5-trading-day, secondary) checks to agree the verdict held up --
+// direct instruction (Sep 7, 2026): the long check validates/tightens the
+// strict score rather than being surfaced as its own separate UI number.
+// Rows with no secondary grade yet (freshly issued, still short of its
+// due date, or logged before this two-window redesign shipped and so
+// never got a secondary due date at all) simply aren't counted in the
+// strict denominator either -- directionalPct is completely unaffected
+// by this and keeps using every primary-graded row immediately, same
+// "fast, low-bar accuracy read" role the single check used to fill.
 function computeAccuracyStats(rows) {
   const total = rows.length;
   if (!total) return { gradedCount: 0, strictPct: null, directionalPct: null };
   const trueCount     = rows.filter(r => r.grade === "TRUE").length;
   const marginalCount = rows.filter(r => r.grade === "MARGINAL").length;
+  const secondaryGraded = rows.filter(r => r.grade_secondary != null);
+  const strictTrueCount = secondaryGraded.filter(r => r.grade === "TRUE" && r.grade_secondary === "TRUE").length;
   return {
     gradedCount:    total,
-    strictPct:      +(trueCount / total * 100).toFixed(1),
+    strictPct:      secondaryGraded.length ? +(strictTrueCount / secondaryGraded.length * 100).toFixed(1) : null,
     directionalPct: +((trueCount + marginalCount) / total * 100).toFixed(1),
   };
 }
@@ -4504,7 +4568,7 @@ app.get("/scorecard", async (req, res) => {
     const email = req.userEmail.trim().toLowerCase();
     const { data, error } = await supabase
       .from("verdict_log")
-      .select("grade, ticker, pre_gate_state, gate1_branch, gate0_read, gate2_corroboration_state")
+      .select("grade, grade_secondary, ticker, pre_gate_state, gate1_branch, gate0_read, gate2_corroboration_state")
       .eq("user_email", email).not("graded_at", "is", null);
     if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
     const rows  = data || [];
@@ -5516,7 +5580,6 @@ Return only JSON.
         gate0Read: gate0Reported,
         gate2CorroborationState: `${contextCorroboration.corroborated ? "GATE2-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/2)`,
         dialPosition: req.tierConfig?.dial ? effectiveDialPosition : null,
-        gradingWindowDays: DEFAULT_GRADING_WINDOW_TRADING_DAYS,
         userEmail: req.userEmail, tier: req.userTier,
       });
       res.json(result);

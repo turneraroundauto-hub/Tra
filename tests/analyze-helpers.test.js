@@ -102,6 +102,38 @@ test('applyProxyFitCeiling', async (t) => {
   });
 });
 
+// ── applyHistoricalAccuracyCeiling — Sep 14, 2026, the same-direction
+// historical-accuracy confidence clamp. The real motivating case: ALAB's
+// own pooled UP-verdict history is 0/8 graded TRUE -- a 0% same-direction
+// accuracy that a direction-agnostic average would never surface. ──────
+test('applyHistoricalAccuracyCeiling', async (t) => {
+  await t.test('the real ALAB shape: 0% same-direction accuracy downgrades HIGH to MEDIUM', () => {
+    assert.equal(ah.applyHistoricalAccuracyCeiling('HIGH', 0), 'MEDIUM');
+  });
+
+  await t.test('a solid same-direction track record leaves HIGH untouched', () => {
+    assert.equal(ah.applyHistoricalAccuracyCeiling('HIGH', 65), 'HIGH');
+  });
+
+  await t.test('exact floor boundary is not "below" it -- stays HIGH', () => {
+    assert.equal(ah.applyHistoricalAccuracyCeiling('HIGH', ah.HISTORICAL_ACCURACY_FLOOR_PCT), 'HIGH');
+  });
+
+  await t.test('just under the floor downgrades', () => {
+    assert.equal(ah.applyHistoricalAccuracyCeiling('HIGH', ah.HISTORICAL_ACCURACY_FLOOR_PCT - 1), 'MEDIUM');
+  });
+
+  await t.test('insufficient graded history (null) leaves HIGH untouched -- never penalize a lack of data', () => {
+    assert.equal(ah.applyHistoricalAccuracyCeiling('HIGH', null), 'HIGH');
+    assert.equal(ah.applyHistoricalAccuracyCeiling('HIGH', undefined), 'HIGH');
+  });
+
+  await t.test('never upgrades or downgrades MEDIUM or LOW, regardless of same-direction accuracy', () => {
+    assert.equal(ah.applyHistoricalAccuracyCeiling('MEDIUM', 0), 'MEDIUM');
+    assert.equal(ah.applyHistoricalAccuracyCeiling('LOW', 0), 'LOW');
+  });
+});
+
 // ── normalizeMarketReading — the exact shape mismatch behind the Aug 13 bug ──
 test('normalizeMarketReading', async (t) => {
   await t.test('parses the real wire-format string shape sectorContext actually sends', () => {

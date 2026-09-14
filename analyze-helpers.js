@@ -69,6 +69,36 @@ function applyProxyFitCeiling(confidence, proxyFit) {
         return 'MEDIUM';
     return confidence;
 }
+// Historical-accuracy confidence ceiling (Sep 14, 2026). The proxy-fit
+// ceiling above catches a structurally weak proxy relationship; this
+// catches a different, real failure shape found the same way ALAB's own
+// was: a ticker whose pooled, cross-user grading history in THIS SAME
+// DIRECTION has been wrong most of the time, independent of how sound
+// today's trigger or proxy look on paper. Direction-specific on purpose
+// -- a ticker's overall accuracy can look fine while one direction is
+// consistently bad (exactly ALAB's shape: 0/8 real UP verdicts graded
+// TRUE), so this must be compared against the SAME direction as the
+// verdict being shipped, not a pooled average across both.
+// Confirmed via AskUserQuestion (Sep 14, 2026): confidence-cap only, same
+// one-step HIGH->MEDIUM shape as applyProxyFitCeiling -- deliberately
+// never touches sizing or the verdict direction itself. A stronger
+// intervention (capping sizing, or suppressing the verdict to FLAT) was
+// explicitly considered and rejected: forcing a ticker to FLAT whenever
+// its own history looks bad would create a "stopped clock" problem --
+// that ticker could never ship a real verdict in that direction again to
+// actually prove it's improved, since nothing would ever get graded
+// going forward. 40% is a reasonable-but-arbitrary floor (meaningfully
+// worse than a coin flip, not just "any miss"), same calibration posture
+// as PROXY_FIT_FLOOR and every other threshold in this file seeded from
+// judgment rather than a data fit -- revisit once enough real
+// same-direction grades accumulate per ticker to check whether 40 is
+// picking up real signal or just noise at small sample sizes.
+const HISTORICAL_ACCURACY_FLOOR_PCT = 40;
+function applyHistoricalAccuracyCeiling(confidence, sameDirectionPct) {
+    if (confidence === 'HIGH' && typeof sameDirectionPct === 'number' && sameDirectionPct < HISTORICAL_ACCURACY_FLOOR_PCT)
+        return 'MEDIUM';
+    return confidence;
+}
 // Normalizes a marketData[symbol] entry into {pct, change}. Handles both
 // shapes actually seen in this codebase: a real {price,change,pct,direction}
 // object (the server's own internal marketCache) and a bare "+1.23%"/
@@ -127,8 +157,10 @@ module.exports = {
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
     PROXY_FIT_FLOOR: PROXY_FIT_FLOOR,
+    HISTORICAL_ACCURACY_FLOOR_PCT: HISTORICAL_ACCURACY_FLOOR_PCT,
     priceConfirmedConfidence: priceConfirmedConfidence,
     applyProxyFitCeiling: applyProxyFitCeiling,
+    applyHistoricalAccuracyCeiling: applyHistoricalAccuracyCeiling,
     normalizeMarketReading: normalizeMarketReading,
     evaluateProxyStatus: evaluateProxyStatus,
 };

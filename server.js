@@ -4750,6 +4750,70 @@ function computeExpectancyStats(rows) {
     winRatePct:            +(winCount / sized.length * 100).toFixed(1),
   };
 }
+
+// Direct follow-up ask (Sep 13, 2026): "it would be helpful to know up and
+// down accuracy and the top 5 tickers the app has been most accurate with
+// (across all users)." A UP/DOWN split answers a real, different question
+// from the aggregate directionalPct above -- this session's own pooled
+// query (verdict_log, 360 graded rows) found UP verdicts alone at 34.4%
+// against DOWN's 65.5%, a gap the single blended number completely hides.
+// Both this and the top-tickers list below are pooled across EVERY user
+// and EVERY tier (not scoped to the requesting user, or to Free's own
+// tier-filtered aggregate stat above) -- "across all users" as asked,
+// matching the real numbers already reported this session. Deliberately a
+// narrow, curated addition -- NOT a reopening of the Sep 2/Sep 13
+// per-ticker-breakdown removals above. Those removed a wall of mostly-
+// "insufficientData" rows for every ticker in one user's own watchlist; a
+// direction split (2 numbers) and a top-5 pooled list are both small,
+// always-interesting summaries, not the noisy per-user enumeration that
+// got pulled.
+//
+// Both derive from one shared, cached pool fetch (1h TTL, same reasoning
+// as historicalReactionCache -- the 30-min grading sweep is the only thing
+// that can change either, so anything shorter is pure waste) rather than
+// two separate Supabase round trips for what's fundamentally the same
+// underlying data.
+let scorecardPoolCache = { data: null, time: 0 };
+const SCORECARD_POOL_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+async function fetchScorecardPool() {
+  if (scorecardPoolCache.data && Date.now() - scorecardPoolCache.time < SCORECARD_POOL_CACHE_MAX_AGE_MS) {
+    return scorecardPoolCache.data;
+  }
+  const { data, error } = await supabase
+    .from("verdict_log").select("ticker, grade, verdict").not("graded_at", "is", null);
+  if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
+  scorecardPoolCache = { data: data || [], time: Date.now() };
+  return scorecardPoolCache.data;
+}
+function computeDirectionBreakdown(rows) {
+  const build = (verdict) => {
+    const stats = tickerStatsWithFloor(rows.filter(r => r.verdict === verdict), SCORECARD_TICKER_MIN_GRADED);
+    return stats.insufficientData
+      ? { gradedCount: stats.gradedCount, insufficientData: true }
+      : { directionalPct: stats.directionalPct, gradedCount: stats.gradedCount };
+  };
+  return { up: build("UP"), down: build("DOWN") };
+}
+async function computeTopTickers(limit) {
+  const pool = await fetchScorecardPool();
+  const byTicker = new Map();
+  for (const r of pool) {
+    if (!byTicker.has(r.ticker)) byTicker.set(r.ticker, []);
+    byTicker.get(r.ticker).push(r);
+  }
+  const ranked = [];
+  for (const [ticker, tickerRows] of byTicker) {
+    const stats = tickerStatsWithFloor(tickerRows, SCORECARD_TICKER_MIN_GRADED);
+    if (!stats.insufficientData) ranked.push({ ticker, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount });
+  }
+  ranked.sort((a, b) => b.directionalPct - a.directionalPct || b.gradedCount - a.gradedCount);
+  return ranked.slice(0, limit);
+}
+async function computeDirectionBreakdownPooled() {
+  return computeDirectionBreakdown(await fetchScorecardPool());
+}
+const SCORECARD_TOP_TICKERS_LIMIT = 5;
+
 app.get("/scorecard", async (req, res) => {
   // Gated Pro-first (credits.js TIERS.<tier>.scorecard) -- flip the flag
   // per tier as this rolls out further, rather than branching on tier
@@ -4767,8 +4831,16 @@ app.get("/scorecard", async (req, res) => {
       if (error) { console.error("GET /scorecard (free):", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
       const stats = computeAccuracyStats(data || []);
       if (stats.gradedCount < SCORECARD_MIN_GRADED) return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
-      // Directional % only for Free, per Proposal 7's tier rollout table.
-      return res.json({ scope: "aggregate", directionalPct: stats.directionalPct, gradedCount: stats.gradedCount });
+      // Directional % is Free-tier-only, per Proposal 7's tier rollout
+      // table -- unchanged. The direction split/top-tickers list below are
+      // pooled across every user AND every tier (see the comment above
+      // computeTopTickers) -- not personal data, so there's no reason to
+      // withhold either from Free's own aggregate view.
+      return res.json({
+        scope: "aggregate", directionalPct: stats.directionalPct, gradedCount: stats.gradedCount,
+        directionBreakdown: await computeDirectionBreakdownPooled(),
+        topTickers: await computeTopTickers(SCORECARD_TOP_TICKERS_LIMIT),
+      });
     }
 
     if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
@@ -4786,6 +4858,10 @@ app.get("/scorecard", async (req, res) => {
     const result = {
       scope: "personal", strictPct: stats.strictPct, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount,
       expectancy: computeExpectancyStats(rows),
+      // Pooled across every user/tier, not this user's own rows -- see the
+      // comment above computeTopTickers for why.
+      directionBreakdown: await computeDirectionBreakdownPooled(),
+      topTickers: await computeTopTickers(SCORECARD_TOP_TICKERS_LIMIT),
     };
 
     // Per-ticker breakdown (personal/pool/graph-peers) removed Sep 2, 2026

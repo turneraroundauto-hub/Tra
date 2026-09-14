@@ -337,6 +337,44 @@ test('computeGate2Corroboration', async (t) => {
   });
 });
 
+// ── classifyTicker / PROXY_RULES — moved here Sep 13, 2026 so a standalone
+// script (the regime-prewarm sweep) can require the real classification
+// data without a second, hand-maintained copy of the ticker lists ────────
+test('classifyTicker', async (t) => {
+  await t.test('direct ticker match wins over keyword match', () => {
+    const r = gx.classifyTicker('ALAB', { finnhubIndustry: 'Semiconductors' });
+    assert.equal(r.category, 'AI/Semiconductor');
+    assert.deepEqual(r.proxy.symbols, ['TSM']);
+  });
+
+  await t.test('BDC/REIT/Income carries a QUARTER sizing ceiling at the category level', () => {
+    const arcc = gx.classifyTicker('ARCC', null);
+    assert.equal(arcc.category, 'BDC/REIT/Income');
+    assert.equal(arcc.sizingOverride, 'QUARTER');
+    // Not a hardcoded ticker fix -- any ticker resolving into this category
+    // via keyword match gets it too, with zero code change per ticker.
+    const stwd = gx.classifyTicker('STWD', { finnhubIndustry: 'REIT - Mortgage' });
+    assert.equal(stwd.category, 'BDC/REIT/Income');
+    assert.equal(stwd.sizingOverride, 'QUARTER');
+  });
+
+  await t.test('every other static category has no sizingOverride', () => {
+    assert.equal(gx.classifyTicker('ALAB', null).sizingOverride, undefined);
+    assert.equal(gx.classifyTicker('NU', null).sizingOverride, undefined);
+  });
+
+  await t.test('unknown ticker with no matching keyword falls to DEFAULT_PROXY', () => {
+    const r = gx.classifyTicker('ZZZQQQ', { finnhubIndustry: 'Widget Manufacturing' });
+    assert.equal(r, gx.DEFAULT_PROXY);
+    assert.equal(r.category, 'General');
+  });
+
+  await t.test('keyword match works with no ticker-list hit', () => {
+    const r = gx.classifyTicker('NOTALISTEDTICKER', { finnhubIndustry: 'Biopharmaceuticals' });
+    assert.equal(r.category, 'Biotech/Medical');
+  });
+});
+
 // ── dailyReturns / pearson — basic sanity on the two math helpers ───────
 test('dailyReturns / pearson', async (t) => {
   await t.test('dailyReturns computes session-over-session % change as a decimal', () => {

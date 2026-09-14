@@ -458,97 +458,16 @@ function carryoverDecayLabel() {
 // ─── SMART PROXY ALGORITHM ────────────────────────────────────────
 // Classifies any ticker into a proxy category using Finnhub sector data
 // Never returns N/A — every ticker gets a meaningful proxy
-
-const PROXY_RULES = [
-  {
-    category: "Biotech/Medical",
-    keywords: ["biotech","pharmaceutical","therapeutics","genomics","diagnostics",
-               "medical","healthcare","oncology","biopharma","clinical"],
-    tickers:  ["SMMT","VCYT","IMVT","ENVX","MRNA","PFE","BIIB","GILD","REGN","VRTX",
-               "BMRN","ALNY","SRPT","BLUE","EDIT","NTLA","BEAM","CRSP"],
-    proxy:    { name:"XBI (Biotech ETF)", symbols:["XBI","IBB"],
-                rationale:"Biotech/medical names move with XBI sector sentiment" },
-  },
-  {
-    category: "AI/Semiconductor",
-    keywords: ["semiconductor","chip","memory","artificial intelligence","gpu",
-               "fabless","foundry","electronic","integrated circuit"],
-    tickers:  ["MU","NVDA","AMD","ALAB","SMCI","AVGO","QCOM","INTC","MRVL","ON",
-               "IREN","CIFR","CORZ","WULF","BTDR","ARM","TSM","ASML","LRCX","KLAC"],
-    proxy:    { name:"TSM + KOSPI (Taiwan/Korea Semis)",
-                symbols:["TSM"],
-                rationale:"AI/semi names lag Taiwan (TSM) and Korean (Samsung/SK Hynix) by 1-3 sessions. TSM drop >3% = risk-off." },
-  },
-  {
-    category: "Software/Cloud",
-    keywords: ["software","cloud","saas","platform","enterprise","cybersecurity",
-               "application","data analytics","crm"],
-    tickers:  ["ORCL","MSFT","CRM","NOW","SNOW","DDOG","NET","CRWD","ZS","OKTA",
-               "MDB","GTLB","HUBS","BILL","VEEV"],
-    proxy:    { name:"MSFT (Cloud Canary)",
-                symbols:["MSFT"],
-                rationale:"MSFT is the institutional canary for enterprise software and cloud. MSFT weakness precedes software sector rotation by 2-5 sessions." },
-  },
-  {
-    category: "Fintech/Crypto",
-    keywords: ["fintech","payment","financial technology","cryptocurrency","digital asset",
-               "exchange","brokerage","neobank","digital bank"],
-    tickers:  ["HOOD","NU","SQ","COIN","PYPL","AFRM","UPST","LC","SOFI","DAVE",
-               "MARA","RIOT","CLSK","HUT","BTBT"],
-    proxy:    { name:"BTC + QQQ (Risk-On Signal)",
-                symbols:["BTC","QQQ"],
-                rationale:"Fintech/crypto names correlate directly with BTC momentum and QQQ risk-on sentiment." },
-  },
-  {
-    category: "Energy/Commodities",
-    keywords: ["energy","oil","gas","petroleum","mining","natural resources",
-               "pipeline","refining","coal","uranium","renewable"],
-    tickers:  ["ET","XOM","CVX","COP","OXY","SLB","HAL","DVN","FANG","APA",
-               "USO","GLD","SLV","NEM","GOLD","FCX","MP","UEC","CCJ"],
-    proxy:    { name:"USO + GLD (Commodity Complex)",
-                symbols:["USO","GLD"],
-                rationale:"Energy and commodity names track oil (USO) and gold (GLD) directly. Macro/geopolitical signals dominate." },
-  },
-  {
-    category: "Defense/Aerospace",
-    keywords: ["defense","aerospace","military","government","contractor","security"],
-    tickers:  ["LMT","RTX","NOC","GD","BA","HII","LDOS","SAIC","KTOS","AXON"],
-    proxy:    { name:"LMT (Defense Canary)",
-                symbols:["LMT"],
-                rationale:"LMT leads defense sector moves. Geopolitical escalation (LMT +2%) = long signal for all defense names." },
-  },
-  {
-    category: "BDC/REIT/Income",
-    keywords: ["business development","real estate","reit","income","dividend",
-               "mortgage","investment trust"],
-    tickers:  ["ARCC","MAIN","OBDC","GBDC","FS","IWM","O","AMT","PLD","EQIX"],
-    proxy:    { name:"IWM + SPY (Broad Market / Rate Sensitive)",
-                symbols:["IWM","SPY"],
-                rationale:"BDCs and REITs are rate-sensitive. IWM small-cap health and SPY broad market are the right barometers." },
-  },
-];
-
-const DEFAULT_PROXY = {
-  category: "General",
-  proxy: { name:"SPY + IWM (Broad Market Default)",
-           symbols:["SPY","IWM"],
-           rationale:"No sector-specific proxy identified. SPY and IWM broad market health is the appropriate Gate 5 barometer." },
-};
-
-function classifyTicker(symbol, sectorInfo) {
-  const sym  = symbol.toUpperCase();
-  const desc = (sectorInfo?.description || sectorInfo?.finnhubIndustry || "").toLowerCase();
-  const name = (sectorInfo?.name || "").toLowerCase();
-  const combined = `${desc} ${name}`;
-
-  for (const rule of PROXY_RULES) {
-    // Check direct ticker match first
-    if (rule.tickers.includes(sym)) return rule;
-    // Check keyword match in sector description
-    if (rule.keywords.some(kw => combined.includes(kw))) return rule;
-  }
-  return DEFAULT_PROXY;
-}
+//
+// Moved into gates-extended.ts (Sep 13, 2026) — same real PROXY_RULES/
+// DEFAULT_PROXY/classifyTicker, unchanged in content — so the standalone
+// regime-prewarm sweep below (runRegimePrewarmSweep) can require the real
+// classification data directly instead of a second, hand-maintained copy
+// of the ticker lists that could silently drift out of sync. These three
+// names are used throughout this file exactly as before, just via `gx.`.
+const PROXY_RULES   = gx.PROXY_RULES;
+const DEFAULT_PROXY = gx.DEFAULT_PROXY;
+const classifyTicker = gx.classifyTicker;
 
 // ─── PRE-GATE — THESIS INTEGRITY (Patch 3, Aug 1 2026) ─────────────
 // Runs BEFORE Gate 0. Screens for solvency, dilution, and guidance-cut risk
@@ -3513,6 +3432,23 @@ function checkAgitatorRateLimit(userKey) {
 const GATE5_CANDIDATE_SYMBOLS = ["SPY","QQQ","IWM","XBI","SOXX","TSM","MSFT","GLD","USO"];
 const GATE5_RECOMPUTE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // Step 5: quarterly
 
+// Candidate probation (Sep 13, 2026, direct follow-up to the same day's
+// proxy-fit generalization): "if a ticker breaks proxy there should be a
+// search for new placeholder that would need to earn sustainable
+// correlation." Before this, a freshly-found 'primary' candidate (a single
+// check clearing PROXY_PRIMARY_FLOOR) was trusted immediately --
+// forceDownAuthority:true, normal sizing -- off one snapshot. Now a fresh
+// 'primary' result is reported as the new tier: "candidate" (no forceDown
+// authority, QUARTER sizing) until the SAME symbol has cleared the primary
+// floor on this many CONSECUTIVE checks in a row -- any regression (a
+// different best candidate, or the same one dropping below the floor)
+// resets the streak. Re-checked weekly while on probation (matching the
+// regime table's own cadence) instead of the slower quarterly cadence a
+// promoted/trusted proxy settles into once it's actually earned that.
+const PROXY_CANDIDATE_REQUIRED_CONFIRMS = 2;
+const GATE5_CANDIDATE_RECHECK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // weekly while on probation
+function proxyCandidatePromoted(confirms) { return (confirms || 0) >= PROXY_CANDIDATE_REQUIRED_CONFIRMS; }
+
 // Step 5/6 persistence — see proxy_resolution table (Supabase DDL handed off
 // separately). Gracefully no-ops (always recompute, never cache) if Supabase
 // isn't configured or the table doesn't exist yet.
@@ -3526,7 +3462,8 @@ async function getCachedProxyResolution(symbol) {
       .maybeSingle();
     if (error || !data) return null;
     const ageMs = Date.now() - new Date(data.computed_at).getTime();
-    if (ageMs > GATE5_RECOMPUTE_MAX_AGE_MS) return null;
+    const maxAge = proxyCandidatePromoted(data.candidate_confirms) ? GATE5_RECOMPUTE_MAX_AGE_MS : GATE5_CANDIDATE_RECHECK_MAX_AGE_MS;
+    if (ageMs > maxAge) return null;
     return data;
   } catch (e) {
     console.error(`getCachedProxyResolution ${symbol}:`, e.message);
@@ -3534,19 +3471,36 @@ async function getCachedProxyResolution(symbol) {
   }
 }
 
+// Returns the row's candidate_confirms/candidate_since so the caller can
+// pass them straight into buildDynamicProxyRule() without a second read.
 async function saveProxyResolution(symbol, resolved, trigger) {
-  if (!supabase) return;
+  if (!supabase) return null;
+  const clearsPrimaryFloor = resolved.tier === "primary";
   try {
+    const { data: prior } = await supabase
+      .from("proxy_resolution").select("proxy_symbol, candidate_confirms, candidate_since")
+      .eq("ticker", symbol).maybeSingle();
+    let candidateConfirms = 0;
+    let candidateSince = null;
+    if (clearsPrimaryFloor) {
+      const sameCandidateAsBefore = prior && prior.proxy_symbol === resolved.proxy;
+      candidateConfirms = sameCandidateAsBefore ? (prior.candidate_confirms || 0) + 1 : 1;
+      candidateSince = sameCandidateAsBefore && prior.candidate_since ? prior.candidate_since : new Date().toISOString();
+    }
     await supabase.from("proxy_resolution").upsert({
-      ticker:        symbol,
-      tier:          resolved.tier,
-      proxy_symbol:  resolved.proxy || null,
-      correlation_r: resolved.r ?? null,
-      computed_at:   new Date().toISOString(),
-      trigger:       trigger || "quarterly",
+      ticker:             symbol,
+      tier:               resolved.tier,
+      proxy_symbol:       resolved.proxy || null,
+      correlation_r:      resolved.r ?? null,
+      computed_at:        new Date().toISOString(),
+      trigger:            trigger || "quarterly",
+      candidate_confirms: candidateConfirms,
+      candidate_since:    candidateSince,
     }, { onConflict: "ticker" });
+    return { candidateConfirms, candidateSince };
   } catch (e) {
     console.error(`saveProxyResolution ${symbol}:`, e.message);
+    return null;
   }
 }
 
@@ -3744,36 +3698,48 @@ async function getCachedRegimeState(symbol) {
   }
 }
 
-async function saveRegimeState(symbol, result) {
+async function saveRegimeState(symbol, proxySymbol, result) {
   if (!supabase) return;
   try {
     await supabase.from("proxy_regime_state").upsert({
-      ticker:      symbol,
-      state:       result.state,
-      action:      result.action,
-      rolling_r:   result.rolling ?? null,
-      baseline_r:  result.baseline ?? null,
-      computed_at: new Date().toISOString(),
+      ticker:       symbol,
+      proxy_symbol: proxySymbol,
+      state:        result.state,
+      action:       result.action,
+      rolling_r:    result.rolling ?? null,
+      baseline_r:   result.baseline ?? null,
+      computed_at:  new Date().toISOString(),
     }, { onConflict: "ticker" });
   } catch (e) {
     console.error(`saveRegimeState ${symbol}:`, e.message);
   }
 }
 
-// Caller (refreshMarketEntry) only invokes this for tickers whose STATIC
-// classification is the fixed Taiwan/Korea rule -- a dynamically-resolved
-// proxy already gets re-validated on its own quarterly cadence
-// (resolveGate5's GATE5_RECOMPUTE_MAX_AGE_MS above), so this doesn't apply
-// there. tickerCloses is the ticker's own ascending daily closes (already
-// fetched by refreshMarketEntry for Gate 1 -- reused here, no extra fetch);
-// the proxy's own closes (TSM) are fetched fresh only on a cache miss, so
-// this adds an Alpaca call at most once a week per gated ticker, never on
-// every /ticker/:symbol refresh.
-async function resolveProxyRegime(symbol, tickerCloses) {
-  if (!tickerCloses) return null;
+// Generalized (Sep 13, 2026) from "Taiwan/Korea semis only" to every static
+// PROXY_RULES category -- regimeValidation() itself was always generic (any
+// two close series), it just never got called for anything but the one
+// category it launched with. Caller (refreshMarketEntry) now invokes this
+// for ANY ticker with a static classification, not just AI/Semiconductor --
+// a dynamically-resolved (DEFAULT_PROXY) ticker is still skipped, since it
+// already gets its own quarterly correlation check via resolveGate5's
+// Dynamic Proxy Resolution Algorithm, and running this too would just be a
+// second, redundant correlation compute for the same relationship.
+// proxySymbol is the classification's own first proxy symbol (a multi-
+// symbol proxy like "USO + GLD" correlates against its first symbol only,
+// as a representative series -- the same simplification Gate 5's own
+// evaluateProxyStatus() already makes when averaging multi-symbol % moves).
+// tickerCloses is the ticker's own ascending daily closes (already fetched
+// by refreshMarketEntry for Gate 1 -- reused here, no extra fetch); the
+// proxy's own closes are fetched fresh only on a cache miss, so this adds
+// an Alpaca call at most once a week per gated ticker, never on every
+// /ticker/:symbol refresh. The cached row's own proxy_symbol is checked
+// against the one requested -- a classification/proxy reassignment can't
+// silently reuse a correlation computed against a now-wrong instrument.
+async function resolveProxyRegime(symbol, tickerCloses, proxySymbol) {
+  if (!tickerCloses || !proxySymbol) return null;
 
   const cached = await getCachedRegimeState(symbol);
-  if (cached) {
+  if (cached && cached.proxy_symbol === proxySymbol) {
     const checkedDate = new Date(cached.computed_at).toLocaleDateString("en-US",
       { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" });
     return {
@@ -3783,23 +3749,101 @@ async function resolveProxyRegime(symbol, tickerCloses) {
     };
   }
 
-  const proxyCloses = await fetchDailyCloses("TSM", 130);
+  const proxyCloses = await fetchDailyCloses(proxySymbol, 130);
   if (!proxyCloses) return null;
 
   const result = gx.regimeValidation(tickerCloses, proxyCloses);
   if (result.state !== "UNKNOWN") {
-    await saveRegimeState(symbol, result);
-    syncCorrelationToGraph(symbol, "TSM", result.rolling, result.state, "regime_check");
+    await saveRegimeState(symbol, proxySymbol, result);
+    syncCorrelationToGraph(symbol, proxySymbol, result.rolling, result.state, "regime_check");
   }
   return result;
 }
+
+// ─── PROPOSAL 3 PREWARM — proactive correlation-table sweep (Sep 13, 2026) ──
+// Every regime check above only ever ran LAZILY — the first time a real
+// user happened to analyze that specific ticker after its cached row (if
+// any) went stale. Cheap, but it also means a ticker nobody's checked
+// recently sits with no fresh correlation number at all, even though the
+// confidence-ceiling clamp in /analyze now depends on one for every static
+// category, not just Taiwan/Korea semis. This sweep walks every ticker
+// PROXY_RULES itself names (the real classification data, via
+// gx.PROXY_RULES — not a second, hand-maintained copy of the same list
+// that could drift out of sync with it) once a day and calls the exact
+// same resolveProxyRegime() a live /ticker/:symbol request would, so its
+// own weekly cache (REGIME_RECOMPUTE_MAX_AGE_MS above) is usually already
+// warm by the time a real request needs it.
+//
+// Deliberately NOT a separate service or process — same in-process
+// setInterval pattern already used above for runVerdictGradingSweep(). A
+// real standalone worker would mean its own deploy, its own monitoring,
+// and (per Render's own pricing — see the Neo4j seed cron job elsewhere in
+// this codebase's history) its own recurring cost, for a job cheap enough
+// to just run inline: PROXY_RULES names at most a few dozen tickers total
+// across every category, each needing at most 2 already-throttled Alpaca
+// calls (the ticker's own closes, the proxy's) — nowhere near enough
+// volume to need its own rate budget or infrastructure. Sequential, not
+// Promise.all, with a small pace delay between tickers — this is a
+// background nice-to-have and should never compete with a real user's
+// live request for alpacaThrottle() headroom.
+const REGIME_PREWARM_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
+const REGIME_PREWARM_DELAY_MS = 2000; // pace between tickers, not a burst
+async function runRegimePrewarmSweep() {
+  if (!supabase) return;
+  const tickers = new Set();
+  for (const rule of gx.PROXY_RULES) {
+    for (const t of rule.tickers || []) tickers.add(t);
+  }
+  for (const symbol of tickers) {
+    try {
+      // No sectorInfo needed — every symbol here came directly off a rule's
+      // own `tickers` list, so classifyTicker's direct-ticker-match branch
+      // resolves it without ever needing the keyword fallback.
+      const staticRule = gx.classifyTicker(symbol, null);
+      const proxySymbol = staticRule.proxy?.symbols?.[0];
+      if (proxySymbol) {
+        const tickerCloses = await fetchDailyCloses(symbol);
+        if (tickerCloses) await resolveProxyRegime(symbol, tickerCloses, proxySymbol);
+      }
+    } catch (e) {
+      console.error(`runRegimePrewarmSweep ${symbol}:`, e.message);
+    }
+    await new Promise(r => setTimeout(r, REGIME_PREWARM_DELAY_MS));
+  }
+}
+setInterval(() => { runRegimePrewarmSweep().catch(e => console.error("runRegimePrewarmSweep:", e.message)); }, REGIME_PREWARM_INTERVAL_MS);
 
 // Maps a resolveFixedProxyBreak()-shaped result (fresh or reconstructed from
 // a cached row) into a proxyRule-compatible object: ah.evaluateProxyStatus() can
 // consume it unchanged (reads rule.proxy.symbols/name/rationale), and /analyze
 // reads the extra tier/forceDownAuthority/sizingOverride/etc fields directly
 // off the same object once it round-trips back through req.body.
-function buildDynamicProxyRule(resolved) {
+//
+// candidateConfirms (Sep 13, 2026, candidate probation): only meaningful when
+// resolved.tier === "primary" -- a fresh 'primary' result only reports as the
+// real, forceDown-authorized "primary" tier once the SAME symbol has cleared
+// PROXY_PRIMARY_FLOOR on PROXY_CANDIDATE_REQUIRED_CONFIRMS consecutive checks;
+// below that it reports as the new "candidate" tier (no forceDown authority,
+// QUARTER sizing) -- see the comment on saveProxyResolution/
+// getCachedProxyResolution above for how the streak itself is tracked.
+function buildDynamicProxyRule(resolved, candidateConfirms) {
+  if (resolved.tier === "primary" && !proxyCandidatePromoted(candidateConfirms)) {
+    const n = candidateConfirms || 0;
+    return {
+      category: "Dynamic",
+      proxy: {
+        name: `${resolved.proxy} (candidate proxy, evaluating${resolved.r != null ? `, r=${resolved.r.toFixed(2)}` : ""})`,
+        symbols: [resolved.proxy],
+        rationale: `Searching for a new proxy after the prior one broke down. ${resolved.proxy} clears the primary ` +
+          `correlation floor but hasn't earned sustainable correlation yet (${n}/${PROXY_CANDIDATE_REQUIRED_CONFIRMS} ` +
+          `consecutive confirms) -- trades on Gate 0 + its own price-action gates alone until promoted. Re-checked weekly.`,
+      },
+      tier: "candidate",
+      forceDownAuthority: false,
+      sizingOverride: "QUARTER",
+      dynamicallyResolved: true,
+    };
+  }
   if (resolved.tier === "primary" || resolved.tier === "secondary") {
     return {
       category: "Dynamic",
@@ -3872,19 +3916,36 @@ function syncCorrelationToGraph(symbol, proxySymbol, coefficient, tier, source) 
 }
 
 // regime (optional 5th param, Proposal 3, Aug 13 2026): the caller's
-// already-resolved weekly regime check for a fixed Taiwan/Korea ticker (null
-// for every other ticker's classification). A BROKEN regime strips the
+// already-resolved weekly regime check (generalized Sep 13, 2026 to every
+// static category -- see resolveProxyRegime's own comment -- null only for
+// a dynamically-resolved DEFAULT_PROXY ticker). A BROKEN regime strips the
 // static rule's authority to stay fixed -- falls through to the Dynamic
 // Proxy Resolution Algorithm below exactly like a DEFAULT_PROXY ticker,
 // instead of returning the static rule unconditionally. This is the
 // "graduates into the dynamic system, triggered by breakdown instead of
-// onboarding" fallback the proposal describes. Every other static category
-// (Biotech/XBI, Defense/LMT, etc.) has no regime tracking at all -- Proposal
-// 3 only ever validates the Taiwan/Korea rule -- so `regime` is always null
-// for them and this is a no-op.
+// onboarding" fallback the proposal describes.
+//
+// Widened Sep 13, 2026 (same day, direct follow-up) from AI/Semiconductor
+// only to every static category -- "if a ticker breaks proxy there should
+// be a search for new [proxy]." This is now safe to widen unconditionally:
+// the forceDown-authority concern flagged when this was first scoped down
+// ("would that category start earning forceDown authority too?") doesn't
+// actually apply here -- the fallthrough's own forceDownAuthority is set
+// per-tier inside buildDynamicProxyRule() (true only for a genuinely
+// promoted "primary" proxy, never for "candidate"/"secondary"/fundamentals-
+// *), completely independent of FORCEDOWN_EXEMPT's category-scoped
+// TAIWAN_PROXY/GATE_5_KOREA entries (those govern only the STATIC fixed-
+// proxy path's own forceDown authority, checked separately in /analyze via
+// tickerGating -- see the comment there). And with candidate probation
+// (above) now gating a fresh 'primary' result behind
+// PROXY_CANDIDATE_REQUIRED_CONFIRMS consecutive checks before it can even
+// report as "primary" at all, a newly-found replacement proxy for ANY
+// category earns real forceDown authority only after proving itself, not
+// off one lucky snapshot -- closing the actual gap this widening used to
+// risk opening.
 async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regime) {
   const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
-  const regimeBroken = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor" && regime?.state === "BROKEN";
+  const regimeBroken = staticRule !== DEFAULT_PROXY && regime?.state === "BROKEN";
   if (staticRule !== DEFAULT_PROXY && !regimeBroken) {
     syncClassificationToGraph(symbol, staticRule.category, "primary");
     return { ...staticRule, tier: "primary", forceDownAuthority: false, dynamicallyResolved: false };
@@ -3908,7 +3969,7 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regim
         note: `Proxy match confirmed via price correlation` +
           (coherencePct ? ` (${coherencePct})` : "") +
           `. Last checked ${checkedDate}.`,
-      });
+      }, cached.candidate_confirms);
     }
   }
 
@@ -3932,10 +3993,10 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regim
   };
 
   const resolved = gx.resolveFixedProxyBreak(tickerCloses, candidateBasket, fundamentals);
-  await saveProxyResolution(symbol, resolved, forceRecompute ? "pre_gate_hard_trigger" : "quarterly");
+  const saved = await saveProxyResolution(symbol, resolved, forceRecompute ? "pre_gate_hard_trigger" : "quarterly");
   syncCorrelationToGraph(symbol, resolved.proxy, resolved.r, resolved.tier,
     forceRecompute ? "pre_gate_hard_trigger" : "quarterly");
-  return buildDynamicProxyRule(resolved);
+  return buildDynamicProxyRule(resolved, saved?.candidateConfirms);
 }
 
 async function generatePulse(marketData) {
@@ -5032,14 +5093,22 @@ async function refreshMarketEntry(symbol, hardTrigger = false) {
   // Gauge this same way).
   const historicalReaction = historicalReactionRes.status === "fulfilled" ? historicalReactionRes.value : null;
 
-  // Proposal 3 — weekly health check on a FIXED Taiwan/Korea proxy
-  // assignment (no-op / null for every other ticker's classification).
-  // Computed BEFORE resolveGate5 below so a BROKEN regime can steer that
-  // function's own static-vs-dynamic branch, and so both the response and
-  // resolveGate5 share one regime value instead of resolving it twice.
+  // Proposal 3 — weekly correlation-strength health check. Generalized
+  // (Sep 13, 2026) from "Taiwan/Korea semis only" to every static
+  // PROXY_RULES category (null for a DEFAULT_PROXY/dynamically-resolved
+  // ticker, which already gets its own quarterly check below). Computed
+  // BEFORE resolveGate5 below so a BROKEN regime can steer that function's
+  // own static-vs-dynamic branch (still AI/Semiconductor-only, a deliberate
+  // scope boundary tied to that category's own forceDown-authority
+  // mechanism — see resolveGate5's comment), and so both the response and
+  // resolveGate5 share one regime value instead of resolving it twice. The
+  // real number this now carries for every static category — rolling_r —
+  // feeds the confidence-ceiling clamp in /analyze below, whether or not
+  // the regime STATE ever matters for that category's own forceDown logic.
   const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
-  const isFixedTaiwanKorea = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor";
-  const regime = isFixedTaiwanKorea ? await resolveProxyRegime(symbol, dailyCloses) : null;
+  const regime = staticRule !== DEFAULT_PROXY
+    ? await resolveProxyRegime(symbol, dailyCloses, staticRule.proxy?.symbols?.[0])
+    : null;
 
   // Gate 5 — static classification, falling through to the Dynamic Proxy
   // Resolution Algorithm (correlation + fundamentals loop) when ambiguous,
@@ -5376,6 +5445,19 @@ Current price: $${metricsData.price || "?"}
     const vals = syms.map(s => ah.parsePctString(sectorContext?.[s])).filter(v => v !== null);
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   })();
+  // Proposal 3 (Aug 13, 2026; generalized to every static category Sep 13,
+  // 2026): regimeData is computed server-side once in refreshMarketEntry()/
+  // resolveProxyRegime() on a weekly cadence (proxy_regime_state table) and
+  // relayed through here untouched, same pattern as gate1Data/
+  // weeklyCarryoverData above — never recalculated by the LLM. null (no
+  // regime signal, e.g. a dynamically-resolved ticker, or Supabase not
+  // configured) is treated by both hasForceDownAuthority() below and the
+  // confidence-ceiling clamp further down as "proceed normally." Declared
+  // here (not just at its original Gate-5-authority call site) so the
+  // confidence clamp — which runs after every branch that can set
+  // confidence, including a "clean" verdict with no override at all — has
+  // it in scope too.
+  const regime = regimeData || null;
 
   // ── GATE 2 CORROBORATION (Aug 28, 2026 rework of Proposal 4) ────────
   // Runs unconditionally on every /analyze call now -- both remaining
@@ -5545,14 +5627,8 @@ Return only JSON.
       // together — KOSPI itself isn't in the /market tracked symbol set, so
       // in practice only the Taiwan (TSM) leg is checkable; Korea gating is
       // registered for when a live KOSPI feed is wired.
-      // Proposal 3 (Aug 13, 2026): regimeData is computed server-side once
-      // in refreshMarketEntry()/resolveProxyRegime() on a weekly cadence
-      // (proxy_regime_state table) and relayed through here untouched, same
-      // pattern as gate1Data/weeklyCarryoverData above — never recalculated
-      // by the LLM. null (no regime signal, e.g. a non-fixed-proxy ticker,
-      // or Supabase not configured) is treated by hasForceDownAuthority()
-      // as "proceed normally," same as before this was wired up.
-      const regime = regimeData || null;
+      // `regime` (Proposal 3) is declared once, above, near tickerPct/
+      // proxyPct — see that comment for why.
       const tickerGating = (!rule.dynamicallyResolved && rule.category === "AI/Semiconductor")
         ? ["ai-semi-gated", "korea-gated"]
         : [];
@@ -5680,6 +5756,26 @@ Return only JSON.
           parsed.wait_for   = parsed.wait_for || "Additional confirmation needed before directional entry.";
         }
       }
+
+      // ── SERVER ENFORCEMENT: proxy-fit confidence ceiling (Sep 13, 2026) ──
+      // Real verdict_log data (Sep 13, 2026): ALAB's Gate 5 proxy (TSM) sits
+      // at rolling_r 0.49 against its own 0.66 baseline — regimeValidation()
+      // reads that as INTACT (unchanged from its own history), but INTACT
+      // only means the relationship hasn't DEGRADED, never that it was ever
+      // STRONG. Roughly half of ALAB's real move is proxy-unrelated by that
+      // number, yet 0 of its 8 real UP verdicts graded TRUE, and none of
+      // them ever tripped Pre-Gate/Gate 0/Gate 1/Gate 5 RED — every one was
+      // a "clean" verdict riding the model's own self-assigned confidence,
+      // untouched by any override branch above. That's exactly why this
+      // clamp runs once, HERE, after every branch that can set confidence
+      // (including a clean, no-override verdict) rather than being threaded
+      // into priceConfirmedConfidence() itself — that function only ever
+      // fires on specific override branches, so it structurally can't reach
+      // ALAB's actual failure shape. Deliberately one-directional: never
+      // upgrades or downgrades LOW/MEDIUM, only caps HIGH — a real
+      // disagreement (LOW) is still meaningful even against a weak proxy,
+      // and this shouldn't make LOW more common than it already is.
+      parsed.confidence = ah.applyProxyFitCeiling(parsed.confidence, regime?.rolling);
 
       // ── INVARIANT: LOW confidence always ships with a real wait_for ──
       // Confirmed (Aug 16, 2026) this wasn't actually guaranteed: the Proxy

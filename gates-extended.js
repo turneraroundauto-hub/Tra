@@ -1,4 +1,116 @@
 'use strict';
+// ─── GATE 5 STATIC CLASSIFICATION (moved here Sep 13, 2026) ──────────────
+// PROXY_RULES/DEFAULT_PROXY/classifyTicker used to live in server.js --
+// moved here (not touching their content otherwise) so the same real
+// classification data server.js already runs on can also be required
+// directly by a standalone script (see Tra's regime-prewarm sweep,
+// runRegimePrewarmSweep() in server.js) without duplicating the ticker
+// lists a second time somewhere they could silently drift out of sync.
+// This file's own charter ("pure, side-effect-free... requirable in
+// isolation") already fits this data -- classifyTicker() has zero
+// dependency on anything else in server.js.
+// Never returns N/A — every ticker gets a meaningful proxy
+const PROXY_RULES = [
+    {
+        category: "Biotech/Medical",
+        keywords: ["biotech", "pharmaceutical", "therapeutics", "genomics", "diagnostics",
+            "medical", "healthcare", "oncology", "biopharma", "clinical"],
+        tickers: ["SMMT", "VCYT", "IMVT", "ENVX", "MRNA", "PFE", "BIIB", "GILD", "REGN", "VRTX",
+            "BMRN", "ALNY", "SRPT", "BLUE", "EDIT", "NTLA", "BEAM", "CRSP"],
+        proxy: { name: "XBI (Biotech ETF)", symbols: ["XBI", "IBB"],
+            rationale: "Biotech/medical names move with XBI sector sentiment" },
+    },
+    {
+        category: "AI/Semiconductor",
+        keywords: ["semiconductor", "chip", "memory", "artificial intelligence", "gpu",
+            "fabless", "foundry", "electronic", "integrated circuit"],
+        tickers: ["MU", "NVDA", "AMD", "ALAB", "SMCI", "AVGO", "QCOM", "INTC", "MRVL", "ON",
+            "IREN", "CIFR", "CORZ", "WULF", "BTDR", "ARM", "TSM", "ASML", "LRCX", "KLAC"],
+        proxy: { name: "TSM + KOSPI (Taiwan/Korea Semis)",
+            symbols: ["TSM"],
+            rationale: "AI/semi names lag Taiwan (TSM) and Korean (Samsung/SK Hynix) by 1-3 sessions. TSM drop >3% = risk-off." },
+    },
+    {
+        category: "Software/Cloud",
+        keywords: ["software", "cloud", "saas", "platform", "enterprise", "cybersecurity",
+            "application", "data analytics", "crm"],
+        tickers: ["ORCL", "MSFT", "CRM", "NOW", "SNOW", "DDOG", "NET", "CRWD", "ZS", "OKTA",
+            "MDB", "GTLB", "HUBS", "BILL", "VEEV"],
+        proxy: { name: "MSFT (Cloud Canary)",
+            symbols: ["MSFT"],
+            rationale: "MSFT is the institutional canary for enterprise software and cloud. MSFT weakness precedes software sector rotation by 2-5 sessions." },
+    },
+    {
+        category: "Fintech/Crypto",
+        keywords: ["fintech", "payment", "financial technology", "cryptocurrency", "digital asset",
+            "exchange", "brokerage", "neobank", "digital bank"],
+        tickers: ["HOOD", "NU", "SQ", "COIN", "PYPL", "AFRM", "UPST", "LC", "SOFI", "DAVE",
+            "MARA", "RIOT", "CLSK", "HUT", "BTBT"],
+        proxy: { name: "BTC + QQQ (Risk-On Signal)",
+            symbols: ["BTC", "QQQ"],
+            rationale: "Fintech/crypto names correlate directly with BTC momentum and QQQ risk-on sentiment." },
+    },
+    {
+        category: "Energy/Commodities",
+        keywords: ["energy", "oil", "gas", "petroleum", "mining", "natural resources",
+            "pipeline", "refining", "coal", "uranium", "renewable"],
+        tickers: ["ET", "XOM", "CVX", "COP", "OXY", "SLB", "HAL", "DVN", "FANG", "APA",
+            "USO", "GLD", "SLV", "NEM", "GOLD", "FCX", "MP", "UEC", "CCJ"],
+        proxy: { name: "USO + GLD (Commodity Complex)",
+            symbols: ["USO", "GLD"],
+            rationale: "Energy and commodity names track oil (USO) and gold (GLD) directly. Macro/geopolitical signals dominate." },
+    },
+    {
+        category: "Defense/Aerospace",
+        keywords: ["defense", "aerospace", "military", "government", "contractor", "security"],
+        tickers: ["LMT", "RTX", "NOC", "GD", "BA", "HII", "LDOS", "SAIC", "KTOS", "AXON"],
+        proxy: { name: "LMT (Defense Canary)",
+            symbols: ["LMT"],
+            rationale: "LMT leads defense sector moves. Geopolitical escalation (LMT +2%) = long signal for all defense names." },
+    },
+    {
+        category: "BDC/REIT/Income",
+        keywords: ["business development", "real estate", "reit", "income", "dividend",
+            "mortgage", "investment trust"],
+        tickers: ["ARCC", "MAIN", "OBDC", "GBDC", "FS", "IWM", "O", "AMT", "PLD", "EQIX"],
+        proxy: { name: "IWM + SPY (Broad Market / Rate Sensitive)",
+            symbols: ["IWM", "SPY"],
+            rationale: "BDCs and REITs are rate-sensitive. IWM small-cap health and SPY broad market are the right barometers." },
+        // Real verdict_log data (Sep 13, 2026): ARCC's own UP-verdict directional
+        // accuracy sits at 18.2% (n=11) despite a correct, textbook-right proxy
+        // assignment right above -- these instruments are rate/yield-driven, not
+        // catalyst-driven, so they rarely clear even the MARGINAL classification
+        // band no matter how well Gate 5's correlation check is working. That's
+        // a property of the CATEGORY (every ticker resolving here shares it), not
+        // something that needs a live per-ticker track record to discover first
+        // -- capped at classification time so a brand-new BDC/REIT ticker is
+        // protected on day one, same sizingOverride mechanism Patch 2's
+        // fundamentals-speculative tier already uses (see buildDynamicProxyRule
+        // and its enforcement in /analyze).
+        sizingOverride: "QUARTER",
+    },
+];
+const DEFAULT_PROXY = {
+    category: "General",
+    proxy: { name: "SPY + IWM (Broad Market Default)",
+        symbols: ["SPY", "IWM"],
+        rationale: "No sector-specific proxy identified. SPY and IWM broad market health is the appropriate Gate 5 barometer." },
+};
+function classifyTicker(symbol, sectorInfo) {
+    const sym = symbol.toUpperCase();
+    const desc = (sectorInfo?.description || sectorInfo?.finnhubIndustry || "").toLowerCase();
+    const name = (sectorInfo?.name || "").toLowerCase();
+    const combined = `${desc} ${name}`;
+    for (const rule of PROXY_RULES) {
+        // Check direct ticker match first
+        if (rule.tickers && rule.tickers.includes(sym))
+            return rule;
+        // Check keyword match in sector description
+        if (rule.keywords && rule.keywords.some(kw => combined.includes(kw)))
+            return rule;
+    }
+    return DEFAULT_PROXY;
+}
 function dailyReturns(closes) {
     const out = [];
     for (let i = 1; i < closes.length; i++)
@@ -306,6 +418,9 @@ function computeGate2Corroboration(input) {
     };
 }
 module.exports = {
+    PROXY_RULES: PROXY_RULES,
+    DEFAULT_PROXY: DEFAULT_PROXY,
+    classifyTicker: classifyTicker,
     evaluateGate1Sessions: evaluateGate1Sessions,
     proxyCoherenceCheck: proxyCoherenceCheck,
     regimeValidation: regimeValidation,

@@ -14,6 +14,23 @@ function parsePctString(s) {
 // value tuned for one specific check to double as a generic threshold here
 // would couple the two for no real reason.
 const CONFIDENCE_NEGLIGIBLE_MOVE_PCT = 1.0;
+// Below this rolling correlation (Sep 13, 2026), Gate 5's own proxy isn't a
+// reliable enough relationship for two-signal agreement to justify HIGH --
+// a different question from regimeValidation()'s own BROKEN ceiling (0.0)
+// and DEGRADING delta (-0.30), which measure whether the fit has CHANGED,
+// not whether it was ever STRONG. A ticker can sit "INTACT" (unchanged from
+// its own historical baseline) while that baseline itself was never tight
+// enough to trust -- confirmed against real verdict_log data: ALAB's Gate 5
+// proxy (TSM) reads rolling_r 0.49 against a 0.66 baseline, state INTACT,
+// yet 0 of ALAB's 8 real UP verdicts graded TRUE. Consumed by server.js's
+// single post-parse confidence-ceiling clamp (applied once, after every
+// branch that can set confidence, including the model's own self-assigned
+// value on a "clean" verdict with no override at all -- ALAB's actual
+// failure shape, since none of its misses ever tripped another gate) --
+// not threaded into priceConfirmedConfidence() itself, since that function
+// only fires on specific override branches and a "clean" verdict never
+// reaches it.
+const PROXY_FIT_FLOOR = 0.5;
 // CONFIDENCE, redefined (Aug 16, 2026) as price-confirmed corroboration,
 // not "did a rule fire": HIGH requires the ticker's own price move AND its
 // proxy/sector's move to both independently agree with the asserted
@@ -36,6 +53,21 @@ function priceConfirmedConfidence(direction, tickerPct, proxyPct) {
     if (agrees(tickerPct) && agrees(proxyPct))
         return 'HIGH';
     return 'MEDIUM'; // nothing to confirm or deny it with, or only one side does
+}
+// Applied once in /analyze, after every branch that can set confidence
+// (including the model's own self-assigned value on a "clean" verdict with
+// no override at all) -- not threaded into priceConfirmedConfidence()
+// itself, since that function only ever fires on specific override
+// branches and can't reach a clean verdict's confidence at all. See
+// PROXY_FIT_FLOOR's own comment for why this exists and what real data
+// motivated it. Extracted as its own small, named, testable function
+// rather than an inline conditional in server.js -- same "this function
+// class has shipped real bugs before, give it real coverage" reasoning
+// this whole file already exists for.
+function applyProxyFitCeiling(confidence, proxyFit) {
+    if (confidence === 'HIGH' && typeof proxyFit === 'number' && proxyFit < PROXY_FIT_FLOOR)
+        return 'MEDIUM';
+    return confidence;
 }
 // Normalizes a marketData[symbol] entry into {pct, change}. Handles both
 // shapes actually seen in this codebase: a real {price,change,pct,direction}
@@ -94,7 +126,9 @@ function evaluateProxyStatus(proxyRule, marketData) {
 module.exports = {
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
+    PROXY_FIT_FLOOR: PROXY_FIT_FLOOR,
     priceConfirmedConfidence: priceConfirmedConfidence,
+    applyProxyFitCeiling: applyProxyFitCeiling,
     normalizeMarketReading: normalizeMarketReading,
     evaluateProxyStatus: evaluateProxyStatus,
 };

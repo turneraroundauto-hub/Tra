@@ -70,6 +70,38 @@ test('priceConfirmedConfidence', async (t) => {
   });
 });
 
+// ── applyProxyFitCeiling — Sep 13, 2026, the generalized-regime confidence
+// clamp. The real motivating case: ALAB's Gate 5 proxy (TSM) sits at
+// rolling_r 0.49 vs a 0.66 baseline -- INTACT (unchanged from its own
+// history), but never actually strong. ─────────────────────────────────
+test('applyProxyFitCeiling', async (t) => {
+  await t.test('the real ALAB number: HIGH downgrades to MEDIUM below the fit floor', () => {
+    assert.equal(ah.applyProxyFitCeiling('HIGH', 0.49), 'MEDIUM');
+  });
+
+  await t.test('a strong fit leaves HIGH untouched', () => {
+    assert.equal(ah.applyProxyFitCeiling('HIGH', 0.66), 'HIGH');
+  });
+
+  await t.test('exact floor boundary is not "below" it -- stays HIGH', () => {
+    assert.equal(ah.applyProxyFitCeiling('HIGH', ah.PROXY_FIT_FLOOR), 'HIGH');
+  });
+
+  await t.test('just under the floor downgrades', () => {
+    assert.equal(ah.applyProxyFitCeiling('HIGH', ah.PROXY_FIT_FLOOR - 0.0001), 'MEDIUM');
+  });
+
+  await t.test('no regime data at all (null/undefined) leaves HIGH untouched', () => {
+    assert.equal(ah.applyProxyFitCeiling('HIGH', null), 'HIGH');
+    assert.equal(ah.applyProxyFitCeiling('HIGH', undefined), 'HIGH');
+  });
+
+  await t.test('never upgrades or downgrades MEDIUM or LOW, regardless of fit', () => {
+    assert.equal(ah.applyProxyFitCeiling('MEDIUM', 0.01), 'MEDIUM');
+    assert.equal(ah.applyProxyFitCeiling('LOW', 0.01), 'LOW');
+  });
+});
+
 // ── normalizeMarketReading — the exact shape mismatch behind the Aug 13 bug ──
 test('normalizeMarketReading', async (t) => {
   await t.test('parses the real wire-format string shape sectorContext actually sends', () => {

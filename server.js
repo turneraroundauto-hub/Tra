@@ -3181,7 +3181,7 @@ async function computeHistoricalReaction(symbol) {
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
     const { data, error } = await supabase.from("verdict_log").select("grade")
-      .eq("ticker", symbol).not("graded_at", "is", null);
+      .eq("ticker", symbol).eq("superseded", false).not("graded_at", "is", null);
     if (error) { console.error(`computeHistoricalReaction ${symbol}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
     const result = stats.insufficientData ? null : {
@@ -3217,7 +3217,7 @@ async function computeDirectionalAccuracy(symbol, direction) {
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
     const { data, error } = await supabase.from("verdict_log").select("grade")
-      .eq("ticker", symbol).eq("verdict", direction).not("graded_at", "is", null);
+      .eq("ticker", symbol).eq("verdict", direction).eq("superseded", false).not("graded_at", "is", null);
     if (error) { console.error(`computeDirectionalAccuracy ${symbol} ${direction}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
     const result = stats.insufficientData ? null : {
@@ -3540,6 +3540,44 @@ async function saveProxyResolution(symbol, resolved, trigger) {
   }
 }
 
+// A ticker can legitimately get re-analyzed several times in one morning
+// (Analyze All re-run against the same watchlist, a manual re-tap) --
+// analyzeOne()/analyzeAll() fire a real /analyze call every time with no
+// cache check at all (the client-side same-day verdict cache is only ever
+// consulted by the pill-tap navigation path, never by Analyze All or the
+// plain ANALYZE button). Confirmed live, Sep 14, 2026: HOOD logged DOWN,
+// UP, FLAT, FLAT, then UP within about an hour from real production
+// traffic. Before this, every one of those became its own independently-
+// graded verdict_log row, and every Scorecard-facing query counted all of
+// them equally -- a ticker re-checked five times in a morning padded the
+// graded pool 5x over one checked once, even though a real trader only
+// ever acts on one read per ticker per day. Direct decision (AskUserQuestion,
+// Sep 14, 2026): only the LAST same-day call for a given ticker+user should
+// count -- earlier same-day calls for that ticker are marked `superseded`
+// (never deleted -- the row and its eventual real grade stay in the table
+// for audit/history) and every Scorecard-facing query excludes them.
+//
+// Scoped to ticker+user_email+calendar-day (UTC) -- anonymous Free-tier
+// rows (no user_email) are deliberately left unscoped: there's no way to
+// tell whether two anonymous 'free' rows on the same ticker same day came
+// from the same visitor or two different ones, so no supersession is
+// applied there (same "can't attribute, don't guess" posture as every
+// other anonymous-data limitation in this file).
+async function supersedeSameDayVerdicts(ticker, userEmail) {
+  if (!supabase || !userEmail) return;
+  try {
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    await supabase.from("verdict_log")
+      .update({ superseded: true })
+      .eq("ticker", ticker).eq("user_email", userEmail)
+      .eq("superseded", false)
+      .gte("issued_at", todayStart.toISOString());
+  } catch (e) {
+    console.error(`supersedeSameDayVerdicts ${ticker}:`, e.message);
+  }
+}
+
 // ─── PROPOSAL 7 — VERDICT ACCURACY SCORECARD (Aug 26, 2026) ───────────
 // One row per /analyze response, written just before the response is
 // sent. Never blocks/rejects the request -- same fail-safe posture as
@@ -3549,6 +3587,7 @@ async function saveProxyResolution(symbol, resolved, trigger) {
 async function logVerdict(fields) {
   if (!supabase) return;
   try {
+    await supersedeSameDayVerdicts(fields.ticker, fields.userEmail || null);
     const issuedAt = new Date();
     const dueAtPrimary = addHours(issuedAt, PRIMARY_GRADING_WINDOW_HOURS);
     const dueAtSecondary = addTradingDays(issuedAt, SECONDARY_GRADING_WINDOW_TRADING_DAYS);
@@ -3564,6 +3603,13 @@ async function logVerdict(fields) {
       gate0_read:                fields.gate0Read || null,
       gate2_corroboration_state: fields.gate2CorroborationState || null,
       dial_position:             fields.dialPosition || null,
+      // Added Sep 14, 2026 (patch14) -- the confidence a verdict actually
+      // shipped at, post every ceiling (applyProxyFitCeiling,
+      // applyHistoricalAccuracyCeiling) that can demote it. Without this,
+      // neither ceiling's real-world effect was observable after the
+      // fact -- there was no way to see a HIGH->MEDIUM demotion actually
+      // happened, or confirm one hadn't, from this table alone.
+      confidence:                fields.confidence || null,
       // Informational only as of Sep 7, 2026 -- the primary due date is
       // now computed from PRIMARY_GRADING_WINDOW_HOURS (a fixed 24h),
       // not this column. Kept populated (as "1", the nearest whole-day
@@ -4816,7 +4862,8 @@ async function fetchScorecardPool() {
     return scorecardPoolCache.data;
   }
   const { data, error } = await supabase
-    .from("verdict_log").select("ticker, grade, verdict").not("graded_at", "is", null);
+    .from("verdict_log").select("ticker, grade, verdict")
+    .eq("superseded", false).not("graded_at", "is", null);
   if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
   scorecardPoolCache = { data: data || [], time: Date.now() };
   return scorecardPoolCache.data;
@@ -4863,7 +4910,7 @@ app.get("/scorecard", async (req, res) => {
     if (req.userTier === "free") {
       const { data, error } = await supabase
         .from("verdict_log").select("grade")
-        .eq("tier", "free").not("graded_at", "is", null);
+        .eq("tier", "free").eq("superseded", false).not("graded_at", "is", null);
       if (error) { console.error("GET /scorecard (free):", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
       const stats = computeAccuracyStats(data || []);
       if (stats.gradedCount < SCORECARD_MIN_GRADED) return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
@@ -4884,7 +4931,7 @@ app.get("/scorecard", async (req, res) => {
     const { data, error } = await supabase
       .from("verdict_log")
       .select("grade, grade_secondary, verdict, size_action, actual_return_pct")
-      .eq("user_email", email).not("graded_at", "is", null);
+      .eq("user_email", email).eq("superseded", false).not("graded_at", "is", null);
     if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
     const rows  = data || [];
     const stats = computeAccuracyStats(rows);
@@ -5943,6 +5990,7 @@ Return only JSON.
         gate0Read: gate0Reported,
         gate2CorroborationState: `${contextCorroboration.corroborated ? "GATE2-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/2)`,
         dialPosition: req.tierConfig?.dial ? effectiveDialPosition : null,
+        confidence: parsed.confidence,
         userEmail: req.userEmail, tier: req.userTier,
       });
       res.json(result);

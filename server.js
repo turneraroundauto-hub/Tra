@@ -3432,6 +3432,23 @@ function checkAgitatorRateLimit(userKey) {
 const GATE5_CANDIDATE_SYMBOLS = ["SPY","QQQ","IWM","XBI","SOXX","TSM","MSFT","GLD","USO"];
 const GATE5_RECOMPUTE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // Step 5: quarterly
 
+// Candidate probation (Sep 13, 2026, direct follow-up to the same day's
+// proxy-fit generalization): "if a ticker breaks proxy there should be a
+// search for new placeholder that would need to earn sustainable
+// correlation." Before this, a freshly-found 'primary' candidate (a single
+// check clearing PROXY_PRIMARY_FLOOR) was trusted immediately --
+// forceDownAuthority:true, normal sizing -- off one snapshot. Now a fresh
+// 'primary' result is reported as the new tier: "candidate" (no forceDown
+// authority, QUARTER sizing) until the SAME symbol has cleared the primary
+// floor on this many CONSECUTIVE checks in a row -- any regression (a
+// different best candidate, or the same one dropping below the floor)
+// resets the streak. Re-checked weekly while on probation (matching the
+// regime table's own cadence) instead of the slower quarterly cadence a
+// promoted/trusted proxy settles into once it's actually earned that.
+const PROXY_CANDIDATE_REQUIRED_CONFIRMS = 2;
+const GATE5_CANDIDATE_RECHECK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // weekly while on probation
+function proxyCandidatePromoted(confirms) { return (confirms || 0) >= PROXY_CANDIDATE_REQUIRED_CONFIRMS; }
+
 // Step 5/6 persistence — see proxy_resolution table (Supabase DDL handed off
 // separately). Gracefully no-ops (always recompute, never cache) if Supabase
 // isn't configured or the table doesn't exist yet.
@@ -3445,7 +3462,8 @@ async function getCachedProxyResolution(symbol) {
       .maybeSingle();
     if (error || !data) return null;
     const ageMs = Date.now() - new Date(data.computed_at).getTime();
-    if (ageMs > GATE5_RECOMPUTE_MAX_AGE_MS) return null;
+    const maxAge = proxyCandidatePromoted(data.candidate_confirms) ? GATE5_RECOMPUTE_MAX_AGE_MS : GATE5_CANDIDATE_RECHECK_MAX_AGE_MS;
+    if (ageMs > maxAge) return null;
     return data;
   } catch (e) {
     console.error(`getCachedProxyResolution ${symbol}:`, e.message);
@@ -3453,19 +3471,36 @@ async function getCachedProxyResolution(symbol) {
   }
 }
 
+// Returns the row's candidate_confirms/candidate_since so the caller can
+// pass them straight into buildDynamicProxyRule() without a second read.
 async function saveProxyResolution(symbol, resolved, trigger) {
-  if (!supabase) return;
+  if (!supabase) return null;
+  const clearsPrimaryFloor = resolved.tier === "primary";
   try {
+    const { data: prior } = await supabase
+      .from("proxy_resolution").select("proxy_symbol, candidate_confirms, candidate_since")
+      .eq("ticker", symbol).maybeSingle();
+    let candidateConfirms = 0;
+    let candidateSince = null;
+    if (clearsPrimaryFloor) {
+      const sameCandidateAsBefore = prior && prior.proxy_symbol === resolved.proxy;
+      candidateConfirms = sameCandidateAsBefore ? (prior.candidate_confirms || 0) + 1 : 1;
+      candidateSince = sameCandidateAsBefore && prior.candidate_since ? prior.candidate_since : new Date().toISOString();
+    }
     await supabase.from("proxy_resolution").upsert({
-      ticker:        symbol,
-      tier:          resolved.tier,
-      proxy_symbol:  resolved.proxy || null,
-      correlation_r: resolved.r ?? null,
-      computed_at:   new Date().toISOString(),
-      trigger:       trigger || "quarterly",
+      ticker:             symbol,
+      tier:               resolved.tier,
+      proxy_symbol:       resolved.proxy || null,
+      correlation_r:      resolved.r ?? null,
+      computed_at:        new Date().toISOString(),
+      trigger:            trigger || "quarterly",
+      candidate_confirms: candidateConfirms,
+      candidate_since:    candidateSince,
     }, { onConflict: "ticker" });
+    return { candidateConfirms, candidateSince };
   } catch (e) {
     console.error(`saveProxyResolution ${symbol}:`, e.message);
+    return null;
   }
 }
 
@@ -3783,7 +3818,32 @@ setInterval(() => { runRegimePrewarmSweep().catch(e => console.error("runRegimeP
 // consume it unchanged (reads rule.proxy.symbols/name/rationale), and /analyze
 // reads the extra tier/forceDownAuthority/sizingOverride/etc fields directly
 // off the same object once it round-trips back through req.body.
-function buildDynamicProxyRule(resolved) {
+//
+// candidateConfirms (Sep 13, 2026, candidate probation): only meaningful when
+// resolved.tier === "primary" -- a fresh 'primary' result only reports as the
+// real, forceDown-authorized "primary" tier once the SAME symbol has cleared
+// PROXY_PRIMARY_FLOOR on PROXY_CANDIDATE_REQUIRED_CONFIRMS consecutive checks;
+// below that it reports as the new "candidate" tier (no forceDown authority,
+// QUARTER sizing) -- see the comment on saveProxyResolution/
+// getCachedProxyResolution above for how the streak itself is tracked.
+function buildDynamicProxyRule(resolved, candidateConfirms) {
+  if (resolved.tier === "primary" && !proxyCandidatePromoted(candidateConfirms)) {
+    const n = candidateConfirms || 0;
+    return {
+      category: "Dynamic",
+      proxy: {
+        name: `${resolved.proxy} (candidate proxy, evaluating${resolved.r != null ? `, r=${resolved.r.toFixed(2)}` : ""})`,
+        symbols: [resolved.proxy],
+        rationale: `Searching for a new proxy after the prior one broke down. ${resolved.proxy} clears the primary ` +
+          `correlation floor but hasn't earned sustainable correlation yet (${n}/${PROXY_CANDIDATE_REQUIRED_CONFIRMS} ` +
+          `consecutive confirms) -- trades on Gate 0 + its own price-action gates alone until promoted. Re-checked weekly.`,
+      },
+      tier: "candidate",
+      forceDownAuthority: false,
+      sizingOverride: "QUARTER",
+      dynamicallyResolved: true,
+    };
+  }
   if (resolved.tier === "primary" || resolved.tier === "secondary") {
     return {
       category: "Dynamic",
@@ -3863,18 +3923,29 @@ function syncCorrelationToGraph(symbol, proxySymbol, coefficient, tier, source) 
 // Proxy Resolution Algorithm below exactly like a DEFAULT_PROXY ticker,
 // instead of returning the static rule unconditionally. This is the
 // "graduates into the dynamic system, triggered by breakdown instead of
-// onboarding" fallback the proposal describes. Deliberately still scoped to
-// AI/Semiconductor ONLY, not every category regime is now computed for --
-// that's the category this fallback and its paired forceDown-authority
-// exemption (FORCEDOWN_EXEMPT's TAIWAN_PROXY entry) were built around, and
-// widening it to e.g. BDC/REIT/Income would be a real, separate behavior
-// change (would that category start earning forceDown authority too?) that
-// nothing here asked for. Every other static category's regime is still
-// real and used -- just for the confidence-ceiling clamp in /analyze below,
-// not for this fallback decision.
+// onboarding" fallback the proposal describes.
+//
+// Widened Sep 13, 2026 (same day, direct follow-up) from AI/Semiconductor
+// only to every static category -- "if a ticker breaks proxy there should
+// be a search for new [proxy]." This is now safe to widen unconditionally:
+// the forceDown-authority concern flagged when this was first scoped down
+// ("would that category start earning forceDown authority too?") doesn't
+// actually apply here -- the fallthrough's own forceDownAuthority is set
+// per-tier inside buildDynamicProxyRule() (true only for a genuinely
+// promoted "primary" proxy, never for "candidate"/"secondary"/fundamentals-
+// *), completely independent of FORCEDOWN_EXEMPT's category-scoped
+// TAIWAN_PROXY/GATE_5_KOREA entries (those govern only the STATIC fixed-
+// proxy path's own forceDown authority, checked separately in /analyze via
+// tickerGating -- see the comment there). And with candidate probation
+// (above) now gating a fresh 'primary' result behind
+// PROXY_CANDIDATE_REQUIRED_CONFIRMS consecutive checks before it can even
+// report as "primary" at all, a newly-found replacement proxy for ANY
+// category earns real forceDown authority only after proving itself, not
+// off one lucky snapshot -- closing the actual gap this widening used to
+// risk opening.
 async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regime) {
   const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
-  const regimeBroken = staticRule !== DEFAULT_PROXY && staticRule.category === "AI/Semiconductor" && regime?.state === "BROKEN";
+  const regimeBroken = staticRule !== DEFAULT_PROXY && regime?.state === "BROKEN";
   if (staticRule !== DEFAULT_PROXY && !regimeBroken) {
     syncClassificationToGraph(symbol, staticRule.category, "primary");
     return { ...staticRule, tier: "primary", forceDownAuthority: false, dynamicallyResolved: false };
@@ -3898,7 +3969,7 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regim
         note: `Proxy match confirmed via price correlation` +
           (coherencePct ? ` (${coherencePct})` : "") +
           `. Last checked ${checkedDate}.`,
-      });
+      }, cached.candidate_confirms);
     }
   }
 
@@ -3922,10 +3993,10 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regim
   };
 
   const resolved = gx.resolveFixedProxyBreak(tickerCloses, candidateBasket, fundamentals);
-  await saveProxyResolution(symbol, resolved, forceRecompute ? "pre_gate_hard_trigger" : "quarterly");
+  const saved = await saveProxyResolution(symbol, resolved, forceRecompute ? "pre_gate_hard_trigger" : "quarterly");
   syncCorrelationToGraph(symbol, resolved.proxy, resolved.r, resolved.tier,
     forceRecompute ? "pre_gate_hard_trigger" : "quarterly");
-  return buildDynamicProxyRule(resolved);
+  return buildDynamicProxyRule(resolved, saved?.candidateConfirms);
 }
 
 async function generatePulse(marketData) {

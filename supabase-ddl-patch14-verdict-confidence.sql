@@ -1,0 +1,18 @@
+-- Patch 14 (Sep 14, 2026): add a confidence column to verdict_log.
+--
+-- Prompted by a real gap found while investigating whether the Sep 13/14
+-- confidence-ceiling mechanisms (applyProxyFitCeiling, the same-direction
+-- applyHistoricalAccuracyCeiling) are actually demoting anything in
+-- production: verdict_log has never recorded the confidence a verdict
+-- shipped at, only verdict/size_action/grading outcomes. That makes both
+-- ceilings' real-world effect structurally unobservable after the fact --
+-- there's no way to see a HIGH->MEDIUM demotion happened, or confirm one
+-- didn't, from this table alone.
+--
+-- Purely additive, nullable -- no backfill for existing rows (their real
+-- confidence was never captured and can't be reconstructed). verdict_log
+-- is already a service-role-only table with RLS disabled and anon/
+-- authenticated grants revoked (see CLAUDE.md's "Supabase tables: RLS
+-- disabled != access blocked" section) -- adding one nullable column to
+-- an already-secured table needs no new grants/RLS work.
+alter table public.verdict_log add column if not exists confidence text;

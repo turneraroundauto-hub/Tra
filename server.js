@@ -3564,6 +3564,13 @@ async function logVerdict(fields) {
       gate0_read:                fields.gate0Read || null,
       gate2_corroboration_state: fields.gate2CorroborationState || null,
       dial_position:             fields.dialPosition || null,
+      // Added Sep 14, 2026 (patch14) -- the confidence a verdict actually
+      // shipped at, post every ceiling (applyProxyFitCeiling,
+      // applyHistoricalAccuracyCeiling) that can demote it. Without this,
+      // neither ceiling's real-world effect was observable after the
+      // fact -- there was no way to see a HIGH->MEDIUM demotion actually
+      // happened, or confirm one hadn't, from this table alone.
+      confidence:                fields.confidence || null,
       // Informational only as of Sep 7, 2026 -- the primary due date is
       // now computed from PRIMARY_GRADING_WINDOW_HOURS (a fixed 24h),
       // not this column. Kept populated (as "1", the nearest whole-day
@@ -5943,6 +5950,7 @@ Return only JSON.
         gate0Read: gate0Reported,
         gate2CorroborationState: `${contextCorroboration.corroborated ? "GATE2-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/2)`,
         dialPosition: req.tierConfig?.dial ? effectiveDialPosition : null,
+        confidence: parsed.confidence,
         userEmail: req.userEmail, tier: req.userTier,
       });
       res.json(result);

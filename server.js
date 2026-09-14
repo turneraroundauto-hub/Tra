@@ -3196,6 +3196,42 @@ async function computeHistoricalReaction(symbol) {
   }
 }
 
+// Direction-specific counterpart to computeHistoricalReaction() above
+// (Sep 14, 2026). That function deliberately pools ALL graded verdicts for
+// a ticker regardless of direction -- correct for its own two display
+// consumers (the ticker card's TRACK RECORD row, the Agitator's "Past
+// Reactions" factor), but it washes out exactly the failure shape that
+// prompted this: a ticker's UP calls being consistently wrong while its
+// DOWN calls are fine (or vice versa) reads as a mediocre-but-not-alarming
+// overall average. This is the same-direction slice
+// analyze-helpers.ts's applyHistoricalAccuracyCeiling actually needs, kept
+// as its own function/cache rather than changing computeHistoricalReaction
+// itself -- two already-shipped display features depend on that one
+// staying direction-agnostic. Same shape, same floor
+// (SCORECARD_TICKER_MIN_GRADED), same fail-safe-to-stale-cache posture.
+const directionalAccuracyCache = new Map(); // "symbol:direction" -> { data, time }
+async function computeDirectionalAccuracy(symbol, direction) {
+  if (!supabase) return null;
+  const key = `${symbol}:${direction}`;
+  const cached = directionalAccuracyCache.get(key);
+  if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
+  try {
+    const { data, error } = await supabase.from("verdict_log").select("grade")
+      .eq("ticker", symbol).eq("verdict", direction).not("graded_at", "is", null);
+    if (error) { console.error(`computeDirectionalAccuracy ${symbol} ${direction}:`, error.message); return cached ? cached.data : null; }
+    const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
+    const result = stats.insufficientData ? null : {
+      directionalPct: Math.max(0, Math.min(100, Math.round(stats.directionalPct))),
+      gradedCount: stats.gradedCount,
+    };
+    directionalAccuracyCache.set(key, { data: result, time: Date.now() });
+    return result;
+  } catch (e) {
+    console.error(`computeDirectionalAccuracy ${symbol} ${direction}:`, e.message);
+    return cached ? cached.data : null;
+  }
+}
+
 async function scoreAgitatorFactors(symbol, headline) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey || !headline) return null;
@@ -5852,6 +5888,23 @@ Return only JSON.
       // disagreement (LOW) is still meaningful even against a weak proxy,
       // and this shouldn't make LOW more common than it already is.
       parsed.confidence = ah.applyProxyFitCeiling(parsed.confidence, regime?.rolling);
+
+      // ── SERVER ENFORCEMENT: same-direction historical-accuracy ceiling (Sep 14, 2026) ──
+      // Direct follow-up to the proxy-fit ceiling above, from a live sweep
+      // confirming everything documented in this file was actually wired:
+      // that sweep's own honest gap was "the historical grading data feeds
+      // a readout, never the verdict itself." This closes that gap for
+      // confidence specifically (confirmed via AskUserQuestion: confidence-
+      // cap only, never sizing or the verdict direction -- see
+      // applyHistoricalAccuracyCeiling's own comment in analyze-helpers.ts
+      // for the full reasoning and the "stopped clock" risk that ruled out
+      // a stronger intervention). Only queried when it could actually
+      // matter -- a clean HIGH on a real UP/DOWN call -- so the common
+      // non-HIGH case costs zero extra Supabase load.
+      if (parsed.confidence === "HIGH" && (parsed.verdict === "UP" || parsed.verdict === "DOWN")) {
+        const directionalAccuracy = await computeDirectionalAccuracy(ticker.toUpperCase(), parsed.verdict);
+        parsed.confidence = ah.applyHistoricalAccuracyCeiling(parsed.confidence, directionalAccuracy?.directionalPct);
+      }
 
       // ── INVARIANT: LOW confidence always ships with a real wait_for ──
       // Confirmed (Aug 16, 2026) this wasn't actually guaranteed: the Proxy

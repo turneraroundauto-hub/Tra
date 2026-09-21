@@ -19,6 +19,7 @@ const { createClient } = require("@supabase/supabase-js");
 const kg = require("./neo4j-graph");
 const mcpServer = require("./mcp-server");
 const oauth = require("./oauth-server");
+const pushNotifications = require("./push-notifications");
 
 // ── SUPABASE CLIENT ───────────────────────────────────────────────
 // This is the ONLY client that should ever be used for service_role-
@@ -6424,12 +6425,32 @@ setInterval(async () => {
   } catch(e) {
     console.error("Market open cache warm failed:", e.message);
   }
+  // Anonymous re-engagement push, riding the bell instead of a separate
+  // schedule -- see push-notifications.js. Real content (this morning's
+  // actual Gate read), not a bare "come back" ping, and it fires from the
+  // exact cache warmTrackedMarketCache() above just populated, so it's
+  // never stale relative to what a user would see opening the app right
+  // now. Best-effort: a push failure here must never affect the cache
+  // warm it rides alongside.
+  try {
+    const gs = marketCache?.gateStatus || "?";
+    const gn = marketCache?.gateNote ? String(marketCache.gateNote).slice(0, 110) : "Check today's read.";
+    const { sent, removed } = await pushNotifications.sendPushToAllSubscribers(supabase, {
+      title: `Gate ${gs} — market's open`,
+      body: gn,
+      url: "/",
+    });
+    if (sent || removed) console.log(`Market-open push: sent ${sent}, removed ${removed} dead subscription(s).`);
+  } catch (e) {
+    console.error("Market-open push failed:", e.message);
+  }
 }, 60 * 1000);
 
 // ─── START ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 mcpServer.mountMcpRoutes(app, PORT);
 oauth.mountOAuthRoutes(app, supabase);
+pushNotifications.mountPushRoutes(app, supabase);
 credits.loadCredits(); // no-op with Supabase backend
 app.listen(PORT, async () => {
   console.log(`Trade Tribunal API v4.0.0 on port ${PORT}`);

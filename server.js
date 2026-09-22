@@ -6339,6 +6339,24 @@ app.post("/stripe/credits", async (req, res) => {
   res.json({ received: true });
 });
 
+// Picks the market-open push's body text: the real Sector Pulse narrative
+// when it's available (its own first sentence only -- PULSE_PROMPT always
+// returns exactly 2 sentences, together too long for a push body, and a
+// notification cut off mid-sentence reads worse than a short complete one),
+// falling back to the mechanical gateNote line otherwise. Capped well under
+// Android's ~240-char truncation point for a notification body.
+function pulsePushBody(cache) {
+  const pulse = cache?.pulse ? String(cache.pulse).trim() : "";
+  if (pulse) {
+    const splitAt = pulse.indexOf(". ");
+    const firstSentence = splitAt > 0 ? pulse.slice(0, splitAt + 1) : pulse;
+    return firstSentence.length > 140
+      ? firstSentence.slice(0, 139).trimEnd() + "…"
+      : firstSentence;
+  }
+  return cache?.gateNote ? String(cache.gateNote).slice(0, 110) : "Check today's read.";
+}
+
 // Refreshes marketCache (the fixed SPY/QQQ/BTC/etc. tracked-symbol list
 // backing Gate 0 and the /market overview) via fetchQuote. Factored out so
 // both the boot-time warm and the market-open warm pass below use the same
@@ -6432,9 +6450,19 @@ setInterval(async () => {
   // never stale relative to what a user would see opening the app right
   // now. Best-effort: a push failure here must never affect the cache
   // warm it rides alongside.
+  //
+  // Sep 2026: body now prefers the real Sector Pulse narrative
+  // (marketCache.pulse -- the same AI-generated sector-rotation text
+  // Starter/Pro's own Pulse card already renders from generatePulse())
+  // over the plain mechanical "SPY +0.4% QQQ +0.3%" gateNote line --
+  // reused as-is, zero added cost/latency, since it's already computed
+  // by warmTrackedMarketCache() above. pulse is populated async (see
+  // that function's own trailing .then()), so it can lag a beat behind
+  // a brand-new trading day; falls back to gateNote when it hasn't
+  // landed yet, exactly the prior behavior.
   try {
     const gs = marketCache?.gateStatus || "?";
-    const gn = marketCache?.gateNote ? String(marketCache.gateNote).slice(0, 110) : "Check today's read.";
+    const gn = pulsePushBody(marketCache);
     const { sent, removed } = await pushNotifications.sendPushToAllSubscribers(supabase, {
       title: `Gate ${gs} — market's open`,
       body: gn,

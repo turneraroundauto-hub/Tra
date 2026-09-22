@@ -3664,27 +3664,49 @@ async function logCorroborationHits(ticker, corroboration) {
 // outcome, MARGINAL on either Weak band (close to flat), FALSE on either
 // Strong band (a real move happened despite the flat call). Flag to Mr. T
 // to confirm this matches what was actually worked out in chat.
+// Sep 22, 2026 -- direct instruction: narrow the UP grading margin to a
+// single +0.1% threshold (previously required +0.75%/+2.5% for
+// MARGINAL/TRUE) and lean the HOLD/FLAT band asymmetrically toward the
+// downside, -1.5% to +0.5% -- deliberately overlapping both the new UP
+// band above (0.1%-0.5% counts as both a real UP AND a correct HOLD) and
+// DOWN's own WEAK_DOWN band below (-1.5% to -0.75% counts as both a
+// correct HOLD and a MARGINAL DOWN). This replaces the old shared "zone"
+// partition (one classification feeding all three verdicts) with three
+// independent per-verdict checks, since a clean partition can't express
+// overlap by construction. DOWN's own thresholds are untouched -- only
+// UP's margin and the HOLD band were asked for; DOWN still requires the
+// same +/-0.75%/2.5% bands as before.
+//
+// FLAT/HOLD's own MARGINAL tier (same day, direct follow-up): a real
+// impact check on live verdict_log data showed the strict TRUE-or-nothing
+// HOLD band above dropped FLAT's directional accuracy from 59.3% to
+// 26.6% -- almost entirely because the old scheme's WEAK_UP/WEAK_DOWN
+// MARGINAL credit (out to +/-2.5%) was gone. Given a MARGINAL band too:
+// a 1.0-point buffer around the leaned core, asymmetric the same
+// direction as the core itself (2.5% tolerated below vs. 1.5% above,
+// vs. the core's own 1.5%-below/0.5%-above) -- HOLD gets the same
+// "close enough" credit UP/DOWN already have via their own MARGINAL
+// tiers, instead of a hard cliff right at the leaned band's edge.
+//
+// Feeds every consumer of the stored `grade` column (computeAccuracyStats,
+// computeHistoricalReaction, computeDirectionalAccuracy -- and, through
+// that last one, analyze-helpers.ts's applyHistoricalAccuracyCeiling in
+// /analyze itself), not just the Scorecard display. Not retroactive --
+// only verdict_log rows graded after this deploys use the new bands;
+// already-graded rows keep whatever grade the old bands assigned.
 function classifyVerdictReturn(verdict, r) {
-  let zone;
-  if (r >= 2.5) zone = "STRONG_UP";
-  else if (r > 0.75) zone = "WEAK_UP";
-  else if (r >= -0.75) zone = "FLAT";
-  else if (r > -2.5) zone = "WEAK_DOWN";
-  else zone = "STRONG_DOWN";
+  if (verdict === "UP") return r > 0.1 ? "TRUE" : "FALSE";
 
-  if (verdict === "UP") {
-    if (zone === "STRONG_UP") return "TRUE";
-    if (zone === "WEAK_UP") return "MARGINAL";
-    return "FALSE";
-  }
   if (verdict === "DOWN") {
-    if (zone === "STRONG_DOWN") return "TRUE";
-    if (zone === "WEAK_DOWN") return "MARGINAL";
+    if (r <= -2.5) return "TRUE";
+    if (r < -0.75) return "MARGINAL";
     return "FALSE";
   }
-  // FLAT
-  if (zone === "FLAT") return "TRUE";
-  if (zone === "WEAK_UP" || zone === "WEAK_DOWN") return "MARGINAL";
+
+  // FLAT / HOLD -- leans down. TRUE core: -1.5% to +0.5%. MARGINAL buffer
+  // around it: +0.5% to +1.5% above, -1.5% to -2.5% below.
+  if (r <= 0.5 && r >= -1.5) return "TRUE";
+  if (r <= 1.5 && r >= -2.5) return "MARGINAL";
   return "FALSE";
 }
 

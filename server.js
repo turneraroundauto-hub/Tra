@@ -4774,6 +4774,35 @@ app.post("/device-ping", async (req, res) => {
       visit_count:   (existing?.visit_count || 0) + 1,
     }, { onConflict: "device_id" });
     if (error) throw error;
+
+    // device_accounts: every (device, account) pairing this device has
+    // EVER signed into, never collapsed down to one. device_visits'
+    // user_email above is a convenience "last known account" pointer on
+    // a one-row-per-device table -- it can only ever hold a single email,
+    // so a second account signing in on the same device (a shared
+    // device, or one person's own second account) silently overwrote the
+    // first account's association with no way to see it had happened.
+    // This table is the real record: a row per (device_id, user_email)
+    // pair, so every account a device has ever been used for stays
+    // visible. Best-effort -- a failure here logs and falls through
+    // rather than failing the whole ping, same posture as this app's
+    // other secondary analytics writes (e.g. corroboration_log).
+    if (req.userEmail) {
+      const { data: existingAccount } = await supabase
+        .from("device_accounts")
+        .select("visit_count")
+        .eq("device_id", deviceId)
+        .eq("user_email", req.userEmail)
+        .maybeSingle();
+      const { error: acctError } = await supabase.from("device_accounts").upsert({
+        device_id:    deviceId,
+        user_email:   req.userEmail,
+        last_seen_at: new Date().toISOString(),
+        visit_count:  (existingAccount?.visit_count || 0) + 1,
+      }, { onConflict: "device_id,user_email" });
+      if (acctError) console.error("POST /device-ping (device_accounts):", acctError.message);
+    }
+
     res.json({ success: true });
   } catch (e) {
     console.error("POST /device-ping:", e.message);

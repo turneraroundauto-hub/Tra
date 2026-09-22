@@ -3677,6 +3677,17 @@ async function logCorroborationHits(ticker, corroboration) {
 // UP's margin and the HOLD band were asked for; DOWN still requires the
 // same +/-0.75%/2.5% bands as before.
 //
+// FLAT/HOLD's own MARGINAL tier (same day, direct follow-up): a real
+// impact check on live verdict_log data showed the strict TRUE-or-nothing
+// HOLD band above dropped FLAT's directional accuracy from 59.3% to
+// 26.6% -- almost entirely because the old scheme's WEAK_UP/WEAK_DOWN
+// MARGINAL credit (out to +/-2.5%) was gone. Given a MARGINAL band too:
+// a 1.0-point buffer around the leaned core, asymmetric the same
+// direction as the core itself (2.5% tolerated below vs. 1.5% above,
+// vs. the core's own 1.5%-below/0.5%-above) -- HOLD gets the same
+// "close enough" credit UP/DOWN already have via their own MARGINAL
+// tiers, instead of a hard cliff right at the leaned band's edge.
+//
 // Feeds every consumer of the stored `grade` column (computeAccuracyStats,
 // computeHistoricalReaction, computeDirectionalAccuracy -- and, through
 // that last one, analyze-helpers.ts's applyHistoricalAccuracyCeiling in
@@ -3692,8 +3703,11 @@ function classifyVerdictReturn(verdict, r) {
     return "FALSE";
   }
 
-  // FLAT / HOLD -- leans down: -1.5% to +0.5%, inclusive both ends.
-  return (r <= 0.5 && r >= -1.5) ? "TRUE" : "FALSE";
+  // FLAT / HOLD -- leans down. TRUE core: -1.5% to +0.5%. MARGINAL buffer
+  // around it: +0.5% to +1.5% above, -1.5% to -2.5% below.
+  if (r <= 0.5 && r >= -1.5) return "TRUE";
+  if (r <= 1.5 && r >= -2.5) return "MARGINAL";
+  return "FALSE";
 }
 
 // Runs every 30 minutes, grades any verdict_log row whose primary or

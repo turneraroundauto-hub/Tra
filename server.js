@@ -3893,6 +3893,35 @@ async function resolveProxyRegime(symbol, tickerCloses, proxySymbol) {
 // live request for alpacaThrottle() headroom.
 const REGIME_PREWARM_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 const REGIME_PREWARM_DELAY_MS = 2000; // pace between tickers, not a burst
+// Candidate Probation bridge (Sep 22, 2026): the sweep above only ever
+// warmed proxy_regime_state -- a BROKEN read there never, on its own,
+// triggered the real re-resolution search (resolveGate5's dynamic-proxy
+// branch, which is what actually writes a proxy_resolution row and puts a
+// ticker on Candidate Probation). That only ran when a live /analyze or
+// /ticker/:symbol request happened to reach resolveGate5() for that exact
+// symbol afterward. Confirmed live (Sep 22, 2026 audit): every one of the
+// 11 real BROKEN tickers at the time had ZERO proxy_resolution row, ever,
+// despite this sweep having marked them BROKEN daily, on autopilot,
+// across the whole ticker universe, for over a week. The two systems were
+// simply decoupled -- regime tracking ran independent of real traffic,
+// candidate resolution didn't. Given this app's real usage volume, that
+// gap could sit open indefinitely on its own.
+async function resolveCandidateIfBroken(symbol, tickerCloses, regime) {
+  if (regime?.state !== "BROKEN") return;
+  try {
+    // metrics:null -- resolveGate5's own classifyTicker call needs no
+    // sectorInfo hint for a symbol already resolved off PROXY_RULES' own
+    // tickers list (same reasoning as staticRule above); tickerCloses is
+    // reused from the regime check that just ran, no extra fetch.
+    // forceRecompute:false so an existing, still-fresh proxy_resolution
+    // row (7-day probation / 90-day promoted cache) is reused rather than
+    // redundantly re-searched every single day this sweep runs.
+    await resolveGate5(symbol, null, tickerCloses, false, regime);
+  } catch (e) {
+    console.error(`resolveCandidateIfBroken ${symbol}:`, e.message);
+  }
+}
+
 async function runRegimePrewarmSweep() {
   if (!supabase) return;
   const tickers = new Set();
@@ -3908,7 +3937,10 @@ async function runRegimePrewarmSweep() {
       const proxySymbol = staticRule.proxy?.symbols?.[0];
       if (proxySymbol) {
         const tickerCloses = await fetchDailyCloses(symbol);
-        if (tickerCloses) await resolveProxyRegime(symbol, tickerCloses, proxySymbol);
+        if (tickerCloses) {
+          const regime = await resolveProxyRegime(symbol, tickerCloses, proxySymbol);
+          await resolveCandidateIfBroken(symbol, tickerCloses, regime);
+        }
       }
     } catch (e) {
       console.error(`runRegimePrewarmSweep ${symbol}:`, e.message);

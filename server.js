@@ -4670,14 +4670,22 @@ app.get("/agitator", async (req, res) => {
 // `platform` comes from `document.referrer` — Chrome itself sets that to
 // `android-app://<package>` on the one navigation that launches a page
 // inside an installed Trusted Web Activity, a passive signal the browser
-// already exposes, not anything fingerprinted. No IP, no user-agent, no
-// email is accepted or stored here, on purpose — this table exists to
-// answer "how many devices," nothing more.
+// already exposes, not anything fingerprinted. No IP, no user-agent is
+// accepted or stored here, on purpose.
 //
 // Fires on every tier's boot() regardless of sign-in state — an
 // anonymous visitor is exactly who this exists to count. Same auth
 // gating as every other route (the tier secret every client already
-// ships), no credit cost.
+// ships, or a real Supabase session token), no credit cost.
+//
+// user_email is NOT sent by the client at all — it's read off req.userEmail,
+// which the same global auth middleware every other route already goes
+// through sets whenever the request carries a real Supabase session token
+// (see PATH 1 above). So a signed-in user's device correlates to their
+// account automatically, using auth data that was already reaching this
+// route; nothing new is collected client-side to make that happen. An
+// anonymous ping (tier-secret auth, no session) never has req.userEmail set
+// and never overwrites a device's already-known email with null.
 const DEVICE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 app.post("/device-ping", async (req, res) => {
   const { deviceId, platform } = req.body || {};
@@ -4693,7 +4701,11 @@ app.post("/device-ping", async (req, res) => {
     // dedicated Postgres function the way credits.js's real balance needs.
     // first_seen_at/first_tier are deliberately left out of the update
     // payload below (only present as insert defaults) so a returning
-    // device's original first-seen data is never overwritten.
+    // device's original first-seen data is never overwritten. user_email
+    // is also left out (undefined -> dropped from the request body, so the
+    // column is untouched) whenever this particular ping is anonymous --
+    // the device's last known real account should stay attached, not get
+    // cleared just because this one ping happened to arrive unauthenticated.
     const { data: existing } = await supabase
       .from("device_visits")
       .select("visit_count")
@@ -4703,6 +4715,7 @@ app.post("/device-ping", async (req, res) => {
       device_id:     deviceId,
       platform:      plat,
       first_tier:    existing ? undefined : (req.userTier || null),
+      user_email:    req.userEmail || undefined,
       last_seen_at:  new Date().toISOString(),
       visit_count:   (existing?.visit_count || 0) + 1,
     }, { onConflict: "device_id" });

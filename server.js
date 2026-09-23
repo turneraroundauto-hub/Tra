@@ -443,23 +443,24 @@ function etWeekday() {
   return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" })).getDay();
 }
 
-// Human-readable Eastern-time string for device_visits' first_seen_et/
-// last_seen_et columns. timestamptz always stores (and Supabase's own table
+// Human-readable Pacific-time string for device_visits' first_seen_pt/
+// last_seen_pt columns. timestamptz always stores (and Supabase's own table
 // editor always displays) UTC -- that's normal Postgres behavior and isn't
 // something this app's schema can change. These are plain sortable text
 // siblings written alongside the real timestamptz columns so the table
-// reads in ET directly, without depending on the dashboard's own display
-// settings. Not used for any timezone-sensitive logic -- see etWeekday()
-// above for that.
-function etTimestampStr(date) {
+// reads in PT directly, without depending on the dashboard's own display
+// settings. Pacific, not Eastern, because this pair is for Mr. T's own
+// reading of a device/account admin table -- not tied to market hours the
+// way etWeekday() above is, so it's not this app's usual ET convention.
+function ptTimestampStr(date) {
   const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
+    timeZone: "America/Los_Angeles",
     year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit",
     hour12: false,
   }).formatToParts(date).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
   const hh = parts.hour === "24" ? "00" : parts.hour; // ICU midnight quirk
-  return `${parts.year}-${parts.month}-${parts.day} ${hh}:${parts.minute}:${parts.second} ET`;
+  return `${parts.year}-${parts.month}-${parts.day} ${hh}:${parts.minute}:${parts.second} PT`;
 }
 
 // Gate 3's weekly-carryover decay label for today, or null on Mon/Fri/
@@ -4767,8 +4768,8 @@ app.get("/agitator", async (req, res) => {
 // key, so NULL would insert a fresh "anonymous" row on every single
 // anonymous ping instead of updating one running counter.
 //
-// first_seen_et/last_seen_et are plain human-readable Eastern-time text
-// siblings of the real timestamptz columns — see etTimestampStr() above.
+// first_seen_pt/last_seen_pt are plain human-readable Pacific-time text
+// siblings of the real timestamptz columns — see ptTimestampStr() above.
 const DEVICE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 app.post("/device-ping", async (req, res) => {
   const { deviceId, platform } = req.body || {};
@@ -4782,7 +4783,7 @@ app.post("/device-ping", async (req, res) => {
     // pings from the same (device, account) pair can undercount by one;
     // acceptable for a nice-to-have counter on a low-stakes analytics
     // table, not worth a dedicated Postgres function the way credits.js's
-    // real balance needs. first_seen_at/first_seen_et/first_tier are
+    // real balance needs. first_seen_at/first_seen_pt/first_tier are
     // deliberately left out of the update payload below (only present as
     // insert defaults) so a returning (device, account) pair's original
     // first-seen data is never overwritten.
@@ -4801,8 +4802,8 @@ app.post("/device-ping", async (req, res) => {
       platform:      plat,
       first_tier:    existing ? undefined : (req.userTier || null),
       last_seen_at:  nowIso,
-      last_seen_et:  etTimestampStr(nowDate),
-      first_seen_et: existing ? undefined : etTimestampStr(nowDate),
+      last_seen_pt:  ptTimestampStr(nowDate),
+      first_seen_pt: existing ? undefined : ptTimestampStr(nowDate),
       visit_count:   (existing?.visit_count || 0) + 1,
     }, { onConflict: "device_id,user_email" });
     if (error) throw error;

@@ -2997,7 +2997,7 @@ async function computeTopicalFallback(query, knownSymbols) {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-6", max_tokens: 250, temperature: 0,
+          model: CLAUDE_MODEL_LIGHT, max_tokens: 250, temperature: 0,
           system: TOPICAL_PROMPT,
           messages: [{ role: "user", content: `Topic: "${query}"\n\nArticles:\n${listing}` }],
         }),
@@ -3006,6 +3006,7 @@ async function computeTopicalFallback(query, knownSymbols) {
         console.error(`computeTopicalFallback "${query}": Anthropic ${res.status}`);
       } else {
         const data = await res.json();
+        logClaudeUsage("agitator-topical", data.usage);
         const text = data.content?.[0]?.text || "";
         const match = text.match(/\{[\s\S]*\}/);
         if (!match) {
@@ -3262,13 +3263,14 @@ async function scoreAgitatorFactors(symbol, headline) {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", max_tokens: 150, temperature: 0,
+        model: CLAUDE_MODEL_LIGHT, max_tokens: 150, temperature: 0,
         system: AGITATOR_PROMPT,
         messages: [{ role: "user", content: `Ticker: ${symbol}\nHeadline: "${headline}"` }],
       }),
     }, 20000);
     if (!res.ok) throw new Error(`Anthropic ${res.status}`);
     const data = await res.json();
+    logClaudeUsage(`agitator-score ${symbol}`, data.usage);
     const text = data.content?.[0]?.text || "";
     const match = text.match(/\{[^}]*\}/);
     if (!match) return null;
@@ -4157,6 +4159,31 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regim
   return buildDynamicProxyRule(resolved, saved?.candidateConfirms);
 }
 
+// ─── CLAUDE MODEL CHOICE + USAGE LOGGING (Sep 28, 2026) ───────────────
+// The Anthropic account hit its monthly usage cap Sep 27. /analyze -- the
+// verdict itself -- stays on Sonnet; the short, structured side jobs
+// (Sector Pulse's 2-sentence summary, Agitator headline scoring, Agitator
+// topical article pick/extraction) moved to Haiku 4.5 at 1/3 the price.
+// Topical extraction stays guarded by classifyEntityMatch() either way, so
+// a weaker pick can't put a wrong company on the card.
+const CLAUDE_MODEL_ANALYZE = "claude-sonnet-4-6";
+const CLAUDE_MODEL_LIGHT   = "claude-haiku-4-5";
+
+// One line per Claude call so spend can be checked against the Anthropic
+// bill (Tra never recorded token usage before). cache_read > 0 on /analyze
+// confirms the SYSTEM_PROMPT prompt cache is actually hitting.
+function logClaudeUsage(label, usage) {
+  if (!usage) return;
+  console.log(`[CLAUDE USAGE] ${label} in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
+}
+
+// Sector Pulse only depends on the market % changes below, so an identical
+// input would just re-buy the identical summary. /market re-runs this on
+// every 4-min cache refresh, 24/7 -- including nights/weekends when the
+// numbers are frozen -- so reuse the last result whenever the input text is
+// byte-identical.
+let lastPulseInput = null, lastPulseText = null;
+
 async function generatePulse(marketData) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
@@ -4168,6 +4195,7 @@ Crypto: BTC ${marketData.btc?.change||"?"}
 Broad: SPY ${marketData.spy?.change||"?"}, IWM ${marketData.iwm?.change||"?"}
 Write exactly 2 sentences: sector rotation summary for a swing trader.
 `;
+  if (msg === lastPulseInput && lastPulseText) return lastPulseText;
   try {
     const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -4177,7 +4205,7 @@ Write exactly 2 sentences: sector rotation summary for a swing trader.
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", max_tokens: 120,
+        model: CLAUDE_MODEL_LIGHT, max_tokens: 120,
         temperature: 0,
         system: PULSE_PROMPT,
         messages: [{ role: "user", content: msg }],
@@ -4185,7 +4213,10 @@ Write exactly 2 sentences: sector rotation summary for a swing trader.
     }, 20000);
     if (!res.ok) throw new Error(`Anthropic ${res.status}`);
     const data = await res.json();
-    return data.content?.[0]?.text?.trim() || null;
+    logClaudeUsage("pulse", data.usage);
+    const text = data.content?.[0]?.text?.trim() || null;
+    if (text) { lastPulseInput = msg; lastPulseText = text; }
+    return text;
   } catch(e) { return null; }
 }
 
@@ -5869,9 +5900,15 @@ Return only JSON.
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", max_tokens: 800,
+        model: CLAUDE_MODEL_ANALYZE, max_tokens: 800,
         temperature: 0,
-        system: SYSTEM_PROMPT,
+        // SYSTEM_PROMPT (~4k tokens) is byte-identical on every call -- all
+        // per-ticker data lives in the user message -- so it's prompt-cached:
+        // a repeat within ~5 min reads it at ~10% of the input price instead
+        // of paying full price every time. Don't interpolate anything
+        // per-request into SYSTEM_PROMPT or the cache silently stops hitting
+        // (watch cache_read in the [CLAUDE USAGE] log line).
+        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
         messages: [{ role: "user", content: userMessage }],
       }),
     }, 25000);
@@ -5887,6 +5924,7 @@ Return only JSON.
     }
 
     const data  = await response.json();
+    logClaudeUsage(`analyze ${ticker}`, data.usage);
     const text  = data.content?.[0]?.text || "";
     const clean = text.replace(/```json|```/g, "").trim();
 

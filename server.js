@@ -1105,11 +1105,9 @@ A single strong tailwind does not overcome multiple headwinds.
 A single headwind does not confirm a downtrend without corroboration.
 
 IMPORTANT RULES:
-- Pre-Gate status is PRE-DETERMINED by the server. Copy exactly. Never override.
-- Gate 0 status is PRE-DETERMINED by the server. Copy exactly. Never override.
-- Gate 1 status is PRE-DETERMINED by the server. Copy exactly. Never override.
-- Gate 4 phase is PRE-DETERMINED by the server. Copy exactly. Never override.
-- Gate 5 proxy is PRE-DETERMINED by the server. Copy exactly. Never override.
+- Pre-Gate, Gate 0, Gate 1, Gate 4 and Gate 5 are PRE-DETERMINED by the server.
+  Use them in your congruency reasoning exactly as given — never override them —
+  but do NOT write them into your output: the server attaches them itself.
 - Temperature is 0 — be deterministic. Same data = same verdict every time.
 - News headlines provided ARE potential catalysts — treat them as Gate 2 evidence.
 - Always check congruency between gates before assigning verdict.
@@ -1350,25 +1348,10 @@ the verdict — not just that the pre-determined gate statuses happen to be
 green. If the ticker's own price and its proxy disagree with each other,
 that is a congruency conflict even if no individual gate is RED.
 
-Return ONLY:
-{
-  "ticker": "SYMBOL",
-  "type": "CANARY|SENTIMENT|FLOW",
-  "verdict": "UP|DOWN|FLAT",
-  "confidence": "HIGH|MEDIUM|LOW",
-  "reason": "One sentence — cite the specific congruency or conflict driving the verdict.",
-  "gates": {
-    "pre_gate":     { "status": "GREEN|YELLOW|RED", "note": "brief" },
-    "sector":       { "status": "GREEN|YELLOW|RED", "note": "brief, include strength" },
-    "g1_prewindow": { "status": "GREEN|YELLOW|RED", "note": "brief" },
-    "g2_catalyst":  { "status": "GREEN|YELLOW|RED", "note": "catalyst type + congruency" },
-    "g3_openbar":   { "status": "GREEN|YELLOW|RED", "note": "brief" },
-    "g4_phase":     { "status": "GREEN|YELLOW|RED", "note": "brief" },
-    "g5_korea":     { "status": "GREEN|YELLOW|RED", "note": "proxy name + tier + beta note if relevant" }
-  },
-  "sizing": "FULL|HALF|QUARTER|NONE",
-  "wait_for": "null or specific condition to watch for"
-}
+Return ONLY minified JSON on a single line (no line breaks, no indentation,
+no spaces between keys and values), with exactly these fields:
+{"ticker":"SYMBOL","type":"CANARY|SENTIMENT|FLOW","verdict":"UP|DOWN|FLAT","confidence":"HIGH|MEDIUM|LOW","reason":"One sentence — cite the specific congruency or conflict driving the verdict.","gates":{"g2_catalyst":{"status":"GREEN|YELLOW|RED","note":"catalyst type + congruency"},"g3_openbar":{"status":"GREEN|YELLOW|RED","note":"brief"}},"sizing":"FULL|HALF|QUARTER|NONE","wait_for":"null or specific condition to watch for"}
+Only Gates 2 and 3 go in "gates" — Pre-Gate and Gates 0/1/4/5 are added by the server.
 `;
 
 const PULSE_PROMPT = `
@@ -5887,8 +5870,8 @@ Gate 3 Friday full-weight check: ${fridayWeightContext}
 Additional context: ${marketContext || "None"}
 Gate 2 corroboration: ${contextCorroboration.note}
 
-Run Gates 2 and 3 only. Pre-Gate, Gate 0, Gate 1, Gate 4, and Gate 5 are provided above — copy them exactly.
-Return only JSON.
+Run Gates 2 and 3 only. Pre-Gate, Gate 0, Gate 1, Gate 4, and Gate 5 are provided above — use them in your reasoning, but do not repeat them in your output.
+Return only single-line minified JSON.
 `;
 
   try {
@@ -5930,6 +5913,16 @@ Return only JSON.
 
     try {
       const parsed = JSON.parse(clean);
+
+      // The model only writes Gates 2 and 3 (the two judgment gates); the
+      // other five are server-computed and attached here. Rebuilt in the
+      // canonical order so the response shape is identical to before.
+      const modelGates = parsed.gates || {};
+      parsed.gates = {
+        pre_gate: null, sector: null, g1_prewindow: null,
+        g2_catalyst: modelGates.g2_catalyst, g3_openbar: modelGates.g3_openbar,
+        g4_phase: null, g5_korea: null,
+      };
 
       // ── SERVER ENFORCEMENT: Pre-Gate ──────────────────────────────
       parsed.gates.pre_gate = { status: preGateResult.status, note: preGateResult.note };

@@ -5575,6 +5575,10 @@ function setCache(key, data) {
 }
 
 // ─── ANALYZE ──────────────────────────────────────────────────────
+// Shown on the ticker card whenever /analyze can't produce a verdict for a
+// reason on our side (not the user's) -- always paired with a credit refund.
+const ANALYSIS_UNAVAILABLE_MSG = "Analysis is temporarily unavailable. You weren't charged a credit \u2014 please try again later.";
+
 app.post("/analyze", async (req, res) => {
   const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData, dialPosition, holdThroughEarnings } = req.body;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
@@ -5620,8 +5624,23 @@ app.post("/analyze", async (req, res) => {
     return res.json({ ...cached, fromCache: true });
   }
 
-  // Deduct 1 credit (only if not cached)
-  await credits.deductCredit(req.userKey, 1, req.userTier);
+  // Deduct 1 credit (only if not cached). Tracked so every exit below that
+  // ends WITHOUT a verdict (Anthropic down/usage-capped, timeout,
+  // unparseable response) can refund it -- a user should never pay for an
+  // error. Sep 28, 2026: an Anthropic account usage cap made every ANALYZE
+  // fail with a raw "Anthropic error 400" while still charging for it.
+  const charged = await credits.deductCredit(req.userKey, 1, req.userTier);
+  let refunded = false;
+  const refundIfCharged = async (reason) => {
+    if (!charged || refunded) return;
+    refunded = true;
+    try {
+      await credits.refundCredit(req.userKey, 1);
+      console.log(`/analyze ${ticker}: refunded credit (${reason})`);
+    } catch (e) {
+      console.error(`/analyze ${ticker}: credit refund failed (${reason}):`, e.message);
+    }
+  };
 
   // Dial-proof at all 5 positions, no exceptions, per direct instruction --
   // only runs where the Dial feature itself is enabled (tierConfig.dial),
@@ -5858,8 +5877,13 @@ Return only JSON.
     }, 25000);
 
     if (!response.ok) {
+      // The raw Anthropic body stays in Render logs only -- it's
+      // infrastructure detail (billing caps, key problems) users can't act
+      // on, and it used to render verbatim on the card as "Anthropic error 400".
       const errText = await response.text();
-      return res.status(502).json({ error: `Anthropic error ${response.status}`, detail: errText });
+      console.error(`/analyze ${ticker}: Anthropic ${response.status}: ${errText.slice(0, 500)}`);
+      await refundIfCharged(`anthropic ${response.status}`);
+      return res.status(503).json({ error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_UNAVAILABLE" });
     }
 
     const data  = await response.json();
@@ -6155,11 +6179,15 @@ Return only JSON.
         userEmail: req.userEmail, tier: req.userTier,
       });
       res.json(result);
-    } catch {
-      res.status(500).json({ error: "Failed to parse AI response", raw: text });
+    } catch (parseErr) {
+      console.error(`/analyze ${ticker}: failed to parse/enforce AI response: ${parseErr && parseErr.message} | raw: ${text.slice(0, 300)}`);
+      await refundIfCharged("unparseable response");
+      res.status(500).json({ error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_BAD_RESPONSE" });
     }
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error(`/analyze ${ticker}: ${err && err.message}`);
+    await refundIfCharged("request failed");
+    res.status(503).json({ error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_UNAVAILABLE" });
   }
 });
 

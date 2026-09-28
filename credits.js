@@ -198,6 +198,17 @@ async function deductCreditSupabase(apiKey, count, tier) {
   return !!row.success;
 }
 
+// Reverses one deductCredit() call for an /analyze that never produced a
+// verdict (Anthropic outage/usage cap, timeout, unparseable response) --
+// see refund_user_credit in supabase-ddl-patch22-refund-credit.sql. Rolls
+// pending_analyses back; if that crosses a whole-credit boundary, the
+// credit comes back as a purchased credit (never expires, can't be wiped
+// by a weekly/monthly reset before the user gets to use it).
+async function refundCreditSupabase(apiKey, count) {
+  const row = await rpc("refund_user_credit", { p_key: apiKey, p_count: count });
+  return !!row?.success;
+}
+
 async function addPurchasedCreditsSupabase(apiKey, count, tier) {
   const row = await rpc("add_purchased_credits", { p_key: apiKey, p_tier: tier || null, p_count: count });
   return getTotalCredits(rowToUser(row));
@@ -322,6 +333,17 @@ function deductCreditLocal(apiKey, count, tier) {
   return true;
 }
 
+function refundCreditLocal(apiKey, count) {
+  const user = getUserLocal(apiKey);
+  let pending = (user.pendingAnalyses || 0) - count;
+  let restore = 0;
+  while (pending < 0) { pending += ANALYSES_PER_CREDIT; restore += 1; }
+  user.pendingAnalyses  = pending;
+  user.purchasedCredits = (user.purchasedCredits || 0) + restore;
+  saveCreditsLocal();
+  return true;
+}
+
 function addPurchasedCreditsLocal(apiKey, count, tier) {
   const user = getUserLocal(apiKey, tier);
   user.purchasedCredits = (user.purchasedCredits || 0) + count;
@@ -377,6 +399,10 @@ async function deductCredit(apiKey, count = 1, tier) {
   return supabaseClient ? deductCreditSupabase(apiKey, count, tier) : deductCreditLocal(apiKey, count, tier);
 }
 
+async function refundCredit(apiKey, count = 1) {
+  return supabaseClient ? refundCreditSupabase(apiKey, count) : refundCreditLocal(apiKey, count);
+}
+
 async function addPurchasedCredits(apiKey, count, tier) {
   return supabaseClient ? addPurchasedCreditsSupabase(apiKey, count, tier) : addPurchasedCreditsLocal(apiKey, count, tier);
 }
@@ -401,6 +427,7 @@ module.exports = {
   getUser,
   getUserStatus,
   deductCredit,
+  refundCredit,
   addPurchasedCredits,
   upgradeTier,
   setTier,

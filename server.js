@@ -310,6 +310,7 @@ app.use(async (req, res, next) => {
   if (req.path === "/") return next();
   if (req.path === "/auth/login") return next();
   if (req.path === "/auth/signup") return next();
+  if (req.path === "/auth/refresh") return next();
   if (req.path === "/auth/reset") return next();
   if (req.path === "/auth/reset-confirm") return next();
   if (req.path === "/stripe/webhook") return next();
@@ -6194,6 +6195,27 @@ app.post("/auth/login", async (req, res) => {
       tier,
       redirectUrl,
       expiresAt:   data.session.expires_at,
+      // Lets the client silently renew the ~1h access token instead of
+      // forcing a re-login every hour (shared/session.ts, 24h sign-in).
+      refreshToken: data.session.refresh_token,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Trade a refresh token for a fresh access token. Uses the throwaway
+// authClient(), never the shared admin client (see the Aug 4, 2026
+// session-contamination fix above).
+app.post("/auth/refresh", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Auth not configured" });
+  const { refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(400).json({ error: "refreshToken required" });
+  try {
+    const { data, error } = await authClient().auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !data?.session) return res.status(401).json({ error: (error && error.message) || "Refresh failed" });
+    res.json({
+      token:        data.session.access_token,
+      refreshToken: data.session.refresh_token,
+      expiresAt:    data.session.expires_at,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });

@@ -89,6 +89,50 @@ function addTradingDays(date, n) {
   return d;
 }
 
+// ── Horizon grading (Sep 29, 2026) ─────────────────────────────────────
+// Each verdict is graded at the close of the session that matches the
+// user's own Aggression Dial "recheck" cadence, instead of one fixed
+// window for everyone. Session 0 = the session the verdict was issued in.
+// Free and pre-dial rows have no dial position and get the CRF default.
+// Only verdicts issued while the market was open are horizon-graded:
+// off-hours verdicts are built on inputs that don't exist yet (opening
+// bar, session context) and aren't tradable when issued, so they're
+// logged for the record but never counted in any accuracy stat.
+const HORIZON_SESSIONS_BY_DIAL = {
+  ACTIVE_SWING:  0, // Aggressive -- "every session": that session's close
+  ACTIVE_LEAN:   1, // Light Aggressive -- "daily"
+  NEUTRAL:       1, // CRF default
+  POSITION_LEAN: 2, // Light Passive -- "2-3x per week"
+  POSITION_LONG: 5, // Passive -- "weekly"
+};
+function horizonSessionsFor(dialPosition) {
+  const n = HORIZON_SESSIONS_BY_DIAL[dialPosition];
+  return n == null ? HORIZON_SESSIONS_BY_DIAL.NEUTRAL : n;
+}
+function isTradingDate(dateStr) {
+  const d = new Date(`${dateStr}T12:00:00Z`).getUTCDay();
+  return d !== 0 && d !== 6 && !MARKET_HOLIDAYS.has(dateStr);
+}
+function nextTradingDate(dateStr) {
+  const d = new Date(`${dateStr}T12:00:00Z`);
+  do { d.setUTCDate(d.getUTCDate() + 1); } while (!isTradingDate(d.toISOString().slice(0, 10)));
+  return d.toISOString().slice(0, 10);
+}
+// { targetDate: "YYYY-MM-DD", dueAt: Date } -- dueAt is 20 minutes after
+// that session's close, so the daily bar is final before it's read.
+function horizonTargetFor(issuedAt, sessions) {
+  let date = etDateStr(new Date(issuedAt.toLocaleString("en-US", { timeZone: "America/New_York" })));
+  for (let i = 0; i < sessions; i++) date = nextTradingDate(date);
+  const closeHour = MARKET_EARLY_CLOSE_DAYS.has(date) ? 13 : 16;
+  // Close time in ET -> UTC. Offset taken from the target date itself so
+  // DST changes between issue and target are handled.
+  const probe = new Date(`${date}T12:00:00Z`);
+  const etNoon = new Date(probe.toLocaleString("en-US", { timeZone: "America/New_York" })); // ET wall clock at 12:00 UTC
+  const offsetHours = 12 - etNoon.getHours(); // 4 during EDT, 5 during EST
+  const dueAt = new Date(Date.UTC(+date.slice(0, 4), +date.slice(5, 7) - 1, +date.slice(8, 10), closeHour + offsetHours, 20));
+  return { targetDate: date, dueAt };
+}
+
 // Pass supabase client to credit system
 credits.setSupabase(supabase);
 
@@ -424,9 +468,15 @@ function etDateStr(d) {
 }
 
 function isMarketOpen() {
-  const now = new Date();
+  return isMarketOpenAt(new Date());
+}
+
+// Same check as isMarketOpen(), for any instant -- used to stamp each
+// verdict_log row with whether the market was actually open when it was
+// issued (Sep 29, 2026; see logVerdict).
+function isMarketOpenAt(when) {
   // Convert to ET
-  const et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const et = new Date(when.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const day = et.getDay(); // 0=Sun, 6=Sat
   if (day === 0 || day === 6) return false;
   const dateStr = etDateStr(et);
@@ -3186,8 +3236,8 @@ async function computeHistoricalReaction(symbol) {
   const cached = historicalReactionCache.get(symbol);
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
-    const { data, error } = await supabase.from("verdict_log").select("grade")
-      .eq("ticker", symbol).eq("superseded", false).not("graded_at", "is", null);
+    const { data, error } = await supabase.from("verdict_log").select("grade:grade_horizon")
+      .eq("ticker", symbol).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
     if (error) { console.error(`computeHistoricalReaction ${symbol}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
     const result = stats.insufficientData ? null : {
@@ -3222,8 +3272,8 @@ async function computeDirectionalAccuracy(symbol, direction) {
   const cached = directionalAccuracyCache.get(key);
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
-    const { data, error } = await supabase.from("verdict_log").select("grade")
-      .eq("ticker", symbol).eq("verdict", direction).eq("superseded", false).not("graded_at", "is", null);
+    const { data, error } = await supabase.from("verdict_log").select("grade:grade_horizon")
+      .eq("ticker", symbol).eq("verdict", direction).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
     if (error) { console.error(`computeDirectionalAccuracy ${symbol} ${direction}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
     const result = stats.insufficientData ? null : {
@@ -3598,6 +3648,12 @@ async function logVerdict(fields) {
     const issuedAt = new Date();
     const dueAtPrimary = addHours(issuedAt, PRIMARY_GRADING_WINDOW_HOURS);
     const dueAtSecondary = addTradingDays(issuedAt, SECONDARY_GRADING_WINDOW_TRADING_DAYS);
+    // Horizon grading (Sep 29, 2026) -- see HORIZON_SESSIONS_BY_DIAL.
+    // Off-hours verdicts get no horizon at all, so they're never graded
+    // into any accuracy stat.
+    const marketOpenAtIssue = isMarketOpenAt(issuedAt);
+    const horizonSessions = horizonSessionsFor(fields.dialPosition);
+    const horizon = marketOpenAtIssue ? horizonTargetFor(issuedAt, horizonSessions) : null;
     await supabase.from("verdict_log").insert({
       ticker:                    fields.ticker,
       issued_at:                 issuedAt.toISOString(),
@@ -3629,6 +3685,10 @@ async function logVerdict(fields) {
       grade_due_at_secondary:    dueAtSecondary.toISOString(),
       user_email:                fields.userEmail || null,
       tier:                      fields.tier,
+      issued_market_open:        marketOpenAtIssue,
+      horizon_sessions:          marketOpenAtIssue ? horizonSessions : null,
+      horizon_target_date:       horizon ? horizon.targetDate : null,
+      horizon_due_at:            horizon ? horizon.dueAt.toISOString() : null,
     });
   } catch (e) {
     console.error(`logVerdict ${fields.ticker}:`, e.message);
@@ -3766,19 +3826,112 @@ async function gradeDueRows(dueColumn, gradeColumn, returnColumn, gradedAtColumn
   }
   return due.length;
 }
+// Horizon grader (Sep 29, 2026). Grades against the target session's
+// official daily close (Alpaca daily bar, raw prices so a later split
+// can't distort it) rather than whatever the live quote happens to be
+// when the sweep runs -- the 24h/5d graders above keep running for the
+// record, but only this one feeds accuracy stats. A row that can't be
+// graded (no entry price, or no bar for its ticker -- e.g. crypto -- a
+// few days after its target) is closed out with no grade instead of
+// being retried forever.
+const HORIZON_GRADING_BATCH_SIZE = 150;
+const HORIZON_GIVE_UP_AFTER_MS = 3 * 24 * 60 * 60 * 1000;
+const sessionCloseCache = new Map(); // "SYM:YYYY-MM-DD" -> close
+async function fetchSessionClose(symbol, dateStr) {
+  const key = `${symbol}:${dateStr}`;
+  if (sessionCloseCache.has(key)) return sessionCloseCache.get(key);
+  if (!alpacaKeys()) return null;
+  try {
+    const data = await alpacaGet(
+      `/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=1Day&start=${dateStr}&end=${dateStr}&limit=1&feed=iex&adjustment=raw`
+    );
+    const bar = (data.bars || [])[0];
+    const close = bar && typeof bar.c === "number" && bar.c > 0 ? bar.c : null;
+    if (close != null) sessionCloseCache.set(key, close);
+    return close;
+  } catch (e) {
+    console.error(`fetchSessionClose ${symbol} ${dateStr}:`, e.message);
+    return null;
+  }
+}
+async function gradeHorizonRows() {
+  const now = Date.now();
+  const { data: due, error } = await supabase
+    .from("verdict_log")
+    .select("id, ticker, verdict, issued_price, horizon_target_date, horizon_due_at")
+    .eq("issued_market_open", true)
+    .is("graded_at_horizon", null)
+    .lte("horizon_due_at", new Date(now).toISOString())
+    .order("horizon_due_at", { ascending: true })
+    .limit(HORIZON_GRADING_BATCH_SIZE);
+  if (error) { console.error("gradeHorizonRows query:", error.message); return 0; }
+  if (!due || !due.length) return 0;
+  let graded = 0;
+  for (const row of due) {
+    const close = row.issued_price == null ? null : await fetchSessionClose(row.ticker, row.horizon_target_date);
+    if (close == null) {
+      const stale = row.issued_price == null || now - new Date(row.horizon_due_at).getTime() > HORIZON_GIVE_UP_AFTER_MS;
+      if (stale) await supabase.from("verdict_log").update({ graded_at_horizon: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const r = (close - row.issued_price) / row.issued_price * 100;
+    await supabase.from("verdict_log").update({
+      actual_return_pct_horizon: r,
+      grade_horizon: classifyVerdictReturn(row.verdict, r),
+      graded_at_horizon: new Date().toISOString(),
+    }).eq("id", row.id);
+    graded++;
+  }
+  return graded;
+}
+
+// Backfill for rows logged before horizon grading shipped (Sep 29, 2026):
+// stamps issued_market_open and the horizon target using the same helpers
+// logVerdict() uses, so history and new rows follow one rule. Pure
+// compute, no network calls; a no-op once every row has been stamped.
+const HORIZON_BACKFILL_BATCH_SIZE = 500;
+async function backfillHorizonFields() {
+  const { data: rows, error } = await supabase
+    .from("verdict_log")
+    .select("id, issued_at, dial_position")
+    .is("issued_market_open", null)
+    .limit(HORIZON_BACKFILL_BATCH_SIZE);
+  if (error) { console.error("backfillHorizonFields query:", error.message); return 0; }
+  if (!rows || !rows.length) return 0;
+  for (const row of rows) {
+    const issuedAt = new Date(row.issued_at);
+    const open = isMarketOpenAt(issuedAt);
+    const sessions = horizonSessionsFor(row.dial_position);
+    const h = open ? horizonTargetFor(issuedAt, sessions) : null;
+    await supabase.from("verdict_log").update({
+      issued_market_open:  open,
+      horizon_sessions:    open ? sessions : null,
+      horizon_target_date: h ? h.targetDate : null,
+      horizon_due_at:      h ? h.dueAt.toISOString() : null,
+    }).eq("id", row.id);
+  }
+  return rows.length;
+}
+
 async function runVerdictGradingSweep() {
   if (!supabase) return;
   try {
+    const backfilled = await backfillHorizonFields();
+    if (backfilled) console.log(`Verdict horizon backfill: ${backfilled} row(s) stamped.`);
     const primaryCount = await gradeDueRows("grade_due_at", "grade", "actual_return_pct", "graded_at");
     const secondaryCount = await gradeDueRows("grade_due_at_secondary", "grade_secondary", "actual_return_pct_secondary", "graded_at_secondary");
-    if (primaryCount || secondaryCount) {
-      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary row(s) processed.`);
+    const horizonCount = await gradeHorizonRows();
+    if (primaryCount || secondaryCount || horizonCount) {
+      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon row(s) graded.`);
     }
   } catch (e) {
     console.error("runVerdictGradingSweep:", e.message);
   }
 }
 setInterval(() => { runVerdictGradingSweep().catch(e => console.error("runVerdictGradingSweep:", e.message)); }, 30 * 60 * 1000);
+// One pass shortly after boot so a deploy doesn't wait 30 minutes to work
+// through any backlog (e.g. the Sep 29, 2026 horizon backfill).
+setTimeout(() => { runVerdictGradingSweep().catch(e => console.error("runVerdictGradingSweep:", e.message)); }, 60 * 1000);
 
 // ─── PROPOSAL 3 — FIXED-PROXY REGIME VALIDATION (Aug 13, 2026) ────────
 // gates-extended.js's regimeValidation()/resolveFixedProxyBreak() have
@@ -4948,6 +5101,10 @@ const SCORECARD_TICKER_MIN_GRADED = 5;
 // strict denominator either -- directionalPct is completely unaffected
 // by this and keeps using every primary-graded row immediately, same
 // "fast, low-bar accuracy read" role the single check used to fill.
+// Sep 29, 2026: every accuracy reader now selects grade_horizon (aliased
+// to `grade`) and only market-hours verdicts, so `grade` below means the
+// verdict's own dial-horizon grade. strictPct stays null from here on --
+// grade_secondary isn't selected any more, and no UI shows it.
 function computeAccuracyStats(rows) {
   const total = rows.length;
   if (!total) return { gradedCount: 0, strictPct: null, directionalPct: null };
@@ -5037,8 +5194,8 @@ async function fetchScorecardPool() {
     return scorecardPoolCache.data;
   }
   const { data, error } = await supabase
-    .from("verdict_log").select("ticker, grade, verdict")
-    .eq("superseded", false).not("graded_at", "is", null);
+    .from("verdict_log").select("ticker, verdict, grade:grade_horizon")
+    .eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
   if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
   scorecardPoolCache = { data: data || [], time: Date.now() };
   return scorecardPoolCache.data;
@@ -5084,8 +5241,8 @@ app.get("/scorecard", async (req, res) => {
   try {
     if (req.userTier === "free") {
       const { data, error } = await supabase
-        .from("verdict_log").select("grade")
-        .eq("tier", "free").eq("superseded", false).not("graded_at", "is", null);
+        .from("verdict_log").select("grade:grade_horizon")
+        .eq("tier", "free").eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
       if (error) { console.error("GET /scorecard (free):", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
       const stats = computeAccuracyStats(data || []);
       if (stats.gradedCount < SCORECARD_MIN_GRADED) return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
@@ -5105,8 +5262,8 @@ app.get("/scorecard", async (req, res) => {
     const email = req.userEmail.trim().toLowerCase();
     const { data, error } = await supabase
       .from("verdict_log")
-      .select("grade, grade_secondary, verdict, size_action, actual_return_pct")
-      .eq("user_email", email).eq("superseded", false).not("graded_at", "is", null);
+      .select("grade:grade_horizon, verdict, size_action, actual_return_pct:actual_return_pct_horizon")
+      .eq("user_email", email).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
     if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
     const rows  = data || [];
     const stats = computeAccuracyStats(rows);

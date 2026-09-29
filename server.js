@@ -3901,6 +3901,19 @@ function walkTradePath(bars, entry, direction, levels, closePrice) {
   if (closePrice == null) return null;
   return { outcome: "NEITHER", pathReturnPct: signed(closePrice) };
 }
+// Pure: grades an UP/DOWN call per Mr. T's rule (Sep 29, 2026). The close
+// decides it -- closing in the call's direction by any amount is right,
+// closing against it by any amount is wrong. The one exception: if the
+// price reached the dial's target % at any point in the window but still
+// closed against the call, that's half credit (MARGINAL). The stop plays
+// no part in the grade; it only feeds path_return_pct (avg return/trade).
+function gradeDirectionalCall(bars, entry, direction, targetPct, closeReturnPct) {
+  const dir = direction === "UP" ? 1 : -1;
+  if (dir * closeReturnPct > 0) return "TRUE";
+  const targetPx = entry * (1 + dir * targetPct / 100);
+  const touched = (bars || []).some(b => dir === 1 ? b.h >= targetPx : b.l <= targetPx);
+  return touched ? "MARGINAL" : "FALSE";
+}
 async function fetchSessionBars(symbol, fromIso, toIso) {
   if (!alpacaKeys()) return null;
   try {
@@ -3949,8 +3962,9 @@ async function fetchNormalDailyMovePct(symbol, issueDateStr) {
 // (Mr. T's call), close-enough out to one full normal day. Falls back to
 // the fixed band when there's no history to size it from.
 function classifyFlatReturn(r, normalMovePct) {
-  if (normalMovePct == null) return classifyVerdictReturn("FLAT", r);
   const a = Math.abs(r);
+  if (a < 0.1) return "TRUE"; // truly flat always counts in full
+  if (normalMovePct == null) return classifyVerdictReturn("FLAT", r);
   if (a <= 0.5 * normalMovePct) return "TRUE";
   if (a <= normalMovePct) return "MARGINAL";
   return "FALSE";
@@ -3981,12 +3995,11 @@ async function gradeHorizonRows() {
     if (row.verdict === "UP" || row.verdict === "DOWN") {
       const bars = await fetchSessionBars(row.ticker, new Date(row.issued_at).toISOString(), new Date(row.horizon_due_at).toISOString());
       if (bars == null) continue; // fetch failed -- retry next sweep
-      const path = walkTradePath(bars, row.issued_price, row.verdict, tradePathFor(row.dial_position), close);
+      const levels = tradePathFor(row.dial_position);
+      const path = walkTradePath(bars, row.issued_price, row.verdict, levels, close);
       update.path_outcome    = path.outcome;
       update.path_return_pct = path.pathReturnPct;
-      update.grade_horizon   = path.outcome === "TARGET" ? "TRUE"
-                             : path.outcome === "STOP"   ? "FALSE"
-                             : classifyVerdictReturn(row.verdict, r);
+      update.grade_horizon   = gradeDirectionalCall(bars, row.issued_price, row.verdict, levels.target, r);
     } else {
       const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
       const normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
@@ -5225,7 +5238,9 @@ const SCORECARD_TICKER_MIN_GRADED = 5;
 // every floor built on it gates on real directional calls. Callers must
 // select `verdict` alongside `grade`.
 function computeAccuracyStats(rows) {
-  const pctRight = (rs) => +(rs.filter(r => r.grade === "TRUE" || r.grade === "MARGINAL").length / rs.length * 100).toFixed(1);
+  // TRUE = full credit, MARGINAL = half credit (Mr. T, Sep 29, 2026), FALSE = none.
+  const credit = (g) => g === "TRUE" ? 1 : g === "MARGINAL" ? 0.5 : 0;
+  const pctRight = (rs) => +(rs.reduce((a, r) => a + credit(r.grade), 0) / rs.length * 100).toFixed(1);
   const directional = rows.filter(r => r.verdict === "UP" || r.verdict === "DOWN");
   const flat = rows.filter(r => r.verdict !== "UP" && r.verdict !== "DOWN");
   return {

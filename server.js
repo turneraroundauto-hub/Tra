@@ -3236,7 +3236,7 @@ async function computeHistoricalReaction(symbol) {
   const cached = historicalReactionCache.get(symbol);
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
-    const { data, error } = await supabase.from("verdict_log").select("grade:grade_horizon")
+    const { data, error } = await supabase.from("verdict_log").select("verdict, grade:grade_horizon")
       .eq("ticker", symbol).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
     if (error) { console.error(`computeHistoricalReaction ${symbol}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
@@ -3272,7 +3272,7 @@ async function computeDirectionalAccuracy(symbol, direction) {
   const cached = directionalAccuracyCache.get(key);
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
-    const { data, error } = await supabase.from("verdict_log").select("grade:grade_horizon")
+    const { data, error } = await supabase.from("verdict_log").select("verdict, grade:grade_horizon")
       .eq("ticker", symbol).eq("verdict", direction).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
     if (error) { console.error(`computeDirectionalAccuracy ${symbol} ${direction}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
@@ -3854,11 +3854,113 @@ async function fetchSessionClose(symbol, dateStr) {
     return null;
   }
 }
+// ── Trade-path grading + per-ticker FLAT band (Sep 29, 2026) ─────────
+// UP/DOWN verdicts are graded by the trade they'd actually have been:
+// walk regular-session 15-min bars from the moment the verdict was issued
+// to its horizon close and see whether the dial's profit target or its
+// stop was hit first. Targets are 2x the stop wherever the dial only lists
+// a stop (Light Passive, Passive, CRF Default -- confirmed by Mr. T); the
+// Aggressive tiers keep the +4% targets they already show. A bar that
+// touches both counts as the stop (can't tell which came first inside it).
+// A bar that opens past a level fills at its open (gap). Neither level hit
+// by the horizon close -> graded on the close, same as before.
+const TRADE_PATH_BY_DIAL = {
+  ACTIVE_SWING:  { target: 4,  stop: 1 },
+  ACTIVE_LEAN:   { target: 4,  stop: 3 },
+  NEUTRAL:       { target: 6,  stop: 3 },
+  POSITION_LEAN: { target: 10, stop: 5 },
+  POSITION_LONG: { target: 16, stop: 8 },
+};
+function tradePathFor(dialPosition) {
+  return TRADE_PATH_BY_DIAL[dialPosition] || TRADE_PATH_BY_DIAL.NEUTRAL;
+}
+// ET minutes-since-midnight and ET date for a bar timestamp.
+function etClock(ts) {
+  const et = new Date(new Date(ts).toLocaleString("en-US", { timeZone: "America/New_York" }));
+  return { date: etDateStr(et), minutes: et.getHours() * 60 + et.getMinutes() };
+}
+// Pure: given regular-session bars (ascending), the entry price and the
+// verdict direction, return { outcome, pathReturnPct } or null when there
+// are no bars. pathReturnPct is signed in the verdict's favor (+ = the
+// trade made money). closePrice is used when neither level is hit.
+function walkTradePath(bars, entry, direction, levels, closePrice) {
+  const dir = direction === "UP" ? 1 : -1;
+  const targetPx = entry * (1 + dir * levels.target / 100);
+  const stopPx   = entry * (1 - dir * levels.stop / 100);
+  const signed = (px) => dir * (px - entry) / entry * 100;
+  for (const b of bars) {
+    const hitsStop   = dir === 1 ? b.l <= stopPx   : b.h >= stopPx;
+    const hitsTarget = dir === 1 ? b.h >= targetPx : b.l <= targetPx;
+    const openedPastStop   = dir === 1 ? b.o <= stopPx   : b.o >= stopPx;
+    const openedPastTarget = dir === 1 ? b.o >= targetPx : b.o <= targetPx;
+    if (openedPastStop)   return { outcome: "STOP",   pathReturnPct: signed(b.o) };
+    if (openedPastTarget) return { outcome: "TARGET", pathReturnPct: signed(b.o) };
+    if (hitsStop)   return { outcome: "STOP",   pathReturnPct: -levels.stop };
+    if (hitsTarget) return { outcome: "TARGET", pathReturnPct: levels.target };
+  }
+  if (closePrice == null) return null;
+  return { outcome: "NEITHER", pathReturnPct: signed(closePrice) };
+}
+async function fetchSessionBars(symbol, fromIso, toIso) {
+  if (!alpacaKeys()) return null;
+  try {
+    const data = await alpacaGet(
+      `/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=15Min&start=${encodeURIComponent(fromIso)}&end=${encodeURIComponent(toIso)}&limit=1000&feed=iex&adjustment=raw`
+    );
+    return (data.bars || []).filter(b => {
+      const { date, minutes } = etClock(b.t);
+      const close = MARKET_EARLY_CLOSE_DAYS.has(date) ? 13 * 60 : 16 * 60;
+      return isTradingDate(date) && minutes >= 9 * 60 + 30 && minutes < close;
+    });
+  } catch (e) {
+    console.error(`fetchSessionBars ${symbol}:`, e.message);
+    return null;
+  }
+}
+// Average absolute daily % move over the 20 sessions before the verdict's
+// issue date -- the ticker's own "normal day". Split-adjusted so a split
+// doesn't read as a giant move.
+const FLAT_BAND_LOOKBACK_SESSIONS = 20;
+const normalMoveCache = new Map(); // "SYM:YYYY-MM-DD" -> pct
+async function fetchNormalDailyMovePct(symbol, issueDateStr) {
+  const key = `${symbol}:${issueDateStr}`;
+  if (normalMoveCache.has(key)) return normalMoveCache.get(key);
+  if (!alpacaKeys()) return null;
+  try {
+    const end = new Date(`${issueDateStr}T12:00:00Z`); end.setUTCDate(end.getUTCDate() - 1);
+    const start = new Date(end); start.setUTCDate(start.getUTCDate() - 45);
+    const data = await alpacaGet(
+      `/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=1Day&start=${start.toISOString().slice(0, 10)}&end=${end.toISOString().slice(0, 10)}&limit=100&feed=iex&adjustment=split`
+    );
+    const closes = (data.bars || []).map(b => b.c).filter(c => typeof c === "number" && c > 0);
+    const moves = [];
+    for (let i = 1; i < closes.length; i++) moves.push(Math.abs(closes[i] / closes[i - 1] - 1) * 100);
+    const recent = moves.slice(-FLAT_BAND_LOOKBACK_SESSIONS);
+    if (recent.length < 10) return null;
+    const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
+    normalMoveCache.set(key, avg);
+    return avg;
+  } catch (e) {
+    console.error(`fetchNormalDailyMovePct ${symbol}:`, e.message);
+    return null;
+  }
+}
+// FLAT is right when the move stayed within half the ticker's normal day
+// (Mr. T's call), close-enough out to one full normal day. Falls back to
+// the fixed band when there's no history to size it from.
+function classifyFlatReturn(r, normalMovePct) {
+  if (normalMovePct == null) return classifyVerdictReturn("FLAT", r);
+  const a = Math.abs(r);
+  if (a <= 0.5 * normalMovePct) return "TRUE";
+  if (a <= normalMovePct) return "MARGINAL";
+  return "FALSE";
+}
+
 async function gradeHorizonRows() {
   const now = Date.now();
   const { data: due, error } = await supabase
     .from("verdict_log")
-    .select("id, ticker, verdict, issued_price, horizon_target_date, horizon_due_at")
+    .select("id, ticker, verdict, issued_price, issued_at, dial_position, horizon_target_date, horizon_due_at")
     .eq("issued_market_open", true)
     .is("graded_at_horizon", null)
     .lte("horizon_due_at", new Date(now).toISOString())
@@ -3875,11 +3977,23 @@ async function gradeHorizonRows() {
       continue;
     }
     const r = (close - row.issued_price) / row.issued_price * 100;
-    await supabase.from("verdict_log").update({
-      actual_return_pct_horizon: r,
-      grade_horizon: classifyVerdictReturn(row.verdict, r),
-      graded_at_horizon: new Date().toISOString(),
-    }).eq("id", row.id);
+    const update = { actual_return_pct_horizon: r, graded_at_horizon: new Date().toISOString() };
+    if (row.verdict === "UP" || row.verdict === "DOWN") {
+      const bars = await fetchSessionBars(row.ticker, new Date(row.issued_at).toISOString(), new Date(row.horizon_due_at).toISOString());
+      if (bars == null) continue; // fetch failed -- retry next sweep
+      const path = walkTradePath(bars, row.issued_price, row.verdict, tradePathFor(row.dial_position), close);
+      update.path_outcome    = path.outcome;
+      update.path_return_pct = path.pathReturnPct;
+      update.grade_horizon   = path.outcome === "TARGET" ? "TRUE"
+                             : path.outcome === "STOP"   ? "FALSE"
+                             : classifyVerdictReturn(row.verdict, r);
+    } else {
+      const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
+      const normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
+      update.flat_band_pct = normal == null ? null : +(0.5 * normal).toFixed(3);
+      update.grade_horizon = classifyFlatReturn(r, normal);
+    }
+    await supabase.from("verdict_log").update(update).eq("id", row.id);
     graded++;
   }
   return graded;
@@ -5105,17 +5219,21 @@ const SCORECARD_TICKER_MIN_GRADED = 5;
 // to `grade`) and only market-hours verdicts, so `grade` below means the
 // verdict's own dial-horizon grade. strictPct stays null from here on --
 // grade_secondary isn't selected any more, and no UI shows it.
+// Sep 29, 2026 (Mr. T's call): the headline number counts UP/DOWN calls
+// only -- the ones you'd trade. FLAT is reported on its own (flatPct) so
+// it can't prop up the main number. gradedCount is the UP/DOWN count, so
+// every floor built on it gates on real directional calls. Callers must
+// select `verdict` alongside `grade`.
 function computeAccuracyStats(rows) {
-  const total = rows.length;
-  if (!total) return { gradedCount: 0, strictPct: null, directionalPct: null };
-  const trueCount     = rows.filter(r => r.grade === "TRUE").length;
-  const marginalCount = rows.filter(r => r.grade === "MARGINAL").length;
-  const secondaryGraded = rows.filter(r => r.grade_secondary != null);
-  const strictTrueCount = secondaryGraded.filter(r => r.grade === "TRUE" && r.grade_secondary === "TRUE").length;
+  const pctRight = (rs) => +(rs.filter(r => r.grade === "TRUE" || r.grade === "MARGINAL").length / rs.length * 100).toFixed(1);
+  const directional = rows.filter(r => r.verdict === "UP" || r.verdict === "DOWN");
+  const flat = rows.filter(r => r.verdict !== "UP" && r.verdict !== "DOWN");
   return {
-    gradedCount:    total,
-    strictPct:      secondaryGraded.length ? +(strictTrueCount / secondaryGraded.length * 100).toFixed(1) : null,
-    directionalPct: +((trueCount + marginalCount) / total * 100).toFixed(1),
+    gradedCount:     directional.length,
+    strictPct:       null,
+    directionalPct:  directional.length ? pctRight(directional) : null,
+    flatGradedCount: flat.length,
+    flatPct:         flat.length >= SCORECARD_TICKER_MIN_GRADED ? pctRight(flat) : null,
   };
 }
 function tickerStatsWithFloor(rows, minGraded) {
@@ -5147,14 +5265,17 @@ function computeExpectancyStats(rows) {
   const sized = rows.filter(r =>
     (r.verdict === "UP" || r.verdict === "DOWN") &&
     SIZE_MULTIPLIER[r.size_action] &&
-    r.actual_return_pct != null
+    (r.path_return_pct != null || r.actual_return_pct != null)
   );
   if (sized.length < SCORECARD_MIN_SIZED_GRADED) {
     return { sizedGradedCount: sized.length, insufficientSizedData: true };
   }
   const returns = sized.map(r => {
+    // path_return_pct is already signed in the verdict's favor and reflects
+    // the dial's stop/target (Sep 29, 2026); older rows fall back to the close.
     const direction = r.verdict === "UP" ? 1 : -1;
-    return direction * r.actual_return_pct * SIZE_MULTIPLIER[r.size_action];
+    const tradeReturn = r.path_return_pct != null ? r.path_return_pct : direction * r.actual_return_pct;
+    return tradeReturn * SIZE_MULTIPLIER[r.size_action];
   });
   const avgReturnPct = returns.reduce((a, b) => a + b, 0) / returns.length;
   const winCount = returns.filter(x => x > 0).length;
@@ -5241,7 +5362,7 @@ app.get("/scorecard", async (req, res) => {
   try {
     if (req.userTier === "free") {
       const { data, error } = await supabase
-        .from("verdict_log").select("grade:grade_horizon")
+        .from("verdict_log").select("verdict, grade:grade_horizon")
         .eq("tier", "free").eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
       if (error) { console.error("GET /scorecard (free):", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
       const stats = computeAccuracyStats(data || []);
@@ -5253,6 +5374,7 @@ app.get("/scorecard", async (req, res) => {
       // withhold either from Free's own aggregate view.
       return res.json({
         scope: "aggregate", directionalPct: stats.directionalPct, gradedCount: stats.gradedCount,
+        flatPct: stats.flatPct, flatGradedCount: stats.flatGradedCount,
         directionBreakdown: await computeDirectionBreakdownPooled(),
         topTickers: await computeTopTickers(SCORECARD_TOP_TICKERS_LIMIT),
       });
@@ -5262,7 +5384,7 @@ app.get("/scorecard", async (req, res) => {
     const email = req.userEmail.trim().toLowerCase();
     const { data, error } = await supabase
       .from("verdict_log")
-      .select("grade:grade_horizon, verdict, size_action, actual_return_pct:actual_return_pct_horizon")
+      .select("grade:grade_horizon, verdict, size_action, actual_return_pct:actual_return_pct_horizon, path_return_pct")
       .eq("user_email", email).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
     if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
     const rows  = data || [];
@@ -5272,6 +5394,7 @@ app.get("/scorecard", async (req, res) => {
     }
     const result = {
       scope: "personal", strictPct: stats.strictPct, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount,
+      flatPct: stats.flatPct, flatGradedCount: stats.flatGradedCount,
       expectancy: computeExpectancyStats(rows),
       // Pooled across every user/tier, not this user's own rows -- see the
       // comment above computeTopTickers for why.

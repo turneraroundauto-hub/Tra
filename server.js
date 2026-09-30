@@ -6505,7 +6505,7 @@ Return only single-line minified JSON.
         preGateState: preGateResult.status, gate1Branch: gate1Result.branch,
         gate0Read: gate0Reported,
         gate2CorroborationState: `${contextCorroboration.corroborated ? "GATE2-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/2)`,
-        dialPosition: req.tierConfig?.dial ? effectiveDialPosition : null,
+        dialPosition: effectiveDialPosition, // Free (no dial) logs as NEUTRAL = CRF Default, the same rules it runs under
         confidence: parsed.confidence,
         userEmail: req.userEmail, tier: req.userTier,
       });

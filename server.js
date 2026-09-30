@@ -133,6 +133,35 @@ function horizonTargetFor(issuedAt, sessions) {
   return { targetDate: date, dueAt };
 }
 
+// ── Day trade / Long grading (Sep 30, 2026) ────────────────────────────
+// Mr. T's call: the Scorecard shows two plain numbers instead of a dial-
+// dependent "directional accuracy" and an avg-return figure. Every market-
+// hours verdict is graded twice, the same way for every user and tier:
+//   day  = close of the session it was issued in (half credit if it touched
+//          +4% in the call's direction but closed wrong -- Aggressive's target)
+//   long = close of the 5th session after issue (half credit at +16% --
+//          Passive's target)
+// FLAT uses the ticker's normal daily move as its band; the long window
+// scales that band by sqrt(5), since a 5-session move is naturally bigger
+// than a 1-day one (standard volatility-over-time scaling).
+// The dial-horizon grade (grade_horizon) keeps running for the internal
+// confidence ceiling and the ticker card's TRACK RECORD line.
+const GRADE_WINDOWS = {
+  day:  { sessions: 0, target: 4,  flatScale: 1,
+          due: "day_due_at",  date: "day_target_date",  grade: "grade_day",  ret: "return_day_pct",  at: "graded_at_day" },
+  long: { sessions: 5, target: 16, flatScale: Math.sqrt(5),
+          due: "long_due_at", date: "long_target_date", grade: "grade_long", ret: "return_long_pct", at: "graded_at_long" },
+};
+function dayLongTargetFields(issuedAt) {
+  const out = {};
+  for (const w of Object.values(GRADE_WINDOWS)) {
+    const t = horizonTargetFor(issuedAt, w.sessions);
+    out[w.date] = t.targetDate;
+    out[w.due] = t.dueAt.toISOString();
+  }
+  return out;
+}
+
 // Pass supabase client to credit system
 credits.setSupabase(supabase);
 
@@ -3689,6 +3718,7 @@ async function logVerdict(fields) {
       horizon_sessions:          marketOpenAtIssue ? horizonSessions : null,
       horizon_target_date:       horizon ? horizon.targetDate : null,
       horizon_due_at:            horizon ? horizon.dueAt.toISOString() : null,
+      ...(marketOpenAtIssue ? dayLongTargetFields(issuedAt) : {}),
     });
   } catch (e) {
     console.error(`logVerdict ${fields.ticker}:`, e.message);
@@ -4040,6 +4070,62 @@ async function backfillHorizonFields() {
   return rows.length;
 }
 
+// Grades one window (day or long) for every due market-hours verdict. Same
+// close source, give-up rule and batching as gradeHorizonRows above.
+async function gradeWindowRows(kind) {
+  const w = GRADE_WINDOWS[kind];
+  const now = Date.now();
+  const { data: due, error } = await supabase
+    .from("verdict_log")
+    .select(`id, ticker, verdict, issued_price, issued_at, ${w.date}, ${w.due}`)
+    .eq("issued_market_open", true)
+    .is(w.at, null)
+    .lte(w.due, new Date(now).toISOString())
+    .order(w.due, { ascending: true })
+    .limit(HORIZON_GRADING_BATCH_SIZE);
+  if (error) { console.error(`gradeWindowRows ${kind} query:`, error.message); return 0; }
+  if (!due || !due.length) return 0;
+  let graded = 0;
+  for (const row of due) {
+    const close = row.issued_price == null ? null : await fetchSessionClose(row.ticker, row[w.date]);
+    if (close == null) {
+      const stale = row.issued_price == null || now - new Date(row[w.due]).getTime() > HORIZON_GIVE_UP_AFTER_MS;
+      if (stale) await supabase.from("verdict_log").update({ [w.at]: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const r = (close - row.issued_price) / row.issued_price * 100;
+    let grade;
+    if (row.verdict === "UP" || row.verdict === "DOWN") {
+      const bars = await fetchSessionBars(row.ticker, new Date(row.issued_at).toISOString(), new Date(row[w.due]).toISOString());
+      if (bars == null) continue; // fetch failed -- retry next sweep
+      grade = gradeDirectionalCall(bars, row.issued_price, row.verdict, w.target, r);
+    } else {
+      const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
+      const normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
+      grade = classifyFlatReturn(r, normal == null ? null : normal * w.flatScale);
+    }
+    await supabase.from("verdict_log").update({ [w.ret]: r, [w.grade]: grade, [w.at]: new Date().toISOString() }).eq("id", row.id);
+    graded++;
+  }
+  return graded;
+}
+// Stamps day/long targets on market-hours rows logged before Sep 30, 2026.
+// Pure compute, no network; a no-op once every row is stamped.
+async function backfillDayLongFields() {
+  const { data: rows, error } = await supabase
+    .from("verdict_log")
+    .select("id, issued_at")
+    .eq("issued_market_open", true)
+    .is("day_due_at", null)
+    .limit(HORIZON_BACKFILL_BATCH_SIZE);
+  if (error) { console.error("backfillDayLongFields query:", error.message); return 0; }
+  if (!rows || !rows.length) return 0;
+  for (const row of rows) {
+    await supabase.from("verdict_log").update(dayLongTargetFields(new Date(row.issued_at))).eq("id", row.id);
+  }
+  return rows.length;
+}
+
 async function runVerdictGradingSweep() {
   if (!supabase) return;
   try {
@@ -4048,8 +4134,12 @@ async function runVerdictGradingSweep() {
     const primaryCount = await gradeDueRows("grade_due_at", "grade", "actual_return_pct", "graded_at");
     const secondaryCount = await gradeDueRows("grade_due_at_secondary", "grade_secondary", "actual_return_pct_secondary", "graded_at_secondary");
     const horizonCount = await gradeHorizonRows();
-    if (primaryCount || secondaryCount || horizonCount) {
-      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon row(s) graded.`);
+    const dayLongStamped = await backfillDayLongFields();
+    if (dayLongStamped) console.log(`Verdict day/long backfill: ${dayLongStamped} row(s) stamped.`);
+    const dayCount = await gradeWindowRows("day");
+    const longCount = await gradeWindowRows("long");
+    if (primaryCount || secondaryCount || horizonCount || dayCount || longCount) {
+      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon, ${dayCount} day, ${longCount} long row(s) graded.`);
     }
   } catch (e) {
     console.error("runVerdictGradingSweep:", e.message);
@@ -5257,190 +5347,105 @@ function tickerStatsWithFloor(rows, minGraded) {
   return stats;
 }
 
-// Direct feedback (Sep 13, 2026): directional accuracy alone ("was the
-// call right") is only part of the story -- it weighs a correct-but-tiny
-// move the same as a correct-and-large one, and says nothing about what a
-// FALSE call actually cost. This answers the actual question asked --
-// "would following this in trade practice point toward profit" -- using
-// the same actual_return_pct (the ticker's own real % move over the
-// primary 24h window, already computed by the grading sweep) but signed
-// by verdict direction and scaled by the recommended SIZING_RULES size,
-// simulating the return a user would have realized had they sized and
-// held exactly as the app told them to. FLAT verdicts and NONE-sized
-// UP/DOWN calls are excluded entirely (not counted as a $0 trade) -- both
-// mean "the app told you to hold no position," which isn't a trade to
-// grade the profitability of, one way or the other.
-const SIZE_MULTIPLIER = { FULL: 1, HALF: 0.5, QUARTER: 0.25 };
-// Same "don't publish a noisy stat off a handful of samples" floor as
-// SCORECARD_TICKER_MIN_GRADED -- this slice is always a subset of the
-// overall graded count (FLAT/NONE-sized verdicts don't qualify), so it
-// needs its own floor rather than reusing SCORECARD_MIN_GRADED.
-const SCORECARD_MIN_SIZED_GRADED = 5;
-function computeExpectancyStats(rows) {
-  const sized = rows.filter(r =>
-    (r.verdict === "UP" || r.verdict === "DOWN") &&
-    SIZE_MULTIPLIER[r.size_action] &&
-    (r.path_return_pct != null || r.actual_return_pct != null)
-  );
-  if (sized.length < SCORECARD_MIN_SIZED_GRADED) {
-    return { sizedGradedCount: sized.length, insufficientSizedData: true };
-  }
-  const returns = sized.map(r => {
-    // path_return_pct is already signed in the verdict's favor and reflects
-    // the dial's stop/target (Sep 29, 2026); older rows fall back to the close.
-    const direction = r.verdict === "UP" ? 1 : -1;
-    const tradeReturn = r.path_return_pct != null ? r.path_return_pct : direction * r.actual_return_pct;
-    return tradeReturn * SIZE_MULTIPLIER[r.size_action];
-  });
-  const avgReturnPct = returns.reduce((a, b) => a + b, 0) / returns.length;
-  const winCount = returns.filter(x => x > 0).length;
-  return {
-    sizedGradedCount:      sized.length,
-    avgSimulatedReturnPct: +avgReturnPct.toFixed(2),
-    winRatePct:            +(winCount / sized.length * 100).toFixed(1),
-  };
-}
-
-// Direct follow-up ask (Sep 13, 2026): "it would be helpful to know up and
-// down accuracy and the top 5 tickers the app has been most accurate with
-// (across all users)." A UP/DOWN split answers a real, different question
-// from the aggregate directionalPct above -- this session's own pooled
-// query (verdict_log, 360 graded rows) found UP verdicts alone at 34.4%
-// against DOWN's 65.5%, a gap the single blended number completely hides.
-// Both this and the top-tickers list below are pooled across EVERY user
-// and EVERY tier (not scoped to the requesting user, or to Free's own
-// tier-filtered aggregate stat above) -- "across all users" as asked,
-// matching the real numbers already reported this session. Deliberately a
-// narrow, curated addition -- NOT a reopening of the Sep 2/Sep 13
-// per-ticker-breakdown removals above. Those removed a wall of mostly-
-// "insufficientData" rows for every ticker in one user's own watchlist; a
-// direction split (2 numbers) and a top-5 pooled list are both small,
-// always-interesting summaries, not the noisy per-user enumeration that
-// got pulled.
-//
-// Both derive from one shared, cached pool fetch (1h TTL, same reasoning
-// as historicalReactionCache -- the 30-min grading sweep is the only thing
-// that can change either, so anything shorter is pure waste) rather than
-// two separate Supabase round trips for what's fundamentally the same
-// underlying data.
+// ── Scorecard (rebuilt Sep 30, 2026) ───────────────────────────────────
+// Mr. T's call: two plain numbers -- Day trade accuracy and Long accuracy
+// (see GRADE_WINDOWS) -- replace directional accuracy + avg return. Every
+// number on the card is pooled across every user and tier, so the headline,
+// the UP/DOWN/FLAT rows and the top tickers always describe the same set of
+// calls. (Before this, the headline was the viewer's own calls while the
+// rows below were everyone's, under a "Pooled" label -- which is why they
+// didn't add up.) Each tile hides until its window has SCORECARD_MIN_GRADED
+// graded UP/DOWN calls; each row needs SCORECARD_TICKER_MIN_GRADED.
 let scorecardPoolCache = { data: null, time: 0 };
-const SCORECARD_POOL_CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+const SCORECARD_POOL_CACHE_MAX_AGE_MS = 30 * 60 * 1000; // the grading sweep runs every 30 min
 async function fetchScorecardPool() {
   if (scorecardPoolCache.data && Date.now() - scorecardPoolCache.time < SCORECARD_POOL_CACHE_MAX_AGE_MS) {
     return scorecardPoolCache.data;
   }
   const { data, error } = await supabase
-    .from("verdict_log").select("ticker, verdict, grade:grade_horizon")
-    .eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
+    .from("verdict_log").select("ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct")
+    .eq("superseded", false).eq("issued_market_open", true)
+    .or("grade_day.not.is.null,grade_long.not.is.null");
   if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
   scorecardPoolCache = { data: data || [], time: Date.now() };
   return scorecardPoolCache.data;
 }
-function computeDirectionBreakdown(rows) {
-  const build = (verdict) => {
-    const stats = tickerStatsWithFloor(rows.filter(r => r.verdict === verdict), SCORECARD_TICKER_MIN_GRADED);
-    return stats.insufficientData
-      ? { gradedCount: stats.gradedCount, insufficientData: true }
-      : { directionalPct: stats.directionalPct, gradedCount: stats.gradedCount };
-  };
-  return { up: build("UP"), down: build("DOWN") };
+const GRADE_CREDIT = { TRUE: 1, MARGINAL: 0.5, FALSE: 0 };
+// { pct, gradedCount } for one window over the given rows; pct null below minGraded.
+function windowStats(rows, gradeKey, minGraded) {
+  const graded = rows.filter(r => r[gradeKey] != null && GRADE_CREDIT[r[gradeKey]] != null);
+  const pct = graded.length >= minGraded
+    ? +(graded.reduce((a, r) => a + GRADE_CREDIT[r[gradeKey]], 0) / graded.length * 100).toFixed(1)
+    : null;
+  return { pct, gradedCount: graded.length };
 }
-async function computeTopTickers(limit) {
-  const pool = await fetchScorecardPool();
+// Pro-only proof detail for a tile: the 95% margin of error on its pct, and
+// what calling UP on every one of those same calls would have scored
+// ("always-UP" baseline -- stocks drift up, so beating 50% alone proves
+// little). Baseline counts a call right when that window's close was up.
+function tileProof(rows, gradeKey, retKey, pct) {
+  const graded = rows.filter(r => r[gradeKey] != null && GRADE_CREDIT[r[gradeKey]] != null);
+  if (pct == null || !graded.length) return null;
+  const p = pct / 100;
+  const margin = +(1.96 * Math.sqrt(p * (1 - p) / graded.length) * 100).toFixed(1);
+  const withRet = graded.filter(r => r[retKey] != null && isFinite(Number(r[retKey])));
+  const alwaysUpPct = withRet.length
+    ? +(withRet.filter(r => Number(r[retKey]) > 0).length / withRet.length * 100).toFixed(1)
+    : null;
+  return { margin, alwaysUpPct };
+}
+const isDirectional = (r) => r.verdict === "UP" || r.verdict === "DOWN";
+const SCORECARD_TOP_TICKERS_LIMIT = 5;
+function computeTopTickers(pool, limit) {
   const byTicker = new Map();
-  for (const r of pool) {
+  for (const r of pool.filter(isDirectional)) {
     if (!byTicker.has(r.ticker)) byTicker.set(r.ticker, []);
     byTicker.get(r.ticker).push(r);
   }
   const ranked = [];
-  for (const [ticker, tickerRows] of byTicker) {
-    const stats = tickerStatsWithFloor(tickerRows, SCORECARD_TICKER_MIN_GRADED);
-    if (!stats.insufficientData) ranked.push({ ticker, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount });
+  for (const [ticker, rows] of byTicker) {
+    // Day and long grades pooled into one number per ticker, so the list
+    // stays a single column.
+    const samples = rows.flatMap(r => [r.grade_day, r.grade_long]).filter(g => GRADE_CREDIT[g] != null);
+    if (samples.length < SCORECARD_TICKER_MIN_GRADED) continue;
+    const pct = +(samples.reduce((a, g) => a + GRADE_CREDIT[g], 0) / samples.length * 100).toFixed(1);
+    ranked.push({ ticker, pct, gradedCount: samples.length });
   }
-  ranked.sort((a, b) => b.directionalPct - a.directionalPct || b.gradedCount - a.gradedCount);
+  ranked.sort((a, b) => b.pct - a.pct || b.gradedCount - a.gradedCount);
   return ranked.slice(0, limit);
 }
-async function computeDirectionBreakdownPooled() {
-  return computeDirectionBreakdown(await fetchScorecardPool());
-}
-const SCORECARD_TOP_TICKERS_LIMIT = 5;
 
 app.get("/scorecard", async (req, res) => {
-  // Gated Pro-first (credits.js TIERS.<tier>.scorecard) -- flip the flag
-  // per tier as this rolls out further, rather than branching on tier
-  // name here.
+  // Gated per tier (credits.js TIERS.<tier>.scorecard).
   if (!req.tierConfig?.scorecard) {
     return res.status(403).json({ error: "Scorecard not available on this tier yet" });
   }
   if (!supabase) return res.json({ insufficientData: true, gradedCount: 0 });
-
   try {
-    if (req.userTier === "free") {
-      const { data, error } = await supabase
-        .from("verdict_log").select("verdict, grade:grade_horizon")
-        .eq("tier", "free").eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
-      if (error) { console.error("GET /scorecard (free):", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
-      const stats = computeAccuracyStats(data || []);
-      if (stats.gradedCount < SCORECARD_MIN_GRADED) return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
-      // Directional % is Free-tier-only, per Proposal 7's tier rollout
-      // table -- unchanged. The direction split/top-tickers list below are
-      // pooled across every user AND every tier (see the comment above
-      // computeTopTickers) -- not personal data, so there's no reason to
-      // withhold either from Free's own aggregate view.
-      return res.json({
-        scope: "aggregate", directionalPct: stats.directionalPct, gradedCount: stats.gradedCount,
-        flatPct: stats.flatPct, flatGradedCount: stats.flatGradedCount,
-        directionBreakdown: await computeDirectionBreakdownPooled(),
-        topTickers: await computeTopTickers(SCORECARD_TOP_TICKERS_LIMIT),
-      });
+    const pool = await fetchScorecardPool();
+    const directional = pool.filter(isDirectional);
+    const day  = windowStats(directional, "grade_day",  SCORECARD_MIN_GRADED);
+    const long = windowStats(directional, "grade_long", SCORECARD_MIN_GRADED);
+    if (day.pct == null && long.pct == null) {
+      return res.json({ insufficientData: true, gradedCount: Math.max(day.gradedCount, long.gradedCount) });
     }
-
-    if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
-    const email = req.userEmail.trim().toLowerCase();
-    const { data, error } = await supabase
-      .from("verdict_log")
-      .select("grade:grade_horizon, verdict, size_action, actual_return_pct:actual_return_pct_horizon, path_return_pct")
-      .eq("user_email", email).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
-    if (error) { console.error("GET /scorecard:", error.message); return res.json({ insufficientData: true, gradedCount: 0 }); }
-    const rows  = data || [];
-    const stats = computeAccuracyStats(rows);
-    if (stats.gradedCount < SCORECARD_MIN_GRADED) {
-      return res.json({ insufficientData: true, gradedCount: stats.gradedCount });
-    }
-    const result = {
-      scope: "personal", strictPct: stats.strictPct, directionalPct: stats.directionalPct, gradedCount: stats.gradedCount,
-      flatPct: stats.flatPct, flatGradedCount: stats.flatGradedCount,
-      expectancy: computeExpectancyStats(rows),
-      // Pooled across every user/tier, not this user's own rows -- see the
-      // comment above computeTopTickers for why.
-      directionBreakdown: await computeDirectionBreakdownPooled(),
-      topTickers: await computeTopTickers(SCORECARD_TOP_TICKERS_LIMIT),
+    const row = (verdict) => {
+      const rs = pool.filter(r => r.verdict === verdict);
+      return { day: windowStats(rs, "grade_day", SCORECARD_TICKER_MIN_GRADED), long: windowStats(rs, "grade_long", SCORECARD_TICKER_MIN_GRADED) };
     };
-
-    // Per-ticker breakdown (personal/pool/graph-peers) removed Sep 2, 2026
-    // -- direct feedback: with most watchlists holding far fewer than
-    // SCORECARD_TICKER_MIN_GRADED (5) graded rows per ticker, this section
-    // rendered as a wall of "-- pool --" placeholders with real data on
-    // maybe one ticker out of fifteen. Replaced by a single pooled stat
-    // shown on the ticker's own analyzed card instead (see
-    // computeHistoricalReaction, relayed through /ticker/:symbol) --
-    // available on every tier, not gated behind a signed-in Scorecard
-    // fetch, and shown exactly where a user is actually looking at that
-    // ticker rather than buried in an alphabetized list.
-
-    // The by-gate1-branch/pre-gate-state/gate0-read/gate2-corroboration
-    // breakdown (shipped Aug 26-28, 2026) removed from this response Sep
-    // 13, 2026 -- direct feedback: it's real signal for tuning the
-    // framework's own rules, but not something an end user needs staring
-    // back at them on their own Scorecard card ("unnecessary information
-    // to the user but decent for helping the app learn"). The underlying
-    // columns are untouched in verdict_log -- this is a response-shape
-    // change, not a data-loss one -- so that calibration question is
-    // still fully answerable, just via a direct query against verdict_log
-    // grouped by tier/branch/state across every user (not personal, not
-    // gated behind this endpoint) whenever it's actually needed, rather
-    // than a live pooled-breakdown feature nobody was asking to see.
-    res.json(result);
+    // Range + always-UP comparison are Pro/Shark only (tierConfig.tracker).
+    const proof = req.tierConfig?.tracker
+      ? { day: tileProof(directional, "grade_day", "return_day_pct", day.pct),
+          long: tileProof(directional, "grade_long", "return_long_pct", long.pct) }
+      : undefined;
+    res.json({
+      scope: "pooled",
+      proof,
+      gradedCount: Math.max(day.gradedCount, long.gradedCount),
+      day, long,
+      breakdown: { up: row("UP"), down: row("DOWN"), flat: row("FLAT") },
+      topTickers: computeTopTickers(pool, SCORECARD_TOP_TICKERS_LIMIT),
+    });
   } catch (e) {
     console.error("GET /scorecard:", e.message);
     res.json({ insufficientData: true, gradedCount: 0 });

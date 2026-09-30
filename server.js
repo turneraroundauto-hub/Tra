@@ -4126,23 +4126,57 @@ async function backfillDayLongFields() {
   return rows.length;
 }
 
+// Keep grading a window in batches until it's caught up, instead of one
+// HORIZON_GRADING_BATCH_SIZE batch per 30-min sweep (Sep 30, 2026 -- a
+// backlog of a few hundred rows used to take hours to show up on the
+// Scorecard). Stops when a batch grades nothing (caught up, or only rows
+// whose bars fetch keeps failing are left -- those retry next sweep) or after
+// GRADING_MAX_BATCHES_PER_SWEEP, so a stuck row can never spin this forever.
+// Every Alpaca call still goes through alpacaGet()'s shared throttle.
+const GRADING_MAX_BATCHES_PER_SWEEP = 10;
+async function gradeUntilCaughtUp(gradeBatch) {
+  let total = 0;
+  for (let i = 0; i < GRADING_MAX_BATCHES_PER_SWEEP; i++) {
+    const n = await gradeBatch();
+    total += n;
+    if (!n) break;
+  }
+  return total;
+}
+
+// New grades change every accuracy number the app shows -- drop the caches
+// that hold them so the Scorecard/TRACK RECORD/confidence ceiling read the
+// new grades now, not up to 30-60 minutes later.
+function clearAccuracyCaches() {
+  scorecardPoolCache = { data: null, time: 0 };
+  historicalReactionCache.clear();
+  directionalAccuracyCache.clear();
+}
+
+let verdictGradingSweepRunning = false;
 async function runVerdictGradingSweep() {
   if (!supabase) return;
+  // A long catch-up sweep can outlast the next timer tick -- never run two at once.
+  if (verdictGradingSweepRunning) return;
+  verdictGradingSweepRunning = true;
   try {
     const backfilled = await backfillHorizonFields();
     if (backfilled) console.log(`Verdict horizon backfill: ${backfilled} row(s) stamped.`);
     const primaryCount = await gradeDueRows("grade_due_at", "grade", "actual_return_pct", "graded_at");
     const secondaryCount = await gradeDueRows("grade_due_at_secondary", "grade_secondary", "actual_return_pct_secondary", "graded_at_secondary");
-    const horizonCount = await gradeHorizonRows();
+    const horizonCount = await gradeUntilCaughtUp(gradeHorizonRows);
     const dayLongStamped = await backfillDayLongFields();
     if (dayLongStamped) console.log(`Verdict day/long backfill: ${dayLongStamped} row(s) stamped.`);
-    const dayCount = await gradeWindowRows("day");
-    const longCount = await gradeWindowRows("long");
+    const dayCount = await gradeUntilCaughtUp(() => gradeWindowRows("day"));
+    const longCount = await gradeUntilCaughtUp(() => gradeWindowRows("long"));
     if (primaryCount || secondaryCount || horizonCount || dayCount || longCount) {
       console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon, ${dayCount} day, ${longCount} long row(s) graded.`);
     }
+    if (horizonCount || dayCount || longCount) clearAccuracyCaches();
   } catch (e) {
     console.error("runVerdictGradingSweep:", e.message);
+  } finally {
+    verdictGradingSweepRunning = false;
   }
 }
 setInterval(() => { runVerdictGradingSweep().catch(e => console.error("runVerdictGradingSweep:", e.message)); }, 30 * 60 * 1000);

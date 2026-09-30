@@ -5363,7 +5363,7 @@ async function fetchScorecardPool() {
     return scorecardPoolCache.data;
   }
   const { data, error } = await supabase
-    .from("verdict_log").select("ticker, verdict, grade_day, grade_long")
+    .from("verdict_log").select("ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct")
     .eq("superseded", false).eq("issued_market_open", true)
     .or("grade_day.not.is.null,grade_long.not.is.null");
   if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
@@ -5378,6 +5378,21 @@ function windowStats(rows, gradeKey, minGraded) {
     ? +(graded.reduce((a, r) => a + GRADE_CREDIT[r[gradeKey]], 0) / graded.length * 100).toFixed(1)
     : null;
   return { pct, gradedCount: graded.length };
+}
+// Pro-only proof detail for a tile: the 95% margin of error on its pct, and
+// what calling UP on every one of those same calls would have scored
+// ("always-UP" baseline -- stocks drift up, so beating 50% alone proves
+// little). Baseline counts a call right when that window's close was up.
+function tileProof(rows, gradeKey, retKey, pct) {
+  const graded = rows.filter(r => r[gradeKey] != null && GRADE_CREDIT[r[gradeKey]] != null);
+  if (pct == null || !graded.length) return null;
+  const p = pct / 100;
+  const margin = +(1.96 * Math.sqrt(p * (1 - p) / graded.length) * 100).toFixed(1);
+  const withRet = graded.filter(r => r[retKey] != null && isFinite(Number(r[retKey])));
+  const alwaysUpPct = withRet.length
+    ? +(withRet.filter(r => Number(r[retKey]) > 0).length / withRet.length * 100).toFixed(1)
+    : null;
+  return { margin, alwaysUpPct };
 }
 const isDirectional = (r) => r.verdict === "UP" || r.verdict === "DOWN";
 const SCORECARD_TOP_TICKERS_LIMIT = 5;
@@ -5418,8 +5433,14 @@ app.get("/scorecard", async (req, res) => {
       const rs = pool.filter(r => r.verdict === verdict);
       return { day: windowStats(rs, "grade_day", SCORECARD_TICKER_MIN_GRADED), long: windowStats(rs, "grade_long", SCORECARD_TICKER_MIN_GRADED) };
     };
+    // Range + always-UP comparison are Pro/Shark only (tierConfig.tracker).
+    const proof = req.tierConfig?.tracker
+      ? { day: tileProof(directional, "grade_day", "return_day_pct", day.pct),
+          long: tileProof(directional, "grade_long", "return_long_pct", long.pct) }
+      : undefined;
     res.json({
       scope: "pooled",
+      proof,
       gradedCount: Math.max(day.gradedCount, long.gradedCount),
       day, long,
       breakdown: { up: row("UP"), down: row("DOWN"), flat: row("FLAT") },

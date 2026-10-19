@@ -157,19 +157,83 @@ function evaluateProxyStatus(proxyRule, marketData) {
 // accuracy can later be broken down by any gate. Only the G3 note is kept
 // (it says how many bars the gate actually saw); other notes are left out
 // to keep rows small. A missing gate is stored as null, never guessed.
-function gatesForLog(gates) {
+// opts.g3Read === false (Oct 19, 2026): Gate 3 had no bar data, so its
+// stored color is null ("not read"), never the YELLOW the model writes for
+// "no opening bar data" -- that YELLOW looked identical to a real Yellow read.
+function gatesForLog(gates, opts) {
     const g = gates || {};
     const st = (k) => (g[k] && typeof g[k].status === "string") ? g[k].status : null;
+    const g3Read = !(opts && opts.g3Read === false);
     return {
         pre_gate: st("pre_gate"),
         sector: st("sector"),
         g1: st("g1_prewindow"),
         g2: st("g2_catalyst"),
-        g3: st("g3_openbar"),
+        g3: g3Read ? st("g3_openbar") : null,
         g4: st("g4_phase"),
         g5: st("g5_korea"),
-        g3_note: (g.g3_openbar && typeof g.g3_openbar.note === "string") ? g.g3_openbar.note : null,
+        g3_note: g3Read
+            ? ((g.g3_openbar && typeof g.g3_openbar.note === "string") ? g.g3_openbar.note : null)
+            : "not read: no bar data",
     };
+}
+// The numbers behind each gate's color (Oct 19, 2026), stored in
+// verdict_log.gates.inputs so a later query can test which definition
+// actually predicts outcomes. Pure shaping only: numbers rounded to 2
+// decimals, anything missing is null (never guessed).
+function num(x) {
+    return (typeof x === "number" && isFinite(x)) ? Math.round(x * 100) / 100 : null;
+}
+function barsForLog(bars) {
+    if (!Array.isArray(bars) || !bars.length)
+        return null;
+    return bars.map((b) => ({ t: b.t || null, o: num(b.o), h: num(b.h), l: num(b.l), c: num(b.c), v: typeof b.v === "number" ? b.v : null }));
+}
+function gateInputsForLog(x) {
+    const r = x || {};
+    const g1 = r.gate1 || {}, rule = r.rule || {}, m = r.metrics || {}, ob = r.openingBar, coh = r.coherence;
+    const proxy = rule.proxy || {};
+    return {
+        g1: { branch: g1.branch || null, change14: num(g1.change14), change60: num(g1.change60), force_down: !!g1.forceDown },
+        g2: {
+            type: r.type || null,
+            corroboration: typeof r.corroborationCount === "number" ? r.corroborationCount : null,
+            proxy: proxy.name || null,
+            proxy_symbols: Array.isArray(proxy.symbols) ? proxy.symbols : null,
+            proxy_tier: rule.tier || null,
+            proxy_r: num(typeof rule.r === "string" ? Number(rule.r) : rule.r),
+            dynamic: !!rule.dynamicallyResolved,
+        },
+        g3: {
+            source: r.windowMode ? "window" : "opening_bar",
+            read: !!r.g3Read,
+            bars: r.windowMode
+                ? barsForLog(r.windowBars)
+                : (ob ? [{ t: null, o: num(ob.open), h: num(ob.high), l: num(ob.low), c: num(ob.close), v: typeof ob.volume === "number" ? ob.volume : null }] : null),
+        },
+        g4: { range_position: num(m.rangePosition), price: num(m.price), week52hi: num(m.week52hi), week52lo: num(m.week52lo) },
+        g5: {
+            ticker_pct: num(r.tickerPct), proxy_pct: num(r.proxyPct),
+            regime: (r.regime && r.regime.state) || null,
+            rolling_r: num(r.regime && r.regime.rolling != null ? Number(r.regime.rolling) : null),
+            coherence: coh ? { case: coh.case ?? null, verdict: coh.verdict || null, force_down: !!coh.forceDown } : null,
+        },
+        red_count: typeof r.redCount === "number" ? r.redCount : null,
+        override: r.override || null,
+    };
+}
+// Same-session FLAT band (Oct 19, 2026): a FLAT called late in the day has
+// little time left to move, so a fixed band let it score almost
+// automatically. For a same-session window the band scales by the square
+// root of the share of the session still left at issue (floored at 15 min).
+// Multi-session windows return null: the caller keeps its existing scale.
+function sameSessionFlatScale(issueMinutesET, closeMin, sessions) {
+    if (sessions !== 0)
+        return null;
+    const OPEN = 570;
+    const len = Math.max(closeMin - OPEN, 15);
+    const left = Math.min(Math.max(closeMin - issueMinutesET, 15), len);
+    return Math.sqrt(left / len);
 }
 // Gate 0 (Oct 19, 2026): the ONE set of market-gate rules. /market and the
 // boot/9:30 cache warm used to each carry their own copy, and the warm copy
@@ -252,6 +316,8 @@ module.exports = {
     normalizeMarketReading: normalizeMarketReading,
     evaluateProxyStatus: evaluateProxyStatus,
     gatesForLog: gatesForLog,
+    gateInputsForLog: gateInputsForLog,
+    sameSessionFlatScale: sameSessionFlatScale,
     computeGate0: computeGate0,
     pulsePct: pulsePct,
     buildPulseInput: buildPulseInput,

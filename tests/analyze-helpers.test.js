@@ -265,3 +265,39 @@ test('buildPulseInput ignores sub-0.05% wiggles', () => {
   const b = ah.buildPulseInput({ spy: q(0.44), btc: q(1.08) });
   assert.strictEqual(a, b);
 });
+
+// ── Gate logging: not-read Gate 3, gate inputs, same-session FLAT band (Oct 19, 2026) ──
+test('gatesForLog: Gate 3 with no bar data is stored as null, not the model YELLOW', () => {
+  const g = { g3_openbar: { status: 'YELLOW', note: 'no opening bar data' }, g4_phase: { status: 'RED' } };
+  const out = ah.gatesForLog(g, { g3Read: false });
+  assert.strictEqual(out.g3, null);
+  assert.strictEqual(out.g3_note, 'not read: no bar data');
+  assert.strictEqual(out.g4, 'RED');
+  assert.strictEqual(ah.gatesForLog(g).g3, 'YELLOW');
+});
+test('gateInputsForLog: rounds numbers, keeps missing as null', () => {
+  const x = ah.gateInputsForLog({
+    gate1: { branch: 'UPTREND', change14: 12.345, change60: 30.1, forceDown: false },
+    rule: { proxy: { name: 'TSM', symbols: ['TSM'] }, tier: 'primary', r: '0.66', dynamicallyResolved: false },
+    metrics: { rangePosition: 72, price: 101.234 }, g3Read: true,
+    openingBar: { open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
+    regime: { state: 'INTACT', rolling: 0.49 }, coherence: { case: 1, verdict: 'DOWN', forceDown: true },
+    redCount: 1, override: 'gate5_coherence_down',
+  });
+  assert.strictEqual(x.g1.change14, 12.35);
+  assert.strictEqual(x.g2.proxy_r, 0.66);
+  assert.strictEqual(x.g3.source, 'opening_bar');
+  assert.strictEqual(x.g4.week52hi, null);
+  assert.strictEqual(x.g5.rolling_r, 0.49);
+  assert.strictEqual(x.override, 'gate5_coherence_down');
+  const empty = ah.gateInputsForLog({});
+  assert.strictEqual(empty.g3.bars, null);
+  assert.strictEqual(empty.red_count, null);
+});
+test('sameSessionFlatScale: shrinks as the session runs out, multi-session unchanged', () => {
+  assert.strictEqual(ah.sameSessionFlatScale(570, 960, 0), 1);
+  assert.ok(Math.abs(ah.sameSessionFlatScale(840, 960, 0) - Math.sqrt(120 / 390)) < 1e-9);
+  assert.ok(Math.abs(ah.sameSessionFlatScale(959, 960, 0) - Math.sqrt(15 / 390)) < 1e-9); // 15-min floor
+  assert.ok(Math.abs(ah.sameSessionFlatScale(720, 780, 0) - Math.sqrt(60 / 210)) < 1e-9); // early close
+  assert.strictEqual(ah.sameSessionFlatScale(600, 960, 5), null);
+});

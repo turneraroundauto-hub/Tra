@@ -1997,7 +1997,8 @@ function evaluateGate1(closesAscending) {
   if (!r.ok) {
     return { status: "YELLOW", sizing: "HALF", forceDown: false, unit: r.unit, note: r.note };
   }
-  return { status: r.color, sizing: r.sizing, forceDown: r.forceDown, unit: r.unit, branch: r.branch, note: r.note };
+  return { status: r.color, sizing: r.sizing, forceDown: r.forceDown, unit: r.unit, branch: r.branch, note: r.note,
+           change14: r.change14, change60: r.change60 };
 }
 
 // evaluateGate4 — Phase, a plain 52-week-range-position threshold, not an
@@ -4003,6 +4004,14 @@ async function fetchNormalDailyMovePct(symbol, issueDateStr) {
 // FLAT is right when the move stayed within half the ticker's normal day
 // (Mr. T's call), close-enough out to one full normal day. Falls back to
 // the fixed band when there's no history to size it from.
+// Same-session FLAT band shrinks with the time left in the session at issue
+// (Oct 19, 2026, ah.sameSessionFlatScale); multi-session windows keep their
+// existing scale. Applies to rows graded from now on.
+function flatScaleFor(issuedAtIso, sessions, fallbackScale) {
+  const c = nowCandle(new Date(issuedAtIso));
+  const s = ah.sameSessionFlatScale(c.minutes, c.closeMin, sessions);
+  return s == null ? fallbackScale : s;
+}
 function classifyFlatReturn(r, normalMovePct) {
   const a = Math.abs(r);
   if (a < 0.1) return "TRUE"; // truly flat always counts in full
@@ -4016,7 +4025,7 @@ async function gradeHorizonRows() {
   const now = Date.now();
   const { data: due, error } = await supabase
     .from("verdict_log")
-    .select("id, ticker, verdict, issued_price, issued_at, dial_position, horizon_target_date, horizon_due_at")
+    .select("id, ticker, verdict, issued_price, issued_at, dial_position, horizon_sessions, horizon_target_date, horizon_due_at")
     .eq("issued_market_open", true)
     .is("graded_at_horizon", null)
     .lte("horizon_due_at", new Date(now).toISOString())
@@ -4045,8 +4054,9 @@ async function gradeHorizonRows() {
     } else {
       const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
       const normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
-      update.flat_band_pct = normal == null ? null : +(0.5 * normal).toFixed(3);
-      update.grade_horizon = classifyFlatReturn(r, normal);
+      const band = normal == null ? null : normal * flatScaleFor(row.issued_at, row.horizon_sessions, 1);
+      update.flat_band_pct = band == null ? null : +(0.5 * band).toFixed(3);
+      update.grade_horizon = classifyFlatReturn(r, band);
     }
     await supabase.from("verdict_log").update(update).eq("id", row.id);
     graded++;
@@ -4114,7 +4124,7 @@ async function gradeWindowRows(kind) {
     } else {
       const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
       const normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
-      grade = classifyFlatReturn(r, normal == null ? null : normal * w.flatScale);
+      grade = classifyFlatReturn(r, normal == null ? null : normal * flatScaleFor(row.issued_at, w.sessions, w.flatScale));
     }
     await supabase.from("verdict_log").update({ [w.ret]: r, [w.grade]: grade, [w.at]: new Date().toISOString() }).eq("id", row.id);
     graded++;
@@ -5951,6 +5961,7 @@ async function fetchGate3Window(symbol, now = new Date()) {
     ...base, state,
     barsDone: Math.min(done.length, g3w.BARS_NEEDED),
     seq: state === "RESOLVED" ? g3w.classifySequence(done.slice(-g3w.BARS_NEEDED)) : null,
+    bars: done.slice(-g3w.BARS_NEEDED), // logged in verdict_log.gates.inputs; not sent to the card
     asOf: last ? new Date(Date.parse(last.t) + g3w.BAR_MINUTES * 60000).toISOString() : null,
   };
 }
@@ -6524,7 +6535,12 @@ Return only single-line minified JSON.
       // stand. Previously this had blanket forceDown authority equivalent
       // to Gate 0 RED — deliberately walked back: a single SEC filing
       // shouldn't be able to force DOWN entirely alone anymore.
+      // Which override (if any) set the final verdict -- logged with the
+      // gate inputs so accuracy can be broken down by it later.
+      let overrideFired = null;
+      let coherenceResult = null;
       if (preGateResult.hardTrigger) {
+        overrideFired = "pre_gate_candidate";
         parsed.verdict = "DOWN";
         parsed.reason  = `Pre-Gate thesis-integrity concern — ${preGateResult.note}`;
       }
@@ -6532,6 +6548,7 @@ Return only single-line minified JSON.
       // ── SERVER ENFORCEMENT: Gate 0 ────────────────────────────────
       if (gate0Status === "RED") {
         // Both SPY AND QQQ down >1% — genuine broad market failure
+        overrideFired     = "gate0_red";
         parsed.verdict    = "DOWN";
         parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
         parsed.reason     = `Broad market failure — ${gate0Note}. No entries until market stabilizes.`;
@@ -6549,6 +6566,7 @@ Return only single-line minified JSON.
       // and skips the corroboration check below entirely — this is a hard
       // code-level override, not a prompt instruction, so it can't be missed.
       if (gate1Result.forceDown) {
+        overrideFired     = "gate1_forcedown";
         parsed.verdict    = "DOWN";
         parsed.sizing      = "NONE";
         parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
@@ -6593,6 +6611,8 @@ Return only single-line minified JSON.
         // computed once above from data that's actually populated.
         if (tickerGating.length && tickerPct != null && proxyPct != null) {
           const coherence = gx.proxyCoherenceCheck(tickerPct, proxyPct);
+          coherenceResult = coherence;
+          overrideFired = coherence.forceDown ? "gate5_coherence_down" : "gate5_coherence_flat";
           // proxyCoherenceCheck() returns 'HOLD' for case 3 (possible
           // decoupling) — the project's terminology rule restricts the
           // verdict field to UP|DOWN|FLAT only, so map it here. The fuller
@@ -6622,6 +6642,7 @@ Return only single-line minified JSON.
           // credit when its own tickerPct/proxyPct happen to be available
           // and actually agree.
           gate5ForceDown    = true;
+          overrideFired     = "gate5_forcedown";
           parsed.verdict    = "DOWN";
           parsed.sizing      = "NONE";
           parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
@@ -6633,6 +6654,7 @@ Return only single-line minified JSON.
         // Gate 5 RED alone = FLAT (sector stress, not confirmed downtrend)
         // Gate 5 RED + Gate 2 RED = DOWN (double negative, congruent bearish)
         if (g2Status === "RED") {
+          overrideFired     = "gate5_g2_down";
           parsed.verdict    = "DOWN";
           // Two independent gates (sector proxy + catalyst) already agree;
           // if the ticker's own price and its proxy's price also confirm
@@ -6642,6 +6664,7 @@ Return only single-line minified JSON.
           parsed.confidence = ah.priceConfirmedConfidence("DOWN", tickerPct, proxyPct);
           parsed.wait_for   = `${rule.proxy.name} and catalyst headwind both need to clear.`;
         } else if (parsed.verdict === "UP") {
+          overrideFired     = "gate5_flat";
           parsed.verdict    = "FLAT";
           parsed.confidence = "LOW";
           parsed.wait_for   = `${rule.proxy.name} to stabilize. Catalyst positive but sector fighting it.`;
@@ -6670,7 +6693,11 @@ Return only single-line minified JSON.
       // exemption Aug 22, 2026 — it's now a normal member of the
       // corroboration pool below, same as Gates 1/2/4/5.)
       const g1Status = parsed.gates?.g1_prewindow?.status || "GREEN";
-      const g3Status = parsed.gates?.g3_openbar?.status || "GREEN";
+      // Gate 3 with no bar data is "not read" -- it gets no vote in the
+      // three-YELLOW check below (the model writes YELLOW for "no opening
+      // bar data", which used to count as a real caution vote).
+      const g3Read = windowMode ? true : !!openingBarData;
+      const g3Status = g3Read ? (parsed.gates?.g3_openbar?.status || "GREEN") : null;
       const g4Status = parsed.gates?.g4_phase?.status || "GREEN";
       const downForceAuthorized = gate0Status === "RED" || gate1Result.forceDown || gate5ForceDown;
       if (parsed.verdict === "DOWN" && !downForceAuthorized) {
@@ -6687,6 +6714,7 @@ Return only single-line minified JSON.
         const threeYellowBreakdown = g2Status === "YELLOW" && g3Status === "YELLOW" && g4Status === "YELLOW";
         if (redCount < 2 && !threeYellowBreakdown) {
           // Single non-exempt RED gate, no 3-yellow corroboration either — not enough for DOWN
+          overrideFired     = "congruency_flat";
           parsed.verdict    = "FLAT";
           parsed.confidence = "LOW";
           parsed.wait_for   = parsed.wait_for || "Additional confirmation needed before directional entry.";
@@ -6754,16 +6782,19 @@ Return only single-line minified JSON.
       let earningsBlocked = false;
       if (upcomingEarnings) {
         earningsBlocked = true;
+        overrideFired   = overrideFired || "earnings_block";
         parsed.sizing   = "NONE";
         parsed.wait_for = `Earnings imminent${typeof upcomingEarnings === "string" ? ` (${upcomingEarnings})` : ""} — no new entries until it's reported, unless you explicitly hold through it.`;
       }
 
+      let windowBarsLog = null;
       const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
       if (windowMode) {
         // The verdict above is the Long call (still what verdict_log grades,
         // so the Scorecard doesn't change). The Day call is that Long refined
         // by the bars -- rules only, no second model call.
         const win = await windowP;
+        windowBarsLog = win && win.bars ? win.bars : null;
         const locked = gate0Status === "RED" || !!gate1Result.forceDown || gate5ForceDown || earningsBlocked;
         const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
         const long = { verdict: parsed.verdict, sizing: parsed.sizing, locked, fridaySkeptic };
@@ -6790,12 +6821,22 @@ Return only single-line minified JSON.
         confidence: parsed.confidence,
         // Beta: G3 on the card is the bar read, not the model's week read --
         // keep both so the stored G3 says how many bars it actually saw.
-        gates: Object.assign(ah.gatesForLog(parsed.gates), result.window ? {
+        gates: Object.assign(ah.gatesForLog(parsed.gates, { g3Read }), result.window ? {
           g3_bars: result.window.gate3 ? result.window.gate3.status : null,
           g3_bars_note: result.window.gate3 ? result.window.gate3.note : null,
           g3_bars_done: result.window.barsDone,
           g3_window: result.window.state,
-        } : {}),
+        } : {}, {
+          // Oct 19, 2026: the numbers behind each color (ah.gateInputsForLog).
+          inputs: ah.gateInputsForLog({
+            gate1: gate1Result, type: parsed.type, corroborationCount: contextCorroboration.matchCount,
+            rule, metrics: metricsData, windowMode, g3Read: windowMode ? !!(windowBarsLog && windowBarsLog.length >= 3) : g3Read,
+            windowBars: windowBarsLog, openingBar: openingBarData,
+            tickerPct, proxyPct, regime, coherence: coherenceResult,
+            redCount: [preGateResult.status, g1Status, g2Status, g4Status, gate5Result.status].filter(x => x === "RED").length,
+            override: overrideFired,
+          }),
+        }),
         userEmail: req.userEmail, tier: req.userTier,
       });
       if (streaming) { send({ type: "final", result }); res.end(); }

@@ -153,6 +153,24 @@ function evaluateProxyStatus(proxyRule, marketData) {
         note: `${proxyRule.proxy.name}: ${changeStr}. ${proxyRule.proxy.rationale}`,
     };
 }
+// verdict_log.gates (Oct 19, 2026): each gate's color for one verdict, so
+// accuracy can later be broken down by any gate. Only the G3 note is kept
+// (it says how many bars the gate actually saw); other notes are left out
+// to keep rows small. A missing gate is stored as null, never guessed.
+function gatesForLog(gates) {
+    const g = gates || {};
+    const st = (k) => (g[k] && typeof g[k].status === "string") ? g[k].status : null;
+    return {
+        pre_gate: st("pre_gate"),
+        sector: st("sector"),
+        g1: st("g1_prewindow"),
+        g2: st("g2_catalyst"),
+        g3: st("g3_openbar"),
+        g4: st("g4_phase"),
+        g5: st("g5_korea"),
+        g3_note: (g.g3_openbar && typeof g.g3_openbar.note === "string") ? g.g3_openbar.note : null,
+    };
+}
 module.exports = {
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
@@ -163,4 +181,5 @@ module.exports = {
     applyHistoricalAccuracyCeiling: applyHistoricalAccuracyCeiling,
     normalizeMarketReading: normalizeMarketReading,
     evaluateProxyStatus: evaluateProxyStatus,
+    gatesForLog: gatesForLog,
 };

@@ -208,3 +208,27 @@ test('evaluateProxyStatus', async (t) => {
     assert.equal(r.status, 'RED');
   });
 });
+
+test('gatesForLog', async (t) => {
+  await t.test('keeps all seven colors and only the G3 note', () => {
+    const gates = {
+      pre_gate: { status: 'GREEN', note: 'clear' }, sector: { status: 'YELLOW', note: 'SPY -0.4%' },
+      g1_prewindow: { status: 'GREEN', note: 'up' }, g2_catalyst: { status: 'RED', note: 'miss' },
+      g3_openbar: { status: 'YELLOW', note: 'Bar 1 only' }, g4_phase: { status: 'GREEN', note: 'low' },
+      g5_korea: { status: 'RED', note: 'TSM -3%' },
+    };
+    assert.deepEqual(ah.gatesForLog(gates), {
+      pre_gate: 'GREEN', sector: 'YELLOW', g1: 'GREEN', g2: 'RED', g3: 'YELLOW', g4: 'GREEN', g5: 'RED', g3_note: 'Bar 1 only',
+    });
+  });
+  await t.test('stores null for a missing gate instead of guessing', () => {
+    const out = ah.gatesForLog({ sector: { status: 'GREEN' } });
+    assert.equal(out.sector, 'GREEN');
+    assert.equal(out.g2, null);
+    assert.equal(out.g3_note, null);
+    assert.deepEqual(Object.keys(out), ['pre_gate', 'sector', 'g1', 'g2', 'g3', 'g4', 'g5', 'g3_note']);
+  });
+  await t.test('handles no gates at all', () => {
+    assert.equal(ah.gatesForLog(null).pre_gate, null);
+  });
+});

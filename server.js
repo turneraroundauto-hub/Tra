@@ -6818,7 +6818,14 @@ Return only single-line minified JSON.
         gate2CorroborationState: `${contextCorroboration.corroborated ? "GATE2-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/2)`,
         dialPosition: effectiveDialPosition, // Free (no dial) logs as NEUTRAL = CRF Default, the same rules it runs under
         confidence: parsed.confidence,
-        gates: ah.gatesForLog(parsed.gates),
+        // Beta: G3 on the card is the bar read, not the model's week read --
+        // keep both so the stored G3 says how many bars it actually saw.
+        gates: Object.assign(ah.gatesForLog(parsed.gates), result.window ? {
+          g3_bars: result.window.gate3 ? result.window.gate3.status : null,
+          g3_bars_note: result.window.gate3 ? result.window.gate3.note : null,
+          g3_bars_done: result.window.barsDone,
+          g3_window: result.window.state,
+        } : {}),
         userEmail: req.userEmail, tier: req.userTier,
       });
       if (streaming) { send({ type: "final", result }); res.end(); }

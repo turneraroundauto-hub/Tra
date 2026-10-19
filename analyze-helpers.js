@@ -305,6 +305,46 @@ function buildPulseInput(d) {
         `Broad: SPY ${pulsePct(m.spy)}, IWM ${pulsePct(m.iwm)}`,
     ].join("\n");
 }
+// Market leaning for the Sector Pulse (Oct 19, 2026). Computed here with
+// fixed rules so the Pulse model only phrases it -- it can't pick a leaning
+// the numbers contradict (it once called a down-gold day "defensive").
+// Uses the same 1-decimal values the Pulse quotes; BTC is left out (it
+// trades 24/7 and would unfreeze the Pulse overnight). Checked in order;
+// the first match wins.
+function r1(q) {
+    if (!q || typeof q.pct !== "number" || q.change === "?" || !isFinite(q.pct))
+        return null;
+    const v = Math.round(q.pct * 10) / 10;
+    return Object.is(v, -0) ? 0 : v;
+}
+function computeMarketLeaning(d) {
+    const m = d || {};
+    const spy = r1(m.spy), qqq = r1(m.qqq), gld = r1(m.gld), uso = r1(m.uso);
+    const sectors = [r1(m.soxx), r1(m.nvda), r1(m.xbi), r1(m.ibb), r1(m.iwm)].filter((x) => x != null);
+    const idx = [spy, qqq].filter((x) => x != null);
+    const market = idx.length ? idx.reduce((a, b) => a + b, 0) / idx.length : null;
+    const direction = market == null ? "flat" : market >= 0.3 ? "up" : market <= -0.3 ? "down" : "flat";
+    const all = idx.concat(sectors, [gld, uso].filter((x) => x != null));
+    if (!all.length)
+        return { label: "Unavailable", direction: "flat" };
+    if (all.every(x => Math.abs(x) <= 0.3))
+        return { label: "Quiet", direction };
+    if (direction === "down" && gld != null && gld >= 0.3)
+        return { label: "Risk-off, safety bid", direction };
+    if (direction === "down" && spy != null && qqq != null && spy < 0 && qqq < 0
+        && sectors.filter(x => x < 0).length > sectors.length / 2)
+        return { label: "Broad selloff", direction };
+    const stocks = idx.concat(sectors);
+    const commodityTop = Math.max(gld ?? -Infinity, uso ?? -Infinity);
+    if (direction !== "up" && commodityTop >= 1 && stocks.every(x => x < commodityTop))
+        return { label: "Commodity-led", direction };
+    const leaders = [qqq, r1(m.soxx), r1(m.nvda), r1(m.iwm)].filter((x) => x != null);
+    if (direction === "up" && spy != null && leaders.some(x => x > spy))
+        return { label: "Risk-on", direction };
+    if (direction === "flat" && stocks.some(x => x >= 1) && stocks.some(x => x <= -1))
+        return { label: "Rotation", direction };
+    return { label: direction === "up" ? "Mild gains" : direction === "down" ? "Mild losses" : "Mixed", direction };
+}
 module.exports = {
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
@@ -321,4 +361,5 @@ module.exports = {
     computeGate0: computeGate0,
     pulsePct: pulsePct,
     buildPulseInput: buildPulseInput,
+    computeMarketLeaning: computeMarketLeaning,
 };

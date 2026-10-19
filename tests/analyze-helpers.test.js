@@ -301,3 +301,29 @@ test('sameSessionFlatScale: shrinks as the session runs out, multi-session uncha
   assert.ok(Math.abs(ah.sameSessionFlatScale(720, 780, 0) - Math.sqrt(60 / 210)) < 1e-9); // early close
   assert.strictEqual(ah.sameSessionFlatScale(600, 960, 5), null);
 });
+
+// ── Market leaning for the Sector Pulse (Oct 19, 2026) ──
+const mk = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, q(v)]));
+test('computeMarketLeaning: real Oct 16 close is a broad selloff', () => {
+  const d = mk({ spy: -1.11, qqq: -2.5, soxx: -4.14, nvda: -1.43, xbi: -3.65, ibb: -2.61, iwm: -1.69, gld: -0.18, uso: 2.83, btc: 1.02 });
+  assert.deepStrictEqual(ah.computeMarketLeaning(d), { label: 'Broad selloff', direction: 'down' });
+});
+test('computeMarketLeaning: down with gold up is risk-off, safety bid', () => {
+  assert.strictEqual(ah.computeMarketLeaning(mk({ spy: -0.8, qqq: -1.2, soxx: -2, gld: 0.9 })).label, 'Risk-off, safety bid');
+});
+test('computeMarketLeaning: up with semis leading is risk-on', () => {
+  assert.strictEqual(ah.computeMarketLeaning(mk({ spy: 0.6, qqq: 0.9, soxx: 1.8, gld: -0.2 })).label, 'Risk-on');
+});
+test('computeMarketLeaning: flat market with split sectors is rotation', () => {
+  assert.strictEqual(ah.computeMarketLeaning(mk({ spy: 0.1, qqq: -0.1, soxx: 1.5, xbi: -1.4 })).label, 'Rotation');
+});
+test('computeMarketLeaning: oil strongest while stocks flat is commodity-led', () => {
+  assert.strictEqual(ah.computeMarketLeaning(mk({ spy: 0.1, qqq: 0.0, soxx: 0.4, uso: 2.1 })).label, 'Commodity-led');
+});
+test('computeMarketLeaning: everything within 0.3% is quiet; BTC ignored', () => {
+  assert.strictEqual(ah.computeMarketLeaning(mk({ spy: 0.2, qqq: -0.1, soxx: 0.3, gld: 0.1, btc: 5 })).label, 'Quiet');
+});
+test('computeMarketLeaning: fallbacks and missing data', () => {
+  assert.strictEqual(ah.computeMarketLeaning(mk({ spy: 0.5, qqq: 0.4, soxx: 0.2, iwm: 0.1 })).label, 'Mild gains');
+  assert.strictEqual(ah.computeMarketLeaning({}).label, 'Unavailable');
+});

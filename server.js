@@ -1436,17 +1436,17 @@ Only Gates 2 and 3 go in "gates" — Pre-Gate and Gates 0/1/4/5 are added by the
 `;
 
 const PULSE_PROMPT = `
-You describe today's market moves from a short list of % changes.
+You write a short market pulse from a list of % moves and a market leaning that has already been decided.
 Write exactly 2 plain sentences.
-Sentence 1: the strongest moves up, quoting each % exactly as given.
-Sentence 2: the weakest or most negative moves, quoting each % exactly as given.
+Sentence 1: start with the given leaning (e.g. "Broad selloff:") and say the overall market direction in plain words.
+Sentence 2: what led and what lagged, quoting 2-3 of the listed numbers exactly as given.
 Rules:
+- Use the leaning exactly as given. Never choose a different one or add a second one.
 - Use only the tickers and numbers in the message. Never change, round, or invent a number.
-- Describe only direction and size (up, down, flat, leading, lagging).
-- Do not name causes, themes, or narratives (for example "defensive", "risk-on", "risk-off", "safe haven", "inflation hedge", "rotation into").
+- Plain names are fine: QQQ = tech-heavy Nasdaq, SOXX = semiconductors, XBI/IBB = biotech, IWM = small caps, GLD = gold, USO = oil, BTC = bitcoin.
+- Do not name causes, news, or themes beyond the given leaning (for example "inflation hedge", "rate fears", "rotation into" unless the leaning is Rotation).
 - Do not give advice or predictions (no "should", "watch", "consider", "expect", "signal").
-- If every listed move is between -0.3% and +0.3%, say markets are broadly flat.
-No bullets, labels, or headings. Return only the text.
+No bullets or headings. Return only the text.
 `;
 
 
@@ -4598,7 +4598,10 @@ const PULSE_WAIT_MS = 8000;
 
 function pulseInputFor(marketData) {
   const msg = ah.buildPulseInput(marketData);
-  return isMarketOpen() ? msg : msg.split("\n").filter(l => !l.startsWith("Crypto:")).join("\n");
+  const moves = isMarketOpen() ? msg : msg.split("\n").filter(l => !l.startsWith("Crypto:")).join("\n");
+  // The leaning is decided here by fixed rules (ah.computeMarketLeaning);
+  // the model only phrases it.
+  return `${moves}\nMarket leaning (use exactly): ${ah.computeMarketLeaning(marketData).label}`;
 }
 
 async function generatePulse(marketData) {
@@ -4621,7 +4624,7 @@ async function generatePulse(marketData) {
           model: CLAUDE_MODEL_LIGHT, max_tokens: 120,
           temperature: 0,
           system: PULSE_PROMPT,
-          messages: [{ role: "user", content: `${msg}\nDescribe these moves in exactly 2 sentences.` }],
+          messages: [{ role: "user", content: `${msg}\nWrite the 2-sentence pulse.` }],
         }),
       }, 20000);
       if (!res.ok) throw new Error(`Anthropic ${res.status}`);

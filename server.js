@@ -3704,6 +3704,9 @@ async function logVerdict(fields) {
       // fact -- there was no way to see a HIGH->MEDIUM demotion actually
       // happened, or confirm one hadn't, from this table alone.
       confidence:                fields.confidence || null,
+      // Oct 19, 2026 (patch25): every gate's color + the G3 note, shaped by
+      // ah.gatesForLog(). Column must exist before this deploys.
+      gates:                     fields.gates || null,
       // Informational only as of Sep 7, 2026 -- the primary due date is
       // now computed from PRIMARY_GRADING_WINDOW_HOURS (a fixed 24h),
       // not this column. Kept populated (as "1", the nearest whole-day
@@ -6815,6 +6818,7 @@ Return only single-line minified JSON.
         gate2CorroborationState: `${contextCorroboration.corroborated ? "GATE2-CORROBORATED" : "UNCORROBORATED"} (${contextCorroboration.matchCount}/2)`,
         dialPosition: effectiveDialPosition, // Free (no dial) logs as NEUTRAL = CRF Default, the same rules it runs under
         confidence: parsed.confidence,
+        gates: ah.gatesForLog(parsed.gates),
         userEmail: req.userEmail, tier: req.userTier,
       });
       if (streaming) { send({ type: "final", result }); res.end(); }

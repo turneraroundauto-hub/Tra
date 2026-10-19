@@ -15,6 +15,7 @@ const cors      = require("cors");
 const credits   = require("./credits");
 const gx        = require("./gates-extended");
 const ah        = require("./analyze-helpers");
+const g3w       = require("./gate3-window");
 const { createClient } = require("@supabase/supabase-js");
 const kg = require("./neo4j-graph");
 const mcpServer = require("./mcp-server");
@@ -400,6 +401,7 @@ app.use(async (req, res, next) => {
     if (!resolved) return res.status(401).json({ error: "Invalid session token" });
 
     req.userEmail  = resolved.user.email;
+    req.userId     = resolved.user.id;
     req.userTier   = resolved.tier;
     req.userKey    = `sub:${resolved.user.email}`;  // stable key — email not JWT
     req.tierConfig = credits.TIERS[resolved.tier];
@@ -5922,13 +5924,210 @@ function setCache(key, data) {
   }
 }
 
+// ─── GATE 3 ROLLING WINDOW + DAY VERDICT (Oct 19, 2026, Pro beta) ──────
+// Pure rules live in gate3-window.ts. This block owns the I/O: the Alpaca
+// bar fetch, the beta switch, the per-candle verdict cache, the pending
+// Day jobs, and the Supabase Realtime push when a Day read lands.
+//
+// Beta switch (Mr. T flips it for full launch, no code change):
+//   GATE3_BETA_EMAILS  = comma list of Pro accounts that get it now
+//   GATE3_WINDOW_TIERS = comma list of tiers that get it for everyone
+// Unset = off. Everyone else keeps the old bar-1-only behavior.
+function envList(name) {
+  return (process.env[name] || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+function gate3WindowEnabled(req) {
+  if (envList("GATE3_WINDOW_TIERS").includes(req.userTier)) return true;
+  return req.userTier === "pro" && !!req.userEmail && envList("GATE3_BETA_EMAILS").includes(req.userEmail.toLowerCase());
+}
+
+function sessionCloseMin(dateStr) { return MARKET_EARLY_CLOSE_DAYS.has(dateStr) ? 13 * 60 : 16 * 60; }
+function nowCandle(now = new Date()) {
+  const { date, minutes } = etClock(now);
+  const closeMin = sessionCloseMin(date);
+  const trading = isTradingDate(date);
+  return { date, minutes, closeMin, trading, key: trading ? g3w.candleKey(date, minutes, closeMin) : null };
+}
+
+// One Alpaca call per symbol per 15-min candle, shared by every caller --
+// the bars can't change until the next candle closes.
+const gate3BarsCache = new Map(); // symbol -> { key, bars }
+async function fetchGate3Window(symbol, now = new Date()) {
+  const c = nowCandle(now);
+  const openMs = Math.floor(now.getTime() / 60000) * 60000 - (c.minutes - g3w.SESSION_OPEN_MIN) * 60000;
+  const readyAt = new Date(openMs + g3w.BARS_NEEDED * g3w.BAR_MINUTES * 60000).toISOString();
+  const cutoffAt = new Date(openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000).toISOString();
+  const base = { dateET: c.date, candleKey: c.key, readyAt, cutoffAt, barsNeeded: g3w.BARS_NEEDED };
+  const preState = g3w.windowState(c.trading, c.minutes, c.closeMin, 0);
+  if (preState === "CLOSED" || preState === "EXPIRED") return { ...base, state: preState, barsDone: 0, seq: null, asOf: null };
+
+  let bars = [];
+  if (c.minutes >= g3w.SESSION_OPEN_MIN + g3w.BAR_MINUTES) {
+    const hit = gate3BarsCache.get(symbol);
+    if (hit && hit.key === c.key) bars = hit.bars;
+    else {
+      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), now.toISOString());
+      if (bars) gate3BarsCache.set(symbol, { key: c.key, bars });
+    }
+  }
+  if (bars === null) return { ...base, state: "FORMING", barsDone: 0, seq: null, asOf: null, fetchFailed: true };
+  const done = g3w.completedBars(bars, now.getTime());
+  const state = g3w.windowState(c.trading, c.minutes, c.closeMin, done.length);
+  const last = done[done.length - 1];
+  return {
+    ...base, state,
+    barsDone: Math.min(done.length, g3w.BARS_NEEDED),
+    seq: state === "RESOLVED" ? g3w.classifySequence(done.slice(-g3w.BARS_NEEDED)) : null,
+    asOf: last ? new Date(Date.parse(last.t) + g3w.BAR_MINUTES * 60000).toISOString() : null,
+  };
+}
+
+// The client-facing window block. long = the verdict the model + server
+// rules produced (that's still what verdict_log grades, so the Scorecard
+// is unchanged); day = long refined by the bars, or null while forming.
+function buildWindowBlock(win, long, opts) {
+  const gate3 = win.seq
+    ? { status: win.seq.status, note: win.seq.note }
+    : win.state === "FORMING"
+      ? { status: null, note: win.fetchFailed ? "Bar data unavailable right now." : `${win.barsDone}/${win.barsNeeded} bars done. Day read at 7:15 AM PT.` }
+      : win.state === "EXPIRED"
+        ? { status: null, note: "Day window passed (9:30 AM PT). Long verdict only." }
+        : { status: null, note: "Market closed. Long verdict only." };
+  const day = win.state === "RESOLVED" ? g3w.refineDayVerdict(long, win.seq, opts) : null;
+  return {
+    state: win.state, barsDone: win.barsDone, barsNeeded: win.barsNeeded,
+    readyAt: win.readyAt, cutoffAt: win.cutoffAt, asOf: win.asOf, candleKey: win.candleKey,
+    pending: win.state === "FORMING", gate3, long: { verdict: long.verdict, sizing: long.sizing }, day,
+  };
+}
+
+// Catalyst check for reusing a cached Long after the cutoff: same news
+// headline and same Pre-Gate status as when it was made. Uses the same
+// 30-min news cadence /ticker already runs on, so no new fetch volume.
+async function catalystKey(symbol) {
+  let e = newsCache.get(symbol);
+  if (!e || (isNewsWindow() && Date.now() - e.time >= NEWS_REFRESH_MS)) {
+    const d = await fetchNews(symbol).catch(() => null);
+    e = { data: d, time: Date.now() };
+    newsCache.set(symbol, e);
+  }
+  const pg = preGateCache.get(symbol)?.data;
+  return `${e.data?.headline || ""}|${pg?.status || ""}`;
+}
+
+// Per-user verdict cache. Same candle -> reuse. After the 9:30 PT cutoff ->
+// reuse a cached Long made after the cutoff, if the catalyst check passes
+// and Gate 0 hasn't changed. Anything else -> a fresh analysis.
+const windowVerdictCache = new Map(); // wkey -> { result, dateET, candleKey, postCutoff, catalyst, gate0 }
+function windowCacheKey(req, ticker, dial, hold) { return `w:${req.userKey}:${ticker}:${dial}:${hold ? 1 : 0}`; }
+async function windowCacheLookup(wkey, ticker, gate0) {
+  const e = windowVerdictCache.get(wkey);
+  if (!e) return null;
+  const c = nowCandle();
+  if (!c.key || e.dateET !== c.date) return null;
+  if (e.candleKey === c.key) return e.result;
+  const postCutoff = c.minutes >= g3w.WINDOW_CUTOFF_MIN;
+  if (postCutoff && e.postCutoff && e.gate0 === gate0 && (await catalystKey(ticker)) === e.catalyst) return e.result;
+  return null;
+}
+
+// Pending Day jobs: an ANALYZE tapped before the 3rd bar closes. When it
+// closes, the Day read is computed from the stored Long (no model call, no
+// credit) and pushed to the user. Persisted so a deploy doesn't drop them.
+const dayJobs = new Map(); // wkey -> job
+async function saveDayJob(job) {
+  dayJobs.set(job.wkey, job);
+  if (!supabase) return;
+  const { error } = await supabase.from("day_refinement_jobs").upsert({
+    wkey: job.wkey, date_et: job.dateET, user_key: job.userKey, user_id: job.userId || null,
+    ticker: job.ticker, long: job.long, ready_at: job.readyAt, status: job.status,
+    window_block: job.window || null, updated_at: new Date().toISOString(),
+  }, { onConflict: "wkey,date_et" });
+  if (error) console.error("saveDayJob:", error.message);
+}
+async function hydrateDayJobs() {
+  if (!supabase) return;
+  const { data, error } = await supabase.from("day_refinement_jobs")
+    .select("wkey,date_et,user_key,user_id,ticker,long,ready_at,status,window_block")
+    .eq("date_et", nowCandle().date).eq("status", "PENDING");
+  if (error) { console.error("hydrateDayJobs:", error.message); return; }
+  for (const r of data || []) {
+    dayJobs.set(r.wkey, { wkey: r.wkey, dateET: r.date_et, userKey: r.user_key, userId: r.user_id, ticker: r.ticker, long: r.long, readyAt: r.ready_at, status: r.status, window: r.window_block });
+  }
+}
+
+// Supabase Realtime broadcast to a private per-user topic (day:<auth uid>).
+// The realtime.messages RLS policy (supabase-ddl-patch24) only lets that
+// signed-in user subscribe to their own topic. Best-effort: the client also
+// asks GET /day/:ticker when readyAt passes, so a missed push isn't lost.
+async function broadcastDay(userId, payload) {
+  if (!userId || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) return;
+  try {
+    const r = await fetchWithTimeout(`${process.env.SUPABASE_URL}/realtime/v1/api/broadcast`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: process.env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}` },
+      body: JSON.stringify({ messages: [{ topic: `day:${userId}`, event: "day", payload, private: true }] }),
+    }, 8000);
+    if (!r.ok) console.error(`broadcastDay: Realtime ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  } catch (e) { console.error("broadcastDay:", e.message); }
+}
+
+// Resolve one pending job if its bars are in. Returns the job (updated).
+async function resolveDayJob(job) {
+  if (job.status !== "PENDING" || Date.now() < Date.parse(job.readyAt)) return job;
+  const win = await fetchGate3Window(job.ticker);
+  if (win.dateET !== job.dateET || win.state === "CLOSED" || win.state === "EXPIRED") job.status = "EXPIRED";
+  else if (win.state === "RESOLVED") job.status = "READY";
+  else return job; // still forming (or a fetch hiccup) -- try again next tick
+  job.window = buildWindowBlock(win, job.long, { locked: job.long.locked, fridaySkeptic: job.long.fridaySkeptic });
+  await saveDayJob(job);
+  const cached = windowVerdictCache.get(job.wkey);
+  if (cached && cached.dateET === job.dateET) cached.result = { ...cached.result, window: job.window };
+  await broadcastDay(job.userId, { ticker: job.ticker, status: job.status, window: job.window });
+  console.log(`Day read ${job.ticker} (${job.userKey}): ${job.status} ${job.window.day ? job.window.day.verdict : ""}`);
+  return job;
+}
+
+let dayJobSweepRunning = false;
+async function runDayJobSweep() {
+  if (dayJobSweepRunning || !dayJobs.size) return;
+  dayJobSweepRunning = true;
+  try {
+    const today = nowCandle().date;
+    for (const job of [...dayJobs.values()]) {
+      if (job.dateET !== today || job.status !== "PENDING") { dayJobs.delete(job.wkey); continue; }
+      await resolveDayJob(job).catch(e => console.error("resolveDayJob:", e.message));
+      if (job.status !== "PENDING") dayJobs.delete(job.wkey);
+    }
+  } finally { dayJobSweepRunning = false; }
+}
+setInterval(() => { runDayJobSweep().catch(e => console.error("runDayJobSweep:", e.message)); }, 60 * 1000);
+setTimeout(() => { hydrateDayJobs().catch(e => console.error("hydrateDayJobs:", e.message)); }, 5000);
+
+// Free (no credit, no model call): the Day read for a pending ANALYZE.
+app.get("/day/:ticker", async (req, res) => {
+  const ticker = req.params.ticker.toUpperCase();
+  const dial = DIAL_POSITIONS[req.query.dial] ? req.query.dial : "NEUTRAL";
+  const wkey = windowCacheKey(req, ticker, dial, req.query.hold === "1");
+  let job = dayJobs.get(wkey);
+  if (!job && supabase) {
+    const { data } = await supabase.from("day_refinement_jobs")
+      .select("wkey,date_et,user_key,user_id,ticker,long,ready_at,status,window_block")
+      .eq("wkey", wkey).eq("date_et", nowCandle().date).maybeSingle();
+    if (data) job = { wkey: data.wkey, dateET: data.date_et, userKey: data.user_key, userId: data.user_id, ticker: data.ticker, long: data.long, readyAt: data.ready_at, status: data.status, window: data.window_block };
+  }
+  if (!job) return res.status(404).json({ error: "No pending Day read for this ticker." });
+  job = await resolveDayJob(job).catch(() => job);
+  res.json({ ticker, status: job.status, readyAt: job.readyAt, window: job.window || null });
+});
+
 // ─── ANALYZE ──────────────────────────────────────────────────────
 // Shown on the ticker card whenever /analyze can't produce a verdict for a
 // reason on our side (not the user's) -- always paired with a credit refund.
 const ANALYSIS_UNAVAILABLE_MSG = "Analysis is temporarily unavailable. You weren't charged a credit \u2014 please try again later.";
 
 app.post("/analyze", async (req, res) => {
-  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData, dialPosition, holdThroughEarnings } = req.body;
+  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData, dialPosition, holdThroughEarnings, stream } = req.body;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
@@ -5942,6 +6141,12 @@ app.post("/analyze", async (req, res) => {
   // is safe even before the client sends a real dial position.
   const allowedDialPositions = DIAL_RANGES[req.tierConfig?.dialRange] || DIAL_RANGES.full;
   const effectiveDialPosition = (req.tierConfig?.dial && DIAL_POSITIONS[dialPosition] && allowedDialPositions.includes(dialPosition)) ? dialPosition : "NEUTRAL";
+
+  // Gate 3 rolling window + Day verdict (Oct 19, 2026) -- beta accounts only
+  // (see gate3WindowEnabled). Off = exactly the old behavior below.
+  const windowMode = gate3WindowEnabled(req);
+  const T = ticker.toUpperCase();
+  const wkey = windowMode ? windowCacheKey(req, T, effectiveDialPosition, holdThroughEarnings) : null;
 
   // ── CREDIT CHECK ──────────────────────────────────────────────
   const userStatus = await credits.getUserStatus(req.userKey, req.userTier);
@@ -5967,7 +6172,9 @@ app.post("/analyze", async (req, res) => {
   // Check cache before deducting credit
   const cacheKey    = `${req.userTier}:${ticker.toUpperCase()}`;
   const cacheMinutes = credits.TIERS[req.userTier]?.cacheMinutes || 15;
-  const cached      = getCached(cacheKey, cacheMinutes);
+  const cached      = windowMode
+    ? await windowCacheLookup(wkey, T, sectorContext?.gateStatus || "GREEN")
+    : getCached(cacheKey, cacheMinutes);
   if (cached) {
     return res.json({ ...cached, fromCache: true });
   }
@@ -6031,6 +6238,45 @@ app.post("/analyze", async (req, res) => {
   // it's just been handed and re-derive the same three thresholds itself.
   const gate4Result = evaluateGate4(metricsData);
 
+  // ── PROPOSAL 9 — STAGED GATE DELIVERY (Oct 19, 2026, beta only) ──────
+  // The five server gates above are already final, so they go to the card
+  // now; Gate 3's bars follow when Alpaca answers; Gates 2 + the verdict
+  // when the model does. Same single model call and same Alpaca calls as
+  // before -- results are just sent as they're ready (NDJSON, one object
+  // per line). A gate whose input never arrived is flagged so the card can
+  // show it as not read.
+  const streaming = windowMode && !!stream;
+  const send = (obj) => { if (streaming && !res.writableEnded) res.write(JSON.stringify(obj) + "\n"); };
+  const fail = (status, body) => {
+    if (streaming) { send({ type: "error", status, ...body }); res.end(); }
+    else res.status(status).json(body);
+  };
+  const gateMissing = {
+    pre_gate: !preGateData, g1_prewindow: !gate1Data,
+    g4_phase: !(metricsData && metricsData.rangePosition != null), g5_korea: !proxyRule,
+  };
+  if (streaming) {
+    res.status(200);
+    res.setHeader("Content-Type", "application/x-ndjson");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (res.flushHeaders) res.flushHeaders();
+    send({ type: "gates", gateMissing, gates: {
+      pre_gate: { status: preGateResult.status, note: preGateResult.note },
+      sector: { status: gate0Status, note: gate0Note },
+      g1_prewindow: { status: gate1Result.status, note: gate1Result.note },
+      g4_phase: { status: gate4Result.status, note: gate4Result.note },
+      g5_korea: { status: gate5Result.status, note: gate5Result.note },
+    } });
+  }
+  const windowP = windowMode
+    ? fetchGate3Window(T).then(w => {
+        const b = buildWindowBlock(w, { verdict: "FLAT", sizing: "NONE" }, {});
+        send({ type: "gate3", window: { state: b.state, barsDone: b.barsDone, barsNeeded: b.barsNeeded, readyAt: b.readyAt, asOf: b.asOf, pending: b.pending, gate3: b.gate3 } });
+        return w;
+      }).catch(e => { console.error(`fetchGate3Window ${T}:`, e.message); return null; })
+    : null;
+
   // ── BUILD NEWS CONTEXT ────────────────────────────────────────────
   let newsContext = "No news within the last business week (300 hours). Gate 2 catalyst = NEUTRAL.";
   if (newsData && newsData.ageHours <= MAX_NEWS_AGE_HOURS) {
@@ -6068,6 +6314,13 @@ No swing levels available. Apply 3-bar sequence logic with Mon/Fri overlay.
 Check SESSION CONTEXT for additional bar data provided by user.`;
     }
   }
+  // Beta: the server reads today's bars itself for the Day verdict, so the
+  // model's verdict is the multi-day (Long) call. Kept in the user message
+  // only -- SYSTEM_PROMPT stays byte-identical so its prompt cache still hits.
+  if (windowMode) {
+    barMode = "LONG_VIEW";
+    barContext = "Intraday bars are read separately by the server for today's Day verdict. Your verdict is the multi-day (Long) call. For g3_openbar give only the day-of-week overlay and weekly carryover read; do not judge intraday bars.";
+  }
 
   // ── BUILD WEEKLY CARRYOVER CONTEXT (Gate 3 Tue/Wed/Thu decay) ──────
   // Decay weight is computed server-side from today's real ET weekday
@@ -6090,8 +6343,9 @@ Check SESSION CONTEXT for additional bar data provided by user.`;
   // trust the client for what day it is" reasoning as everything else
   // here) -- adds zero call volume the other 4 days of the week.
   let fridayWeightContext = "N/A — not Friday, this override doesn't apply.";
+  let weekRange = null;
   if (etWeekday() === 5) {
-    const weekRange = await fetchWeekOwnRange(ticker.toUpperCase());
+    weekRange = await fetchWeekOwnRange(ticker.toUpperCase());
     fridayWeightContext = weekRange
       ? `This week (Monday $${weekRange.mondayClose} → ${weekRange.throughDate} $${weekRange.latestClose}, ${weekRange.pctMove > 0 ? '+' : ''}${weekRange.pctMove}%) has been ${weekRange.flat ? 'FLAT' : 'NOT flat'}.`
       : `Week-range data unavailable this run — treat as NOT flat (apply the standard Friday skepticism discount).`;
@@ -6237,7 +6491,7 @@ Return only single-line minified JSON.
       const errText = await response.text();
       console.error(`/analyze ${ticker}: Anthropic ${response.status}: ${errText.slice(0, 500)}`);
       await refundIfCharged(`anthropic ${response.status}`);
-      return res.status(503).json({ error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_UNAVAILABLE" });
+      return fail(503, { error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_UNAVAILABLE" });
     }
 
     const data  = await response.json();
@@ -6532,7 +6786,27 @@ Return only single-line minified JSON.
       }
 
       const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
-      setCache(cacheKey, result);
+      if (windowMode) {
+        // The verdict above is the Long call (still what verdict_log grades,
+        // so the Scorecard doesn't change). The Day call is that Long refined
+        // by the bars -- rules only, no second model call.
+        const win = await windowP;
+        const locked = gate0Status === "RED" || !!gate1Result.forceDown || gate5ForceDown || earningsBlocked;
+        const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
+        const long = { verdict: parsed.verdict, sizing: parsed.sizing, locked, fridaySkeptic };
+        result.gateMissing = gateMissing;
+        result.window = win ? buildWindowBlock(win, long, { locked, fridaySkeptic }) : null;
+        const c = nowCandle();
+        if (c.key) {
+          if (windowVerdictCache.size > 2000) windowVerdictCache.clear();
+          windowVerdictCache.set(wkey, { result, dateET: c.date, candleKey: c.key, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
+        }
+        if (win && result.window.pending) {
+          await saveDayJob({ wkey, dateET: win.dateET, userKey: req.userKey, userId: req.userId, ticker: T, long, readyAt: win.readyAt, status: "PENDING" });
+        }
+      } else {
+        setCache(cacheKey, result);
+      }
       await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
         issuedPrice: typeof metricsData?.price === "number" ? metricsData.price : null,
@@ -6543,16 +6817,17 @@ Return only single-line minified JSON.
         confidence: parsed.confidence,
         userEmail: req.userEmail, tier: req.userTier,
       });
-      res.json(result);
+      if (streaming) { send({ type: "final", result }); res.end(); }
+      else res.json(result);
     } catch (parseErr) {
       console.error(`/analyze ${ticker}: failed to parse/enforce AI response: ${parseErr && parseErr.message} | raw: ${text.slice(0, 300)}`);
       await refundIfCharged("unparseable response");
-      res.status(500).json({ error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_BAD_RESPONSE" });
+      fail(500, { error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_BAD_RESPONSE" });
     }
   } catch(err) {
     console.error(`/analyze ${ticker}: ${err && err.message}`);
     await refundIfCharged("request failed");
-    res.status(503).json({ error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_UNAVAILABLE" });
+    fail(503, { error: ANALYSIS_UNAVAILABLE_MSG, code: "AI_UNAVAILABLE" });
   }
 });
 

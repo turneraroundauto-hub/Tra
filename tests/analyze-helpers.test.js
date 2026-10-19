@@ -232,3 +232,36 @@ test('gatesForLog', async (t) => {
     assert.equal(ah.gatesForLog(null).pre_gate, null);
   });
 });
+
+// ── computeGate0 / Pulse input (Oct 19, 2026) ──
+const q = (pct) => ({ pct, change: (pct > 0 ? '+' : '') + pct.toFixed(2) + '%' });
+test('computeGate0: both down >1% is RED', () => {
+  assert.strictEqual(ah.computeGate0({ spy: q(-1.2), qqq: q(-1.5) }).gateStatus, 'RED');
+});
+test('computeGate0: one index down >1% is YELLOW, not RED (real Sep 14, 2026 open)', () => {
+  const g = ah.computeGate0({ spy: q(-0.74), qqq: q(-1.66) });
+  assert.strictEqual(g.gateStatus, 'YELLOW');
+  assert.match(g.gateNote, /one index down >1%/);
+});
+test('computeGate0: -0.5% band is YELLOW, mild negatives GREEN, strong up GREEN', () => {
+  assert.strictEqual(ah.computeGate0({ spy: q(-0.6), qqq: q(0.1) }).gateStatus, 'YELLOW');
+  assert.strictEqual(ah.computeGate0({ spy: q(-0.2), qqq: q(-0.1) }).gateStatus, 'GREEN');
+  assert.match(ah.computeGate0({ spy: q(0.6), qqq: q(0.7) }).gateNote, /strong tailwind/);
+});
+test('computeGate0: BTC signal and TSM warning', () => {
+  const g = ah.computeGate0({ spy: q(0), qqq: q(0), btc: q(-5.5), tsm: q(-3.2) });
+  assert.strictEqual(g.btcSignal, 'risk-off');
+  assert.match(g.tsmWarning, /TSM -3.20%/);
+  assert.strictEqual(ah.computeGate0({}).gateStatus, 'GREEN');
+});
+test('pulsePct rounds to 1 decimal, missing data is ?', () => {
+  assert.strictEqual(ah.pulsePct(q(1.07)), '+1.1%');
+  assert.strictEqual(ah.pulsePct(q(1.08)), '+1.1%');
+  assert.strictEqual(ah.pulsePct(q(-0.04)), '0.0%');
+  assert.strictEqual(ah.pulsePct({ pct: 0, change: '?' }), '?');
+});
+test('buildPulseInput ignores sub-0.05% wiggles', () => {
+  const a = ah.buildPulseInput({ spy: q(0.41), btc: q(1.07) });
+  const b = ah.buildPulseInput({ spy: q(0.44), btc: q(1.08) });
+  assert.strictEqual(a, b);
+});

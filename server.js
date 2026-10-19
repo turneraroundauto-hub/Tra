@@ -1436,10 +1436,17 @@ Only Gates 2 and 3 go in "gates" — Pre-Gate and Gates 0/1/4/5 are added by the
 `;
 
 const PULSE_PROMPT = `
-You are a market analyst. Write exactly 2 sentences summarizing sector rotation.
-Sentence 1: what is leading and lagging with specific % numbers.
-Sentence 2: the rotation signal for a swing trader right now.
-No bullets. No labels. Plain sentences only. Return only the text.
+You describe today's market moves from a short list of % changes.
+Write exactly 2 plain sentences.
+Sentence 1: the strongest moves up, quoting each % exactly as given.
+Sentence 2: the weakest or most negative moves, quoting each % exactly as given.
+Rules:
+- Use only the tickers and numbers in the message. Never change, round, or invent a number.
+- Describe only direction and size (up, down, flat, leading, lagging).
+- Do not name causes, themes, or narratives (for example "defensive", "risk-on", "risk-off", "safe haven", "inflation hedge", "rotation into").
+- Do not give advice or predictions (no "should", "watch", "consider", "expect", "signal").
+- If every listed move is between -0.3% and +0.3%, say markets are broadly flat.
+No bullets, labels, or headings. Return only the text.
 `;
 
 
@@ -4569,47 +4576,65 @@ function logClaudeUsage(label, usage) {
   console.log(`[CLAUDE USAGE] ${label} in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
 }
 
-// Sector Pulse only depends on the market % changes below, so an identical
-// input would just re-buy the identical summary. /market re-runs this on
-// every 4-min cache refresh, 24/7 -- including nights/weekends when the
-// numbers are frozen -- so reuse the last result whenever the input text is
-// byte-identical.
+// Sector Pulse (Oct 19, 2026). The input is each move rounded to 1 decimal
+// (ah.buildPulseInput), and an identical input reuses the last summary, so a
+// 0.01% wiggle never buys a new one. While the market is closed the BTC line
+// is left out: it trades 24/7 and was making the Pulse rewrite itself every
+// 4 minutes all night and weekend. With it out, the Pulse only changes when a
+// stock number actually changes (pre/post-market), and stays frozen otherwise.
 let lastPulseInput = null, lastPulseText = null;
+let pulseInFlight = null, pulseInFlightInput = null;
+const PULSE_WAIT_MS = 8000;
+
+function pulseInputFor(marketData) {
+  const msg = ah.buildPulseInput(marketData);
+  return isMarketOpen() ? msg : msg.split("\n").filter(l => !l.startsWith("Crypto:")).join("\n");
+}
 
 async function generatePulse(marketData) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
-  const msg = `
-AI/Tech: QQQ ${marketData.qqq?.change||"?"}, SOXX ${marketData.soxx?.change||"?"}, NVDA ${marketData.nvda?.change||"?"}
-Biotech: XBI ${marketData.xbi?.change||"?"}, IBB ${marketData.ibb?.change||"?"}
-Commodities: GLD ${marketData.gld?.change||"?"}, USO ${marketData.uso?.change||"?"}
-Crypto: BTC ${marketData.btc?.change||"?"}
-Broad: SPY ${marketData.spy?.change||"?"}, IWM ${marketData.iwm?.change||"?"}
-Write exactly 2 sentences: sector rotation summary for a swing trader.
-`;
+  const msg = pulseInputFor(marketData);
   if (msg === lastPulseInput && lastPulseText) return lastPulseText;
-  try {
-    const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: CLAUDE_MODEL_LIGHT, max_tokens: 120,
-        temperature: 0,
-        system: PULSE_PROMPT,
-        messages: [{ role: "user", content: msg }],
-      }),
-    }, 20000);
-    if (!res.ok) throw new Error(`Anthropic ${res.status}`);
-    const data = await res.json();
-    logClaudeUsage("pulse", data.usage);
-    const text = data.content?.[0]?.text?.trim() || null;
-    if (text) { lastPulseInput = msg; lastPulseText = text; }
-    return text;
-  } catch(e) { return null; }
+  if (pulseInFlight && pulseInFlightInput === msg) return pulseInFlight;
+  pulseInFlightInput = msg;
+  pulseInFlight = (async () => {
+    try {
+      const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: CLAUDE_MODEL_LIGHT, max_tokens: 120,
+          temperature: 0,
+          system: PULSE_PROMPT,
+          messages: [{ role: "user", content: `${msg}\nDescribe these moves in exactly 2 sentences.` }],
+        }),
+      }, 20000);
+      if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+      const data = await res.json();
+      logClaudeUsage("pulse", data.usage);
+      const text = data.content?.[0]?.text?.trim() || null;
+      if (text) { lastPulseInput = msg; lastPulseText = text; }
+      return text;
+    } catch(e) { return null; }
+    finally { pulseInFlight = null; pulseInFlightInput = null; }
+  })();
+  return pulseInFlight;
+}
+
+// Waits for the Pulse that matches `marketData` so the refresh goes out with
+// a summary built from the same numbers as the grid. If it takes longer than
+// PULSE_WAIT_MS, the caller gets {pulse:null, pending} and sends the old one,
+// then swaps the new one into the cache when it lands.
+async function pulseForSnapshot(marketData) {
+  const p = generatePulse(marketData);
+  const TIMEOUT = Symbol("timeout");
+  const r = await Promise.race([p, new Promise(res => setTimeout(() => res(TIMEOUT), PULSE_WAIT_MS))]);
+  return r === TIMEOUT ? { pulse: null, pending: p } : { pulse: r || null, pending: null };
 }
 
 // ─── HEALTH CHECK ─────────────────────────────────────────────────
@@ -5573,77 +5598,22 @@ app.get("/market", async (req, res) => {
         ? r.value : { price:"?", change:"?", direction:"flat", pct:0 };
     });
 
-    const spyPct = data.spy?.pct || 0;
-    const qqqPct = data.qqq?.pct || 0;
-    const btcPct = data.btc?.pct || 0;
-    const tsmPct = data.tsm?.pct || 0;
-
-    // Gate 0 — dynamic calculation based on actual SPY/QQQ values
-    const avgPct = (spyPct + qqqPct) / 2;
-    const gateStrong = spyPct >= 0.5 && qqqPct >= 0.5;
-    const bothNeg    = spyPct < 0 && qqqPct < 0;
-    const eitherNeg  = spyPct < 0 || qqqPct < 0;
-
-    let gateStatus, gateNote;
-
-    if (spyPct <= -1 && qqqPct <= -1) {
-      // Both down hard — broad market failure
-      gateStatus = "RED";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, broad market failure, risk-off`;
-    } else if (spyPct <= -1 || qqqPct <= -1) {
-      // One index hard down — sector rotation, caution
-      gateStatus = "YELLOW";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — one index down >1%, sector rotation risk, cut size 50%`;
-    } else if (spyPct <= -0.5 || qqqPct <= -0.5) {
-      // Either down meaningfully
-      gateStatus = "YELLOW";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — market under pressure, cut size 50%`;
-    } else if (bothNeg) {
-      // Both negative but mild — cautionary green
-      gateStatus = "GREEN";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both slightly negative, proceed with caution, half size`;
-    } else if (eitherNeg) {
-      // Mixed — one positive one negative
-      gateStatus = "GREEN";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — mixed signals, proceed at reduced size`;
-    } else if (gateStrong) {
-      // Both clearly positive
-      gateStatus = "GREEN";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both up >0.5%, strong tailwind, full proceed`;
-    } else {
-      // Both flat to mildly positive
-      gateStatus = "GREEN";
-      gateNote   = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — flat to mild positive, proceed normally`;
-    }
-
-    // TSM drop >3% = global AI/semi warning
-    const tsmWarning = tsmPct <= -3
-      ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, risk-off on AI/semi names`
-      : null;
-
-    let btcSignal = "neutral";
-    if      (btcPct >=  2) btcSignal = "full conviction";
-    else if (btcPct <= -5) btcSignal = "risk-off";
-    else if (btcPct <= -2) btcSignal = "reduce size";
+    // Gate 0 rules live in one place (ah.computeGate0), shared with the cache warm.
+    const { gateStatus, gateNote, btcSignal, tsmWarning } = ah.computeGate0(data);
 
     const marketOpen = isMarketOpen();
 
-    // Send market data immediately without waiting for pulse
+    // Wait (briefly) for the Pulse built from these same numbers.
+    const { pulse, pending } = await pulseForSnapshot(data);
     const result = {
       ...data, gateStatus, gateNote, btcSignal, tsmWarning,
-      marketOpen, pulse: marketCache?.pulse || null,
+      marketOpen, pulse: pulse || marketCache?.pulse || null,
       timestamp: new Date().toISOString(), cached: false,
     };
     marketCache = result;
     cacheTime   = Date.now();
     res.json(result);
-
-    // Generate pulse in background — updates cache for next request
-    generatePulse(data).then(pulse => {
-      if(pulse && marketCache) {
-        marketCache.pulse = pulse;
-      }
-    }).catch(() => {});
+    if (pending) pending.then(p => { if (p && marketCache === result) marketCache.pulse = p; }).catch(() => {});
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -7144,10 +7114,9 @@ app.post("/stripe/credits", async (req, res) => {
 // Refreshes marketCache (the fixed SPY/QQQ/BTC/etc. tracked-symbol list
 // backing Gate 0 and the /market overview) via fetchQuote. Factored out so
 // both the boot-time warm and the market-open warm pass below use the same
-// logic instead of two copies drifting apart. Deliberately separate from
-// /market's own handler (which computes gateStatus/gateNote with slightly
-// more granular branching) rather than unifying the two — that's a
-// pre-existing, unrelated duplication not worth touching here.
+// logic instead of two copies drifting apart. Gate 0 itself comes from
+// ah.computeGate0, the same rules /market uses (Oct 19, 2026 -- this used to
+// carry its own copy that called one index down >1% RED and forced DOWN).
 async function warmTrackedMarketCache() {
   const tickers = [
     { symbol: "SPY",             key: "spy"  },
@@ -7169,27 +7138,14 @@ async function warmTrackedMarketCache() {
     data[tickers[i].key] = r.status === "fulfilled" && r.value
       ? r.value : { price:"?", change:"?", direction:"flat", pct:0 };
   });
-  const spyPct = data.spy?.pct || 0;
-  const qqqPct = data.qqq?.pct || 0;
-  const btcPct = data.btc?.pct || 0;
-  const tsmPct = data.tsm?.pct || 0;
-  let gateStatus = "GREEN", gateNote = "SPY and QQQ flat or green — proceed";
-  const gateStrong = spyPct >= 0.5 && qqqPct >= 0.5;
-  if (gateStrong) gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both up >0.5%, strong tailwind`;
-  if (spyPct <= -1 || qqqPct <= -1) { gateStatus = "RED"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — both down >1%, risk-off`; }
-  else if (spyPct <= -0.5 || qqqPct <= -0.5) { gateStatus = "YELLOW"; gateNote = `SPY ${data.spy?.change||"?"} QQQ ${data.qqq?.change||"?"} — down >0.5%, cut size 50%`; }
-  let btcSignal = "neutral";
-  if (btcPct >= 2) btcSignal = "full conviction";
-  else if (btcPct <= -5) btcSignal = "risk-off";
-  else if (btcPct <= -2) btcSignal = "reduce size";
-  const tsmWarning = tsmPct <= -3 ? `⚠ TSM ${data.tsm?.change} — Taiwan semi stress, risk-off on AI/semi names` : null;
+  const { gateStatus, gateNote, btcSignal, tsmWarning } = ah.computeGate0(data);
   const marketOpen = isMarketOpen();
-  marketCache = { ...data, gateStatus, gateNote, btcSignal, tsmWarning, marketOpen, pulse: marketCache?.pulse || null, timestamp: new Date().toISOString(), cached: false };
+  const { pulse, pending } = await pulseForSnapshot(data);
+  const result = { ...data, gateStatus, gateNote, btcSignal, tsmWarning, marketOpen, pulse: pulse || marketCache?.pulse || null, timestamp: new Date().toISOString(), cached: false };
+  marketCache = result;
   cacheTime = Date.now();
   console.log(`Market cache warmed. Gate: ${gateStatus}. Market open: ${marketOpen}`);
-  generatePulse(data).then(p => {
-    if (p && marketCache) marketCache.pulse = p;
-  }).catch(() => {});
+  if (pending) pending.then(p => { if (p && marketCache === result) marketCache.pulse = p; }).catch(() => {});
 }
 
 // ─── MARKET-OPEN CACHE WARM ─────────────────────────────────────────

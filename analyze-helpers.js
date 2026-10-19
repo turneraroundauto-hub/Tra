@@ -171,6 +171,76 @@ function gatesForLog(gates) {
         g3_note: (g.g3_openbar && typeof g.g3_openbar.note === "string") ? g.g3_openbar.note : null,
     };
 }
+// Gate 0 (Oct 19, 2026): the ONE set of market-gate rules. /market and the
+// boot/9:30 cache warm used to each carry their own copy, and the warm copy
+// turned ONE index down >1% into RED ("both down") -- which forces DOWN in
+// /analyze. Both paths call this now. `data` is the /market quote map
+// ({spy, qqq, btc, tsm, ...}, each {change, pct}).
+function computeGate0(data) {
+    const d = data || {};
+    const pct = (k) => (d[k] && typeof d[k].pct === "number") ? d[k].pct : 0;
+    const chg = (k) => (d[k] && d[k].change) ? d[k].change : "?";
+    const spyPct = pct("spy"), qqqPct = pct("qqq"), btcPct = pct("btc"), tsmPct = pct("tsm");
+    const head = `SPY ${chg("spy")} QQQ ${chg("qqq")} — `;
+    let gateStatus, rule;
+    if (spyPct <= -1 && qqqPct <= -1) {
+        gateStatus = "RED";
+        rule = "both down >1%, broad market failure, risk-off";
+    }
+    else if (spyPct <= -1 || qqqPct <= -1) {
+        gateStatus = "YELLOW";
+        rule = "one index down >1%, sector rotation risk, cut size 50%";
+    }
+    else if (spyPct <= -0.5 || qqqPct <= -0.5) {
+        gateStatus = "YELLOW";
+        rule = "market under pressure, cut size 50%";
+    }
+    else if (spyPct < 0 && qqqPct < 0) {
+        gateStatus = "GREEN";
+        rule = "both slightly negative, proceed with caution, half size";
+    }
+    else if (spyPct < 0 || qqqPct < 0) {
+        gateStatus = "GREEN";
+        rule = "mixed signals, proceed at reduced size";
+    }
+    else if (spyPct >= 0.5 && qqqPct >= 0.5) {
+        gateStatus = "GREEN";
+        rule = "both up >0.5%, strong tailwind, full proceed";
+    }
+    else {
+        gateStatus = "GREEN";
+        rule = "flat to mild positive, proceed normally";
+    }
+    let btcSignal = "neutral";
+    if (btcPct >= 2)
+        btcSignal = "full conviction";
+    else if (btcPct <= -5)
+        btcSignal = "risk-off";
+    else if (btcPct <= -2)
+        btcSignal = "reduce size";
+    const tsmWarning = tsmPct <= -3 ? `⚠ TSM ${chg("tsm")} — Taiwan semi stress, risk-off on AI/semi names` : null;
+    return { gateStatus, gateNote: head + rule, btcSignal, tsmWarning };
+}
+// Sector Pulse input (Oct 19, 2026): each move rounded to 1 decimal so a
+// 0.01% wiggle doesn't buy a new summary, and the summary quotes the same
+// 1-decimal numbers a reader can check against the grid.
+function pulsePct(q) {
+    if (!q || typeof q.pct !== "number" || q.change === "?" || !isFinite(q.pct))
+        return "?";
+    const r = Math.round(q.pct * 10) / 10;
+    const v = Object.is(r, -0) ? 0 : r;
+    return (v > 0 ? "+" : "") + v.toFixed(1) + "%";
+}
+function buildPulseInput(d) {
+    const m = d || {};
+    return [
+        `AI/Tech: QQQ ${pulsePct(m.qqq)}, SOXX ${pulsePct(m.soxx)}, NVDA ${pulsePct(m.nvda)}`,
+        `Biotech: XBI ${pulsePct(m.xbi)}, IBB ${pulsePct(m.ibb)}`,
+        `Commodities: GLD ${pulsePct(m.gld)}, USO ${pulsePct(m.uso)}`,
+        `Crypto: BTC ${pulsePct(m.btc)}`,
+        `Broad: SPY ${pulsePct(m.spy)}, IWM ${pulsePct(m.iwm)}`,
+    ].join("\n");
+}
 module.exports = {
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
@@ -182,4 +252,7 @@ module.exports = {
     normalizeMarketReading: normalizeMarketReading,
     evaluateProxyStatus: evaluateProxyStatus,
     gatesForLog: gatesForLog,
+    computeGate0: computeGate0,
+    pulsePct: pulsePct,
+    buildPulseInput: buildPulseInput,
 };

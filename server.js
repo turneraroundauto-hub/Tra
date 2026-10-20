@@ -1436,15 +1436,19 @@ Only Gates 2 and 3 go in "gates" — Pre-Gate and Gates 0/1/4/5 are added by the
 `;
 
 const PULSE_PROMPT = `
-You write a short market pulse from a list of % moves and a market leaning that has already been decided.
+You write a short market pulse for someone who does not trade for a living.
+The price numbers are already shown on screen right above your text, so never repeat them.
+You get the market leaning (already decided), the overall direction, and which groups are leading and lagging.
 Write exactly 2 plain sentences.
-Sentence 1: start with the given leaning (e.g. "Broad selloff:") and say the overall market direction in plain words.
-Sentence 2: what led and what lagged, quoting 2-3 of the listed numbers exactly as given.
+Sentence 1: start with the leaning exactly as given (e.g. "Risk-on:") and say in everyday words what it means for the market today.
+Sentence 2: say which groups are carrying the market and which are dragging it, by name only.
+Meaning of each leaning:
+${Object.entries(ah.LEANING_MEANING).map(([k, v]) => "- " + k + ": " + v).join("\n")}
 Rules:
+- No numbers, digits, or percent signs at all.
+- No ticker symbols; use the group names as given.
 - Use the leaning exactly as given. Never choose a different one or add a second one.
-- Use only the tickers and numbers in the message. Never change, round, or invent a number.
-- Plain names are fine: QQQ = tech-heavy Nasdaq, SOXX = semiconductors, XBI/IBB = biotech, IWM = small caps, GLD = gold, USO = oil, BTC = bitcoin.
-- Do not name causes, news, or themes beyond the given leaning (for example "inflation hedge", "rate fears", "rotation into" unless the leaning is Rotation).
+- Do not name causes or news (no "inflation", "rate fears", "earnings").
 - Do not give advice or predictions (no "should", "watch", "consider", "expect", "signal").
 No bullets or headings. Return only the text.
 `;
@@ -4586,22 +4590,20 @@ function logClaudeUsage(label, usage) {
   console.log(`[CLAUDE USAGE] ${label} in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
 }
 
-// Sector Pulse (Oct 19, 2026). The input is each move rounded to 1 decimal
-// (ah.buildPulseInput), and an identical input reuses the last summary, so a
-// 0.01% wiggle never buys a new one. While the market is closed the BTC line
-// is left out: it trades 24/7 and was making the Pulse rewrite itself every
-// 4 minutes all night and weekend. With it out, the Pulse only changes when a
-// stock number actually changes (pre/post-market), and stays frozen otherwise.
+// Sector Pulse (Oct 19-20, 2026). The input is words only -- the leaning,
+// direction, and leading/lagging groups (ah.buildPulseWords) -- so the Pulse
+// can't repeat the numbers in the grid above it, and it only changes when one
+// of those words changes. An identical input reuses the last summary. Any
+// reply that still contains a number is swapped for ah.pulseFallbackText().
 let lastPulseInput = null, lastPulseText = null;
 let pulseInFlight = null, pulseInFlightInput = null;
 const PULSE_WAIT_MS = 8000;
 
 function pulseInputFor(marketData) {
-  const msg = ah.buildPulseInput(marketData);
-  const moves = isMarketOpen() ? msg : msg.split("\n").filter(l => !l.startsWith("Crypto:")).join("\n");
-  // The leaning is decided here by fixed rules (ah.computeMarketLeaning);
-  // the model only phrases it.
-  return `${moves}\nMarket leaning (use exactly): ${ah.computeMarketLeaning(marketData).label}`;
+  // Words only -- no numbers -- so the Pulse can't echo the grid above it
+  // (ah.buildPulseWords). BTC isn't one of the groups, so the overnight
+  // 24/7-crypto churn stays out too.
+  return ah.buildPulseWords(marketData);
 }
 
 async function generatePulse(marketData) {
@@ -4630,10 +4632,16 @@ async function generatePulse(marketData) {
       if (!res.ok) throw new Error(`Anthropic ${res.status}`);
       const data = await res.json();
       logClaudeUsage("pulse", data.usage);
-      const text = data.content?.[0]?.text?.trim() || null;
-      if (text) { lastPulseInput = msg; lastPulseText = text; }
+      let text = data.content?.[0]?.text?.trim() || null;
+      // Backstop: a reply with any number in it is replaced by the
+      // rule-built sentence, so repeated numbers never reach the screen.
+      if (!text || ah.pulseHasNumbers(text)) {
+        if (text) console.warn("Pulse: model reply had numbers, using fallback:", text.slice(0, 160));
+        text = ah.pulseFallbackText(marketData);
+      }
+      lastPulseInput = msg; lastPulseText = text;
       return text;
-    } catch(e) { return null; }
+    } catch(e) { return ah.pulseFallbackText(marketData); }
     finally { pulseInFlight = null; pulseInFlightInput = null; }
   })();
   return pulseInFlight;

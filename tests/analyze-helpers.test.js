@@ -327,3 +327,29 @@ test('computeMarketLeaning: fallbacks and missing data', () => {
   assert.strictEqual(ah.computeMarketLeaning(mk({ spy: 0.5, qqq: 0.4, soxx: 0.2, iwm: 0.1 })).label, 'Mild gains');
   assert.strictEqual(ah.computeMarketLeaning({}).label, 'Unavailable');
 });
+
+test("plain-word Sector Pulse", async (t) => {
+  const qq = (pct) => ({ pct, change: (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%" });
+  const day = { spy: qq(0.8), qqq: qq(1.2), soxx: qq(1.7), nvda: qq(1.4), xbi: qq(2.5), ibb: qq(1.0), iwm: qq(0.5), gld: qq(-0.6), uso: qq(-0.6), btc: qq(3) };
+  await t.test("names leaders and laggards in words, no numbers", () => {
+    const w = ah.buildPulseWords(day);
+    assert.ok(!/[0-9%]/.test(w), w);
+    assert.match(w, /Market leaning: Risk-on/);
+    assert.match(w, /Leading: chip stocks, biotech|Leading: biotech, chip stocks/);
+    assert.match(w, /Lagging: (gold, oil|oil, gold)/);
+  });
+  await t.test("fallback is plain English with no numbers", () => {
+    const t = ah.pulseFallbackText(day);
+    assert.ok(!ah.pulseHasNumbers(t), t);
+    assert.match(t, /^Risk-on: investors are willing to take chances/);
+    assert.match(t, /leading, while .* lagging\.$/);
+  });
+  await t.test("quiet day has no leaders sentence", () => {
+    const quiet = { spy: qq(0.1), qqq: qq(-0.1), gld: qq(0.2) };
+    assert.strictEqual(ah.pulseFallbackText(quiet), "Quiet: a calm day with no real direction.");
+  });
+  await t.test("detects numbers", () => {
+    assert.ok(ah.pulseHasNumbers("SOXX +1.7%"));
+    assert.ok(!ah.pulseHasNumbers("Chip stocks led."));
+  });
+});

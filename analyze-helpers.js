@@ -345,6 +345,77 @@ function computeMarketLeaning(d) {
         return { label: "Rotation", direction };
     return { label: direction === "up" ? "Mild gains" : direction === "down" ? "Mild losses" : "Mixed", direction };
 }
+// Plain-word Pulse input (Oct 20, 2026). Mr. T: the Pulse kept repeating
+// the % numbers printed in the Gate grid right above it. The model now gets
+// no numbers at all -- only the leaning, the direction, and which groups are
+// leading or lagging, named in words -- so it can't echo them. Groups move
+// less than 0.3% either way are left out (noise at the 1-decimal level the
+// grid shows).
+const PULSE_GROUPS = [
+    ["big tech", ["qqq"]],
+    ["chip stocks", ["soxx", "nvda"]],
+    ["biotech", ["xbi", "ibb"]],
+    ["small companies", ["iwm"]],
+    ["gold", ["gld"]],
+    ["oil", ["uso"]],
+];
+function pulseGroups(d) {
+    const m = d || {};
+    const rows = [];
+    for (const [name, keys] of PULSE_GROUPS) {
+        const vals = keys.map(k => r1(m[k])).filter((x) => x != null);
+        if (vals.length)
+            rows.push({ name, v: vals.reduce((a, b) => a + b, 0) / vals.length });
+    }
+    const leading = rows.filter(r => r.v >= 0.3).sort((a, b) => b.v - a.v).slice(0, 2).map(r => r.name);
+    const lagging = rows.filter(r => r.v <= -0.3).sort((a, b) => a.v - b.v).slice(0, 2).map(r => r.name);
+    return { leading, lagging };
+}
+const DIRECTION_WORDS = { up: "stocks are rising", down: "stocks are falling", flat: "stocks are roughly unchanged" };
+function buildPulseWords(d) {
+    const lean = computeMarketLeaning(d);
+    const g = pulseGroups(d);
+    return [
+        `Market leaning: ${lean.label}`,
+        `Overall: ${DIRECTION_WORDS[lean.direction] || DIRECTION_WORDS.flat}`,
+        `Leading: ${g.leading.join(", ") || "nothing stands out"}`,
+        `Lagging: ${g.lagging.join(", ") || "nothing stands out"}`,
+    ].join("\n");
+}
+// What each leaning means to someone who doesn't trade for a living. Used by
+// the fallback sentence below and quoted in the Pulse prompt.
+const LEANING_MEANING = {
+    "Quiet": "a calm day with no real direction.",
+    "Risk-off, safety bid": "investors are pulling back from stocks and moving into safer places like gold.",
+    "Broad selloff": "most of the market is being sold at once, not just one corner of it.",
+    "Commodity-led": "raw materials like oil and gold are doing better than stocks.",
+    "Risk-on": "investors are willing to take chances, buying faster-growing stocks.",
+    "Rotation": "money is moving from some groups into others while the overall market goes nowhere.",
+    "Mild gains": "stocks are edging higher without much conviction.",
+    "Mild losses": "stocks are drifting lower without much conviction.",
+    "Mixed": "some groups are up and some are down, with no clear winner.",
+    "Unavailable": "market data is not available right now.",
+};
+function joinWords(a) {
+    return a.length <= 1 ? (a[0] || "") : a.slice(0, -1).join(", ") + " and " + a[a.length - 1];
+}
+// Built only from fixed rules -- used whenever the model's text is missing
+// or contains a number.
+function pulseFallbackText(d) {
+    const lean = computeMarketLeaning(d);
+    const g = pulseGroups(d);
+    const first = `${lean.label}: ${LEANING_MEANING[lean.label] || LEANING_MEANING.Mixed}`;
+    if (lean.label === "Unavailable")
+        return first;
+    const verb = lean.direction === "down" ? "holding up" : "leading";
+    const lead = g.leading.length ? `${joinWords(g.leading)} ${g.leading.length > 1 ? "are" : "is"} ${verb}` : "";
+    const lag = g.lagging.length ? `${joinWords(g.lagging)} ${g.lagging.length > 1 ? "are" : "is"} lagging` : "";
+    const second = [lead, lag].filter(Boolean).join(", while ");
+    return second ? `${first} ${second.charAt(0).toUpperCase() + second.slice(1)}.` : first;
+}
+function pulseHasNumbers(text) {
+    return /[0-9%]/.test(text || "");
+}
 module.exports = {
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
@@ -362,4 +433,9 @@ module.exports = {
     pulsePct: pulsePct,
     buildPulseInput: buildPulseInput,
     computeMarketLeaning: computeMarketLeaning,
+    pulseGroups: pulseGroups,
+    buildPulseWords: buildPulseWords,
+    pulseFallbackText: pulseFallbackText,
+    pulseHasNumbers: pulseHasNumbers,
+    LEANING_MEANING: LEANING_MEANING,
 };

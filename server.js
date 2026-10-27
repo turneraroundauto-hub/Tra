@@ -16,6 +16,7 @@ const credits   = require("./credits");
 const gx        = require("./gates-extended");
 const ah        = require("./analyze-helpers");
 const g3w       = require("./gate3-window");
+const learn     = require("./learning");
 const { createClient } = require("@supabase/supabase-js");
 const kg = require("./neo4j-graph");
 const mcpServer = require("./mcp-server");
@@ -4359,6 +4360,129 @@ function clearAccuracyCaches() {
   directionalAccuracyCache.clear();
 }
 
+// ─── LEARNING FROM THE TABLES (Oct 27, 2026) ──────────────────────
+// Stage 1: signal_stats -- hit rate per input value, DAY and LONG calls
+// separately. Stage 2: tuning_runs -- past DAY calls re-run under other
+// settings and graded. RECORD ONLY: nothing here changes a live setting;
+// Mr. T approves every change by hand first. Pure logic in learning.ts.
+// Runs once per day after 5pm ET (after the day's grades land). Off switch:
+// LEARNING_JOBS=off.
+const LEARNING_LOOKBACK_DAYS = 90;
+const LEARNING_RUN_AFTER_ET_MIN = 17 * 60;
+let learningLastRunDate = null;
+let learningRunning = false;
+function etSessionOpenMs(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const noonUtc = Date.UTC(y, m - 1, d, 16, 0); // 11am or noon ET
+  const etHour = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false }).format(new Date(noonUtc)));
+  const offsetH = 16 - etHour; // 4 in EDT, 5 in EST
+  return Date.UTC(y, m - 1, d, 9 + offsetH, 30);
+}
+async function fetchLearningRows() {
+  const since = new Date(Date.now() - LEARNING_LOOKBACK_DAYS * 86400000).toISOString();
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase.from("verdict_log")
+      .select("id, ticker, issued_at, verdict, size_action, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, grade_long, return_long_pct, grade_day, day_verdict, day_sizing, grade_day_call, return_day_call_pct, day_due_at")
+      .eq("superseded", false).eq("issued_market_open", true).gte("issued_at", since)
+      .order("issued_at", { ascending: true }).range(from, from + 999);
+    if (error) throw new Error(error.message);
+    out.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+async function writeSignalStats(rows) {
+  const stats = learn.computeSignalStats(rows).map(x => ({ ...x, window_days: LEARNING_LOOKBACK_DAYS, computed_at: new Date().toISOString() }));
+  const { error: delErr } = await supabase.from("signal_stats").delete().neq("call_type", "");
+  if (delErr) throw new Error("signal_stats delete: " + delErr.message);
+  for (let i = 0; i < stats.length; i += 500) {
+    const { error } = await supabase.from("signal_stats").insert(stats.slice(i, i + 500));
+    if (error) throw new Error("signal_stats insert: " + error.message);
+  }
+  return stats.length;
+}
+const LOCKING_OVERRIDES = new Set(["gate0_red", "gate1_forcedown", "gate5_forcedown", "earnings_block"]);
+async function runShadowTuner(rows) {
+  const now = Date.now();
+  const eligible = rows.filter(r => r.gates && r.gates.g3_window && r.day_due_at && Date.parse(r.day_due_at) <= now);
+  const cache = new Map();
+  const memo = (k, f) => { if (!cache.has(k)) cache.set(k, f()); return cache.get(k); };
+  const inputs = [];
+  for (const r of eligible) {
+    const e = learn.etParts(r.issued_at);
+    if (!e) continue;
+    const openMs = etSessionOpenMs(e.date);
+    const closeIso = new Date(openMs + 6.5 * 3600000).toISOString();
+    const opt = (r.gates.inputs && r.gates.inputs.options) || {};
+    const barsBySize = {};
+    for (const size of [5, 15, 30]) barsBySize[size] = await memo(`${r.ticker}:${e.date}:${size}`, () => fetchSessionBars(r.ticker, new Date(openMs).toISOString(), closeIso, size));
+    const close = await memo(`${r.ticker}:${e.date}:close`, () => fetchSessionClose(r.ticker, e.date));
+    const normal = await memo(`${r.ticker}:${e.date}:normal`, () => fetchNormalDailyMovePct(r.ticker, e.date));
+    const opts = r.gates.g3_day_opts;
+    inputs.push({
+      row: r, date: e.date, close, normal,
+      input: {
+        long: { verdict: r.verdict, sizing: r.size_action || "NONE" },
+        locked: opts ? opts.locked : LOCKING_OVERRIDES.has(r.gates.inputs && r.gates.inputs.override),
+        fridaySkeptic: opts ? opts.fridaySkeptic : e.day === "Fri", // approximation before Oct 27 logging
+        issuedAtMs: Date.parse(r.issued_at), openMs, cutoffMs: openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000,
+        barsBySize, impliedDailyMovePct: opt.impliedDailyMovePct ?? null, normalDailyMovePct: opt.normalDailyMovePct ?? null,
+        deltaLean: typeof opt.deltaLean === "number" ? opt.deltaLean : null,
+      },
+    });
+  }
+  const gradeOne = (x, rep) => {
+    if (!rep || rep.skipped || x.close == null || !(rep.entry > 0)) return null;
+    const ret = (x.close - rep.entry) / rep.entry * 100;
+    if (rep.verdict === "UP" || rep.verdict === "DOWN") {
+      const path = (x.input.barsBySize[15] || []).filter(b => Date.parse(b.t) >= rep.readMs);
+      return gradeDirectionalCall(path, rep.entry, rep.verdict, GRADE_WINDOWS.day.target, ret);
+    }
+    return classifyFlatReturn(ret, x.normal == null ? null : x.normal * flatScaleFor(new Date(rep.readMs).toISOString(), 0, GRADE_WINDOWS.day.flatScale));
+  };
+  const runAt = new Date().toISOString();
+  const liveReps = inputs.map(x => learn.replayDayCall(x.input, learn.LIVE_PARAMS));
+  const liveAgg = learn.aggregateResults(inputs.map((x, i) => ({ verdict: liveReps[i].verdict, grade: gradeOne(x, liveReps[i]), date: x.date })));
+  const logged = inputs.filter((x, i) => x.row.day_verdict && liveReps[i].verdict);
+  const matches = logged.filter((x, i) => liveReps[inputs.indexOf(x)].verdict === x.row.day_verdict).length;
+  const out = [];
+  for (const c of learn.TUNING_CANDIDATES) {
+    const reps = c.param === "live" ? liveReps : inputs.map(x => learn.replayDayCall(x.input, c.params));
+    const agg = learn.aggregateResults(inputs.map((x, i) => ({ verdict: reps[i].verdict, grade: gradeOne(x, reps[i]), date: x.date })));
+    const changed = reps.filter((r, i) => r.verdict !== liveReps[i].verdict || r.sizing !== liveReps[i].sizing).length;
+    const ev = c.param === "live" ? { delta: 0, margin: null, meets: false, why: `replay matches the logged DAY call on ${matches} of ${logged.length}` } : learn.evaluateCandidate(liveAgg, agg);
+    out.push({
+      run_at: runAt, param: c.param, candidate: c.candidate, is_live: c.param === "live",
+      n_calls: inputs.length, n_changed: changed, n_dir: agg.nDir, pct_dir: agg.pctDir, n_flat: agg.nFlat, pct_flat: agg.pctFlat,
+      early_pct: agg.earlyPct, late_pct: agg.latePct, delta_vs_live: ev.delta, margin: ev.margin, meets_guardrails: ev.meets, note: ev.why,
+    });
+  }
+  const { error } = await supabase.from("tuning_runs").insert(out);
+  if (error) throw new Error("tuning_runs insert: " + error.message);
+  return { calls: inputs.length, proposals: out.filter(x => x.meets_guardrails).length };
+}
+async function maybeRunLearningJobs(force = false) {
+  if (!supabase || learningRunning || (process.env.LEARNING_JOBS || "").toLowerCase() === "off") return;
+  const c = nowCandle();
+  if (!force && (c.minutes < LEARNING_RUN_AFTER_ET_MIN || learningLastRunDate === c.date)) return;
+  learningRunning = true;
+  try {
+    if (!force) {
+      const { data } = await supabase.from("signal_stats").select("computed_at").order("computed_at", { ascending: false }).limit(1);
+      const last = data && data[0] && data[0].computed_at ? learn.etParts(data[0].computed_at) : null;
+      if (last && last.date === c.date) { learningLastRunDate = c.date; return; }
+    }
+    const rows = await fetchLearningRows();
+    const nStats = await writeSignalStats(rows);
+    const t = await runShadowTuner(rows);
+    learningLastRunDate = c.date;
+    console.log(`[LEARNING] ${rows.length} calls -> ${nStats} signal rows; shadow tuner replayed ${t.calls} DAY calls, ${t.proposals} candidate(s) clear the guardrails (record only, nothing applied).`);
+  } catch (e) {
+    console.error("[LEARNING] failed:", e.message);
+  } finally { learningRunning = false; }
+}
+
 let verdictGradingSweepRunning = false;
 async function runVerdictGradingSweep() {
   if (!supabase) return;
@@ -4382,6 +4506,7 @@ async function runVerdictGradingSweep() {
       console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon, ${dayCount} day, ${longCount} long, ${dayCallCount} DAY-call row(s) graded.`);
     }
     if (horizonCount || dayCount || longCount || dayCallCount) clearAccuracyCaches();
+    maybeRunLearningJobs().catch(e => console.error("[LEARNING]:", e.message));
   } catch (e) {
     console.error("runVerdictGradingSweep:", e.message);
   } finally {
@@ -5733,6 +5858,29 @@ app.get("/scorecard", async (req, res) => {
   }
 });
 
+// The learning tables, read-only (Pro/Shark). Signals with fewer than 5
+// graded calls are left out; the latest shadow-tuner run comes with each
+// candidate's guardrail note. Nothing here applies a change.
+app.get("/learning", async (req, res) => {
+  if (!req.tierConfig?.tracker) return res.status(403).json({ error: "Pro only" });
+  if (!supabase) return res.json({ signals: [], tuning: [] });
+  try {
+    const [{ data: signals }, { data: latest }] = await Promise.all([
+      supabase.from("signal_stats").select("call_type, signal, value, n, pct, avg_move_pct, computed_at").gte("n", 5).order("signal"),
+      supabase.from("tuning_runs").select("run_at").order("run_at", { ascending: false }).limit(1),
+    ]);
+    let tuning = [];
+    if (latest && latest[0]) {
+      const { data } = await supabase.from("tuning_runs").select("*").eq("run_at", latest[0].run_at).order("id");
+      tuning = data || [];
+    }
+    res.json({ signals: signals || [], tuning });
+  } catch (e) {
+    console.error("GET /learning:", e.message);
+    res.status(500).json({ error: "Learning data unavailable" });
+  }
+});
+
 const TRACK_VERDICTS = new Set(["UP", "DOWN", "FLAT"]);
 app.post("/track", async (req, res) => {
   if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
@@ -7025,6 +7173,7 @@ Return only single-line minified JSON.
 
       let windowBarsLog = null;
       let pendingDayJob = null; // saved after logVerdict, so it can carry the row id
+      let dayOptsLog = null;    // locked / fridaySkeptic, logged for exact shadow replays
       const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
       if (windowMode) {
         // The verdict above is the Long call (still what verdict_log grades,
@@ -7036,6 +7185,7 @@ Return only single-line minified JSON.
         const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
         // schedule rides along so a DAY read that lands later uses the same bar size.
         const long = { verdict: parsed.verdict, sizing: parsed.sizing, locked, fridaySkeptic, schedule: win ? win.schedule : null };
+        dayOptsLog = { locked: !!locked, fridaySkeptic: !!fridaySkeptic };
         result.gateMissing = gateMissing;
         result.window = win ? buildWindowBlock(win, long, { locked, fridaySkeptic }) : null;
         const c = nowCandle();
@@ -7077,6 +7227,8 @@ Return only single-line minified JSON.
           g3_bars_done: result.window.barsDone,
           g3_window: result.window.state,
           g3_bar_minutes: result.window.barMinutes,
+          // Exact inputs the shadow tuner needs to replay this DAY call.
+          g3_day_opts: dayOptsLog,
           g3_lens: result.window.lens,
         } : {}, {
           // Oct 19, 2026: the numbers behind each color (ah.gateInputsForLog).

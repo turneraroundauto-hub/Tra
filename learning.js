@@ -1,0 +1,222 @@
+'use strict';
+const g3w = require('./gate3-window');
+const CREDIT = { TRUE: 1, MARGINAL: 0.5, FALSE: 0 };
+const ET_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function etParts(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime()))
+        return null;
+    const f = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const p = {};
+    for (const x of f.formatToParts(d))
+        p[x.type] = x.value;
+    return { day: p.weekday, minutes: (Number(p.hour) % 24) * 60 + Number(p.minute), date: `${p.year}-${p.month}-${p.day}` };
+}
+function hourBucket(min) {
+    if (min < 630)
+        return '9:30-10:30';
+    if (min < 720)
+        return '10:30-12:00';
+    if (min < 840)
+        return '12:00-2:00';
+    return '2:00-4:00';
+}
+function band(x, cuts, labels) {
+    const v = Number(x);
+    if (x == null || !isFinite(v))
+        return null;
+    for (let i = 0; i < cuts.length; i++)
+        if (v < cuts[i])
+            return labels[i];
+    return labels[labels.length - 1];
+}
+const g = (row, path) => path.reduce((o, k) => (o == null ? null : o[k]), row);
+// [signal name, extractor] -- every value the report breaks calls down by.
+const SIGNALS = [
+    ['direction', (r, c) => (c === 'day' ? r.day_verdict : r.verdict)],
+    ['size', (r, c) => (c === 'day' ? r.day_sizing : r.size_action)],
+    ['confidence', r => r.confidence],
+    ['dial', r => r.dial_position],
+    ['tier', r => r.tier],
+    ['weekday', r => { const e = etParts(r.issued_at); return e && e.day; }],
+    ['time_of_day_et', r => { const e = etParts(r.issued_at); return e && hourBucket(e.minutes); }],
+    ['pre_gate', r => r.pre_gate_state],
+    ['gate0', r => r.gate0_read],
+    ['gate1_branch', r => r.gate1_branch],
+    ['gate2_corroborated', r => (r.gate2_corroboration_state ? (String(r.gate2_corroboration_state).startsWith('GATE2-CORROBORATED') ? 'yes' : 'no') : null)],
+    ['g1', r => g(r, ['gates', 'g1'])],
+    ['g2', r => g(r, ['gates', 'g2'])],
+    ['g3', r => g(r, ['gates', 'g3'])],
+    ['g4', r => g(r, ['gates', 'g4'])],
+    ['g5', r => g(r, ['gates', 'g5'])],
+    ['g3_bars', r => g(r, ['gates', 'g3_bars'])],
+    ['g3_bar_minutes', r => { const v = g(r, ['gates', 'g3_bar_minutes']); return v == null ? null : v + ' min'; }],
+    ['catalyst_type', r => g(r, ['gates', 'inputs', 'g2', 'type'])],
+    ['proxy_tier', r => g(r, ['gates', 'inputs', 'g2', 'proxy_tier'])],
+    ['regime', r => g(r, ['gates', 'inputs', 'g5', 'regime'])],
+    ['override', r => (r.gates && r.gates.inputs ? (r.gates.inputs.override || 'none') : null)],
+    ['range_position', r => band(g(r, ['gates', 'inputs', 'g4', 'range_position']), [30, 70], ['<30%', '30-70%', '>70%'])],
+    ['options_lean', r => g(r, ['gates', 'inputs', 'options', 'deltaLeanLabel'])],
+    ['options_move_vs_normal', r => band(g(r, ['gates', 'inputs', 'options', 'moveRatio']), [0.8, 1.3], ['quiet (<0.8x)', 'normal', 'big (>1.3x)'])],
+    ['day_vs_long', (r, c) => (c === 'day' && r.day_verdict ? (r.day_verdict === r.verdict ? 'same' : 'different') : null)],
+];
+// Which grade/return/direction a call type uses. UP/DOWN calls only (the
+// Scorecard headline rule); FLAT calls get their own 'direction' row.
+function callView(r, call) {
+    if (call === 'day') {
+        if (!r.day_verdict || CREDIT[r.grade_day_call] == null)
+            return null;
+        return { verdict: r.day_verdict, grade: r.grade_day_call, ret: r.return_day_call_pct == null ? null : Number(r.return_day_call_pct) };
+    }
+    if (CREDIT[r.grade_long] == null)
+        return null;
+    return { verdict: r.verdict, grade: r.grade_long, ret: r.return_long_pct == null ? null : Number(r.return_long_pct) };
+}
+// rows: verdict_log rows (non-superseded, market hours). Returns flat stats
+// rows ready for signal_stats. pct = credit-weighted % right; avg_move_pct =
+// average move in the call's direction (DOWN calls flip the sign).
+function computeSignalStats(rows) {
+    const acc = new Map();
+    for (const r of rows || []) {
+        for (const call of ['day', 'long']) {
+            const v = callView(r, call);
+            if (!v)
+                continue;
+            const directional = v.verdict === 'UP' || v.verdict === 'DOWN';
+            for (const [name, fn] of SIGNALS) {
+                if (!directional && name !== 'direction')
+                    continue;
+                let val;
+                try {
+                    val = fn(r, call);
+                }
+                catch (e) {
+                    val = null;
+                }
+                if (val == null || val === '')
+                    continue;
+                const key = `${call}|${name}|${val}`;
+                let a = acc.get(key);
+                if (!a) {
+                    a = { call, signal: name, value: String(val), n: 0, credit: 0, moveSum: 0, moveN: 0 };
+                    acc.set(key, a);
+                }
+                a.n++;
+                a.credit += CREDIT[v.grade];
+                if (v.ret != null && isFinite(v.ret) && directional) {
+                    a.moveSum += v.verdict === 'DOWN' ? -v.ret : v.ret;
+                    a.moveN++;
+                }
+            }
+        }
+    }
+    return [...acc.values()].map(a => ({
+        call_type: a.call, signal: a.signal, value: a.value, n: a.n,
+        pct: +(a.credit / a.n * 100).toFixed(1),
+        avg_move_pct: a.moveN ? +(a.moveSum / a.moveN).toFixed(3) : null,
+    }));
+}
+// ── Stage 2: replay one DAY call under a parameter set ─────────────────
+// input: { long:{verdict,sizing}, locked, fridaySkeptic, issuedAtMs,
+//   openMs (9:30 ET that day), cutoffMs, barsBySize:{5:[],15:[],30:[]},
+//   impliedDailyMovePct, normalDailyMovePct, deltaLean (number) }
+// params: { schedule: {fixed?:n} | {fast,slow}, barShare, leanBand (null = lean off) }
+// Mirrors the live flow: read at the later of the tap and the 3rd bar's
+// close, using the last 3 completed bars at that moment; no DAY call after
+// the cutoff.
+const LIVE_PARAMS = { schedule: { fast: 1.3, slow: 0.8 }, barShare: 0.5, leanBand: 0.15 };
+function pickBarMinutes(schedule, implied, normal) {
+    if (schedule && schedule.fixed)
+        return schedule.fixed;
+    if (!(implied > 0) || !(normal > 0))
+        return 15;
+    const ratio = implied / normal;
+    return ratio > schedule.fast ? 5 : ratio < schedule.slow ? 30 : 15;
+}
+function leanLabel(lean, bandWidth) {
+    if (lean == null || bandWidth == null)
+        return null;
+    return lean > bandWidth ? 'BULLISH' : lean < -bandWidth ? 'BEARISH' : 'NEUTRAL';
+}
+function replayDayCall(input, params) {
+    const barMinutes = pickBarMinutes(params.schedule, input.impliedDailyMovePct, input.normalDailyMovePct);
+    const bars = (input.barsBySize || {})[barMinutes];
+    if (!bars)
+        return { skipped: 'no bars', barMinutes };
+    const readMs = Math.max(input.issuedAtMs, input.openMs + g3w.BARS_NEEDED * barMinutes * 60000);
+    if (readMs >= input.cutoffMs)
+        return { skipped: 'after cutoff', barMinutes };
+    const done = g3w.completedBars(bars, readMs, barMinutes);
+    if (done.length < g3w.BARS_NEEDED)
+        return { skipped: 'too few bars', barMinutes };
+    const implied = input.impliedDailyMovePct > 0 ? input.impliedDailyMovePct : null;
+    const yard = implied ? implied * Math.sqrt(barMinutes / 390) : null;
+    const seq = g3w.classifySequence(done.slice(-g3w.BARS_NEEDED), {
+        yardstickPct: yard, lean: leanLabel(input.deltaLean, params.leanBand), barMinutes, minShare: params.barShare,
+    });
+    const day = g3w.refineDayVerdict(input.long, seq, { locked: !!input.locked, fridaySkeptic: !!input.fridaySkeptic });
+    if (!day)
+        return { skipped: 'no read', barMinutes };
+    const last = done[done.length - 1];
+    return { verdict: day.verdict, sizing: day.sizing, barMinutes, readMs: Date.parse(last.t) + barMinutes * 60000, entry: last.c };
+}
+// Candidate settings, each changing ONE thing from live.
+const TUNING_CANDIDATES = [
+    { param: 'live', candidate: 'live', params: LIVE_PARAMS },
+    { param: 'bar_schedule', candidate: 'always 5-min', params: { ...LIVE_PARAMS, schedule: { fixed: 5 } } },
+    { param: 'bar_schedule', candidate: 'always 15-min', params: { ...LIVE_PARAMS, schedule: { fixed: 15 } } },
+    { param: 'bar_schedule', candidate: 'always 30-min', params: { ...LIVE_PARAMS, schedule: { fixed: 30 } } },
+    { param: 'bar_schedule', candidate: 'ratio 1.2 / 0.9', params: { ...LIVE_PARAMS, schedule: { fast: 1.2, slow: 0.9 } } },
+    { param: 'bar_schedule', candidate: 'ratio 1.5 / 0.7', params: { ...LIVE_PARAMS, schedule: { fast: 1.5, slow: 0.7 } } },
+    { param: 'bar_share', candidate: 'any move counts', params: { ...LIVE_PARAMS, barShare: 0 } },
+    { param: 'bar_share', candidate: '0.25 of a bar', params: { ...LIVE_PARAMS, barShare: 0.25 } },
+    { param: 'bar_share', candidate: '0.75 of a bar', params: { ...LIVE_PARAMS, barShare: 0.75 } },
+    { param: 'bar_share', candidate: '1.0 of a bar', params: { ...LIVE_PARAMS, barShare: 1.0 } },
+    { param: 'lean_band', candidate: 'lean off', params: { ...LIVE_PARAMS, leanBand: null } },
+    { param: 'lean_band', candidate: '±0.10', params: { ...LIVE_PARAMS, leanBand: 0.10 } },
+    { param: 'lean_band', candidate: '±0.25', params: { ...LIVE_PARAMS, leanBand: 0.25 } },
+];
+// Guardrails a candidate must clear before it is even PROPOSED to Mr. T
+// (nothing is applied automatically): enough graded UP/DOWN calls, a gain
+// bigger than the margin of error, and better in both halves of the period.
+const PROPOSAL_MIN_CALLS = 100;
+function aggregateResults(results) {
+    const dir = results.filter(x => (x.verdict === 'UP' || x.verdict === 'DOWN') && CREDIT[x.grade] != null);
+    const flat = results.filter(x => x.verdict === 'FLAT' && CREDIT[x.grade] != null);
+    const pct = (xs) => (xs.length ? +(xs.reduce((a, x) => a + CREDIT[x.grade], 0) / xs.length * 100).toFixed(1) : null);
+    const dates = dir.map(x => x.date).sort();
+    const mid = dates.length ? dates[Math.floor(dates.length / 2)] : null;
+    return {
+        nDir: dir.length, pctDir: pct(dir), nFlat: flat.length, pctFlat: pct(flat),
+        earlyPct: mid ? pct(dir.filter(x => x.date < mid)) : null,
+        latePct: mid ? pct(dir.filter(x => x.date >= mid)) : null,
+    };
+}
+function evaluateCandidate(live, cand, minCalls = PROPOSAL_MIN_CALLS) {
+    if (live.pctDir == null || cand.pctDir == null)
+        return { delta: null, margin: null, meets: false, why: 'no graded UP/DOWN calls' };
+    const p = cand.pctDir / 100;
+    const margin = +(1.96 * Math.sqrt(p * (1 - p) / Math.max(cand.nDir, 1)) * 100).toFixed(1);
+    const delta = +(cand.pctDir - live.pctDir).toFixed(1);
+    const why = [];
+    if (cand.nDir < minCalls)
+        why.push(`only ${cand.nDir} of ${minCalls} graded calls`);
+    if (!(delta > margin))
+        why.push(`gain ${delta} pts is inside the ±${margin} margin`);
+    if (!(cand.earlyPct != null && live.earlyPct != null && cand.earlyPct > live.earlyPct && cand.latePct != null && live.latePct != null && cand.latePct > live.latePct))
+        why.push('not better in both halves of the period');
+    return { delta, margin, meets: why.length === 0, why: why.join('; ') || 'clears every guardrail' };
+}
+module.exports = {
+    SIGNALS: SIGNALS.map(s => s[0]),
+    computeSignalStats: computeSignalStats,
+    etParts: etParts,
+    LIVE_PARAMS: LIVE_PARAMS,
+    TUNING_CANDIDATES: TUNING_CANDIDATES,
+    PROPOSAL_MIN_CALLS: PROPOSAL_MIN_CALLS,
+    pickBarMinutes: pickBarMinutes,
+    leanLabel: leanLabel,
+    replayDayCall: replayDayCall,
+    aggregateResults: aggregateResults,
+    evaluateCandidate: evaluateCandidate,
+};

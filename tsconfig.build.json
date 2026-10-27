@@ -27,5 +27,5 @@
     "sourceMap": false,
     "removeComments": false
   },
-  "include": ["gates-extended.ts", "analyze-helpers.ts", "gate3-window.ts"]
+  "include": ["gates-extended.ts", "analyze-helpers.ts", "gate3-window.ts", "learning.ts"]
 }

@@ -71,7 +71,7 @@ function windowState(isTradingDay: boolean, etMinutes: number, closeMin: number,
 // YELLOW, so the DAY call sizes down a step. Starting values, to be tuned on
 // the logged data.
 const DAY_BAR_MIN_SHARE = 0.5;
-type SeqOpts = { yardstickPct?: number | null; lean?: string | null; barMinutes?: number };
+type SeqOpts = { yardstickPct?: number | null; lean?: string | null; barMinutes?: number; minShare?: number };
 function barDir(b: BarLite, minPct: number = 0): number {
   if (!b.o) return 0;
   const body = (b.c - b.o) / b.o * 100;
@@ -87,8 +87,10 @@ function classifySequence(bars3: BarLite[], opts: SeqOpts = {}) {
   if (!bars3 || bars3.length < BARS_NEEDED) return null;
   const [b1, b2, b3] = bars3.slice(-BARS_NEEDED);
   const yard = opts.yardstickPct != null && opts.yardstickPct > 0 ? opts.yardstickPct : null;
-  const barMin = yard ? DAY_BAR_MIN_SHARE * yard : 0;
-  const netMin = yard ? DAY_BAR_MIN_SHARE * yard * Math.sqrt(BARS_NEEDED) : 0;
+  // minShare: the shadow tuner (learning.ts) replays other values; live uses DAY_BAR_MIN_SHARE.
+  const share = opts.minShare != null ? opts.minShare : DAY_BAR_MIN_SHARE;
+  const barMin = yard ? share * yard : 0;
+  const netMin = yard ? share * yard * Math.sqrt(BARS_NEEDED) : 0;
   const d1 = barDir(b1, barMin), d2 = barDir(b2, barMin), d3 = barDir(b3, barMin);
   const netPct = b1.o ? (b3.c - b1.o) / b1.o * 100 : 0;
   const net = (netPct >= 0 ? '+' : '') + netPct.toFixed(2) + '%';

@@ -9,19 +9,21 @@ function hhmm(min) { return pad2(Math.floor(min / 60)) + ':' + pad2(min % 60); }
 // Start (ET minutes) of the 15-min candle the clock is currently inside, or
 // null outside the regular session. Two taps inside the same candle get the
 // same key -- that's what the per-candle verdict cache is keyed on.
-function candleStartMin(etMinutes, closeMin) {
+// barMinutes (Oct 27, 2026): the IV-aware schedule can read 5-, 15- or
+// 30-min bars; 15 stays the default everywhere it isn't passed.
+function candleStartMin(etMinutes, closeMin, barMinutes = BAR_MINUTES) {
     if (etMinutes < SESSION_OPEN_MIN || etMinutes >= closeMin)
         return null;
-    return SESSION_OPEN_MIN + Math.floor((etMinutes - SESSION_OPEN_MIN) / BAR_MINUTES) * BAR_MINUTES;
+    return SESSION_OPEN_MIN + Math.floor((etMinutes - SESSION_OPEN_MIN) / barMinutes) * barMinutes;
 }
-function candleKey(dateStr, etMinutes, closeMin) {
-    const s = candleStartMin(etMinutes, closeMin);
-    return s == null ? null : dateStr + 'T' + hhmm(s);
+function candleKey(dateStr, etMinutes, closeMin, barMinutes = BAR_MINUTES) {
+    const s = candleStartMin(etMinutes, closeMin, barMinutes);
+    return s == null ? null : dateStr + 'T' + hhmm(s) + (barMinutes === BAR_MINUTES ? '' : '/' + barMinutes + 'm');
 }
 // Bars whose 15-min period has fully ended by nowMs. The bar still forming
 // is dropped -- its open/close would change under the user.
-function completedBars(bars, nowMs) {
-    return (bars || []).filter(b => Date.parse(b.t) + BAR_MINUTES * 60000 <= nowMs);
+function completedBars(bars, nowMs, barMinutes = BAR_MINUTES) {
+    return (bars || []).filter(b => Date.parse(b.t) + barMinutes * 60000 <= nowMs);
 }
 function windowState(isTradingDay, etMinutes, closeMin, completedCount) {
     if (!isTradingDay || etMinutes < SESSION_OPEN_MIN || etMinutes >= closeMin)
@@ -30,26 +32,56 @@ function windowState(isTradingDay, etMinutes, closeMin, completedCount) {
         return 'EXPIRED';
     return completedCount >= BARS_NEEDED ? 'RESOLVED' : 'FORMING';
 }
-function barDir(b) { return b.c > b.o ? 1 : b.c < b.o ? -1 : 0; }
+// Options lens (Oct 27, 2026, Mr. T: IV and delta give Gate 3 "a more
+// dynamic lens"). With an IV yardstick -- the move one bar is expected to
+// make -- a bar only counts as up or down when its body is at least
+// DAY_BAR_MIN_SHARE of that, and the 3-bar net move has to clear the same
+// share of a 3-bar move. Without IV (no options data) any move counts, as
+// before. A delta lean that disagrees with a GREEN/RED read drops it to
+// YELLOW, so the DAY call sizes down a step. Starting values, to be tuned on
+// the logged data.
+const DAY_BAR_MIN_SHARE = 0.5;
+function barDir(b, minPct = 0) {
+    if (!b.o)
+        return 0;
+    const body = (b.c - b.o) / b.o * 100;
+    if (Math.abs(body) < minPct || body === 0)
+        return 0;
+    return body > 0 ? 1 : -1;
+}
 // Same 3-bar logic SYSTEM_PROMPT's Gate 3 section describes (bar 2 confirms
 // or rejects bar 1, bar 3 convicts), applied to the latest 3 completed bars.
-// GREEN = bars 2 and 3 both closed up and the 45 minutes net up. RED = the
+// GREEN = bars 2 and 3 both closed up and the window net up. RED = the
 // mirror image. Anything else is YELLOW (still building or reversing).
-function classifySequence(bars3) {
+function classifySequence(bars3, opts = {}) {
     if (!bars3 || bars3.length < BARS_NEEDED)
         return null;
     const [b1, b2, b3] = bars3.slice(-BARS_NEEDED);
-    const d1 = barDir(b1), d2 = barDir(b2), d3 = barDir(b3);
+    const yard = opts.yardstickPct != null && opts.yardstickPct > 0 ? opts.yardstickPct : null;
+    const barMin = yard ? DAY_BAR_MIN_SHARE * yard : 0;
+    const netMin = yard ? DAY_BAR_MIN_SHARE * yard * Math.sqrt(BARS_NEEDED) : 0;
+    const d1 = barDir(b1, barMin), d2 = barDir(b2, barMin), d3 = barDir(b3, barMin);
     const netPct = b1.o ? (b3.c - b1.o) / b1.o * 100 : 0;
     const net = (netPct >= 0 ? '+' : '') + netPct.toFixed(2) + '%';
-    if (d2 === 1 && d3 === 1 && netPct > 0) {
-        return { status: 'GREEN', direction: 1, netPct, note: `Last 3 bars: bars 2 and 3 both closed up (${net} over 45 min). Buyers in control.` };
+    const span = (opts.barMinutes || BAR_MINUTES) * BARS_NEEDED;
+    const sized = yard ? `; a bar counts at ${barMin.toFixed(2)}%+ for this stock today` : '';
+    const base = { netPct, yardstickPct: yard, lean: opts.lean || null };
+    let out;
+    if (d2 === 1 && d3 === 1 && netPct > netMin) {
+        out = { ...base, status: 'GREEN', direction: 1, note: `Last 3 bars: bars 2 and 3 both closed up (${net} over ${span} min${sized}). Buyers in control.` };
     }
-    if (d2 === -1 && d3 === -1 && netPct < 0) {
-        return { status: 'RED', direction: -1, netPct, note: `Last 3 bars: bars 2 and 3 both closed down (${net} over 45 min). Sellers in control.` };
+    else if (d2 === -1 && d3 === -1 && netPct < -netMin) {
+        out = { ...base, status: 'RED', direction: -1, note: `Last 3 bars: bars 2 and 3 both closed down (${net} over ${span} min${sized}). Sellers in control.` };
     }
-    const shape = d2 !== 0 && d2 === d1 ? 'direction building but not confirmed' : 'mixed or reversing';
-    return { status: 'YELLOW', direction: 0, netPct, note: `Last 3 bars: ${shape} (${net} over 45 min). No clear short-term push.` };
+    else {
+        const shape = d2 !== 0 && d2 === d1 ? 'direction building but not confirmed' : yard ? 'moves too small to count, mixed or reversing' : 'mixed or reversing';
+        return { ...base, status: 'YELLOW', direction: 0, note: `Last 3 bars: ${shape} (${net} over ${span} min${sized}). No clear short-term push.` };
+    }
+    if ((out.direction === 1 && opts.lean === 'BEARISH') || (out.direction === -1 && opts.lean === 'BULLISH')) {
+        return { ...base, status: 'YELLOW', direction: 0, leanApplied: true,
+            note: out.note.replace(/\. (Buyers|Sellers) in control\.$/, '') + `, but options traders lean ${opts.lean === 'BEARISH' ? 'bearish' : 'bullish'}. Not confirmed.` };
+    }
+    return out;
 }
 function stepDownSizing(s) {
     if (s === 'FULL')
@@ -103,6 +135,7 @@ module.exports = {
     completedBars: completedBars,
     windowState: windowState,
     classifySequence: classifySequence,
+    DAY_BAR_MIN_SHARE: DAY_BAR_MIN_SHARE,
     stepDownSizing: stepDownSizing,
     refineDayVerdict: refineDayVerdict,
 };

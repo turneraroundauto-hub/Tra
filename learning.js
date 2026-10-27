@@ -59,6 +59,9 @@ const SIGNALS = [
     ['options_lean', r => g(r, ['gates', 'inputs', 'options', 'deltaLeanLabel'])],
     ['options_move_vs_normal', r => band(g(r, ['gates', 'inputs', 'options', 'moveRatio']), [0.8, 1.3], ['quiet (<0.8x)', 'normal', 'big (>1.3x)'])],
     ['day_vs_long', (r, c) => (c === 'day' && r.day_verdict ? (r.day_verdict === r.verdict ? 'same' : 'different') : null)],
+    // Set by annotateDialShift() below (Proposal 7 audit trail): was this call
+    // made within DIAL_SHIFT_WINDOW_DAYS of the account moving its dial?
+    ['dial_shift', r => r.dial_shift],
 ];
 // Which grade/return/direction a call type uses. UP/DOWN calls only (the
 // Scorecard headline rule); FLAT calls get their own 'direction' row.
@@ -207,6 +210,144 @@ function evaluateCandidate(live, cand, minCalls = PROPOSAL_MIN_CALLS) {
         why.push('not better in both halves of the period');
     return { delta, margin, meets: why.length === 0, why: why.join('; ') || 'clears every guardrail' };
 }
+// ── Proposal 7: Gate-Override Audit Trail (Oct 27, 2026) ────────────────
+// Observational only: logs Aggression Dial changes and lines them up with
+// how calls did before and after. Never blocks a dial move, never changes
+// a verdict. "Losses" are the app's own grades (Mr. T's call: app grades
+// only, no Robinhood join).
+// Most aggressive first -- a lower index is a more aggressive setting.
+const DIAL_ORDER = ['ACTIVE_SWING', 'ACTIVE_LEAN', 'NEUTRAL', 'POSITION_LEAN', 'POSITION_LONG'];
+const DIAL_SHIFT_WINDOW_DAYS = 7; // about 5 trading days
+// An app-logged change this close to a verdict at the new position counts
+// as the same move (the log call and ANALYZE can land in either order).
+const DIAL_MATCH_TOLERANCE_MS = 10 * 60 * 1000;
+function dialDirection(from, to) {
+    const a = DIAL_ORDER.indexOf(from), b = DIAL_ORDER.indexOf(to);
+    if (a < 0 || b < 0 || a === b)
+        return null;
+    return b < a ? 'more_aggressive' : 'more_passive';
+}
+// Rebuilds dial changes the app never logged (pre-audit history, a stale
+// cached page, a failed log call) from each account's verdict sequence.
+// verdicts: [{user_email, tier, dial_position, issued_at}] (any order);
+// changes: existing dial_changes rows. Returns new rows with
+// source 'rebuilt': changed_at = first verdict seen at the new position,
+// changed_after = the last evidence of the old one (the move happened
+// somewhere in between). Idempotent: run it again and it returns [].
+function inferDialChanges(verdicts, changes) {
+    const byUser = new Map();
+    const slot = (u) => { let x = byUser.get(u); if (!x) {
+        x = { v: [], c: [] };
+        byUser.set(u, x);
+    } return x; };
+    for (const v of verdicts || [])
+        if (v && v.user_email && DIAL_ORDER.includes(v.dial_position))
+            slot(v.user_email).v.push(v);
+    for (const c of changes || [])
+        if (c && c.user_email)
+            slot(c.user_email).c.push(c);
+    const out = [];
+    for (const [user, x] of byUser) {
+        const vs = x.v.slice().sort((a, b) => Date.parse(a.issued_at) - Date.parse(b.issued_at));
+        const cs = x.c.slice().sort((a, b) => Date.parse(a.changed_at) - Date.parse(b.changed_at));
+        let known = null, knownAt = null, ci = 0;
+        for (const v of vs) {
+            const t = Date.parse(v.issued_at);
+            while (ci < cs.length && Date.parse(cs[ci].changed_at) <= t) {
+                known = cs[ci].to_position;
+                knownAt = cs[ci].changed_at;
+                ci++;
+            }
+            if (known == null) {
+                known = v.dial_position;
+                knownAt = v.issued_at;
+                continue;
+            }
+            if (v.dial_position === known) {
+                knownAt = v.issued_at;
+                continue;
+            }
+            // An app log for this exact move just after the verdict: same move.
+            const soon = cs.slice(ci).find(c => c.to_position === v.dial_position && Date.parse(c.changed_at) - t <= DIAL_MATCH_TOLERANCE_MS);
+            if (soon) {
+                known = v.dial_position;
+                knownAt = v.issued_at;
+                continue;
+            }
+            out.push({ user_email: user, tier: v.tier || null, from_position: known, to_position: v.dial_position,
+                direction: dialDirection(known, v.dial_position), source: 'rebuilt', changed_at: v.issued_at, changed_after: knownAt });
+            known = v.dial_position;
+            knownAt = v.issued_at;
+        }
+    }
+    return out;
+}
+// Tags each verdict row with dial_shift for the signal report:
+// 'more_aggressive' / 'more_passive' when the account moved its dial within
+// DIAL_SHIFT_WINDOW_DAYS before the call, else 'steady'. Rows with no
+// account or from a tier without a dial get null (left out of the report).
+function annotateDialShift(rows, changes, windowDays = DIAL_SHIFT_WINDOW_DAYS) {
+    const byUser = new Map();
+    for (const c of changes || [])
+        if (c && c.user_email && c.direction) {
+            let a = byUser.get(c.user_email);
+            if (!a) {
+                a = [];
+                byUser.set(c.user_email, a);
+            }
+            a.push(c);
+        }
+    for (const a of byUser.values())
+        a.sort((x, y) => Date.parse(x.changed_at) - Date.parse(y.changed_at));
+    const win = windowDays * 86400000;
+    for (const r of rows || []) {
+        if (!r || !r.user_email || !DIAL_ORDER.includes(r.dial_position) || r.tier === 'free') {
+            if (r)
+                r.dial_shift = null;
+            continue;
+        }
+        const t = Date.parse(r.issued_at);
+        const cs = byUser.get(r.user_email) || [];
+        let last = null;
+        for (const c of cs) {
+            if (Date.parse(c.changed_at) <= t)
+                last = c;
+            else
+                break;
+        }
+        r.dial_shift = last && t - Date.parse(last.changed_at) <= win ? last.direction : 'steady';
+    }
+    return rows;
+}
+// Accuracy (dial-horizon grade, MARGINAL = half) and stop-out rate for a set
+// of verdict rows. UP/DOWN calls only, same rule as the Scorecard headline.
+function dialStats(rows) {
+    const d = (rows || []).filter(r => (r.verdict === 'UP' || r.verdict === 'DOWN') && CREDIT[r.grade_horizon] != null);
+    if (!d.length)
+        return { n: 0, pct: null, stopPct: null };
+    const credit = d.reduce((s, r) => s + CREDIT[r.grade_horizon], 0);
+    const withPath = d.filter(r => r.path_outcome);
+    return { n: d.length, pct: +(credit / d.length * 100).toFixed(1),
+        stopPct: withPath.length ? +(withPath.filter(r => r.path_outcome === 'STOP').length / withPath.length * 100).toFixed(1) : null };
+}
+// One account's audit summary: its changes (newest first) and, for the
+// latest change, how calls did since at the new position vs before it at
+// the old one. rows: that account's graded verdict rows.
+function dialAuditSummary(changes, rows) {
+    const cs = (changes || []).slice().sort((a, b) => Date.parse(b.changed_at) - Date.parse(a.changed_at));
+    const latest = cs[0] || null;
+    if (!latest)
+        return { changes: [], latest: null };
+    const at = Date.parse(latest.changed_at);
+    const prevAt = cs[1] ? Date.parse(cs[1].changed_at) : -Infinity;
+    const after = (rows || []).filter(r => Date.parse(r.issued_at) >= at && r.dial_position === latest.to_position);
+    const before = (rows || []).filter(r => { const t = Date.parse(r.issued_at); return t < at && t >= prevAt && r.dial_position === latest.from_position; });
+    return {
+        changes: cs.slice(0, 10).map(c => ({ from: c.from_position, to: c.to_position, direction: c.direction, at: c.changed_at, source: c.source })),
+        latest: { from: latest.from_position, to: latest.to_position, direction: latest.direction, at: latest.changed_at,
+            after: dialStats(after), before: dialStats(before) },
+    };
+}
 module.exports = {
     SIGNALS: SIGNALS.map(s => s[0]),
     computeSignalStats: computeSignalStats,
@@ -219,4 +360,11 @@ module.exports = {
     replayDayCall: replayDayCall,
     aggregateResults: aggregateResults,
     evaluateCandidate: evaluateCandidate,
+    DIAL_ORDER: DIAL_ORDER,
+    DIAL_SHIFT_WINDOW_DAYS: DIAL_SHIFT_WINDOW_DAYS,
+    dialDirection: dialDirection,
+    inferDialChanges: inferDialChanges,
+    annotateDialShift: annotateDialShift,
+    dialStats: dialStats,
+    dialAuditSummary: dialAuditSummary,
 };

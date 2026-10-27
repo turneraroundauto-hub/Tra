@@ -62,3 +62,71 @@ test('guardrails: a proposal needs enough calls, a real gain, and both halves', 
   const oneHalf = L.aggregateResults([...mk(60, 0.95, '2026-11-01'), ...mk(60, 0.45, '2026-12-01')]);
   assert.match(L.evaluateCandidate(live, oneHalf).why, /both halves/);
 });
+
+// ── Proposal 7 audit trail ─────────────────────────────────────────────
+const v = (t, dial, o) => ({ user_email: 'a@x', tier: 'pro', dial_position: dial, issued_at: t, ...o });
+
+test('audit: direction is relative to the dial order (lower = more aggressive)', () => {
+  assert.equal(L.dialDirection('NEUTRAL', 'ACTIVE_SWING'), 'more_aggressive');
+  assert.equal(L.dialDirection('ACTIVE_LEAN', 'POSITION_LONG'), 'more_passive');
+  assert.equal(L.dialDirection('NEUTRAL', 'NEUTRAL'), null);
+  assert.equal(L.dialDirection(null, 'NEUTRAL'), null);
+});
+
+test('audit: changes are rebuilt from the verdict sequence, idempotently', () => {
+  const verdicts = [
+    v('2026-08-31T14:00:00Z', 'NEUTRAL'), v('2026-09-01T14:00:00Z', 'ACTIVE_SWING'),
+    v('2026-09-02T14:00:00Z', 'ACTIVE_SWING'), v('2026-09-14T15:00:00Z', 'ACTIVE_LEAN'),
+    { ...v('2026-09-03T14:00:00Z', 'NEUTRAL'), user_email: 'b@x' },   // other account, no change
+  ];
+  const got = L.inferDialChanges(verdicts, []);
+  assert.equal(got.length, 2);
+  assert.deepEqual(got.map(c => [c.from_position, c.to_position, c.direction, c.source]), [
+    ['NEUTRAL', 'ACTIVE_SWING', 'more_aggressive', 'rebuilt'], ['ACTIVE_SWING', 'ACTIVE_LEAN', 'more_passive', 'rebuilt']]);
+  assert.equal(got[0].changed_after, '2026-08-31T14:00:00Z');        // the move happened between these two
+  assert.equal(got[1].changed_after, '2026-09-02T14:00:00Z');
+  assert.deepEqual(L.inferDialChanges(verdicts, got), []);           // run again: nothing new
+});
+
+test('audit: an app-logged change is not rebuilt a second time', () => {
+  const verdicts = [v('2026-10-01T14:00:00Z', 'NEUTRAL'), v('2026-10-02T14:00:00Z', 'ACTIVE_LEAN')];
+  const before = [{ user_email: 'a@x', from_position: 'NEUTRAL', to_position: 'ACTIVE_LEAN', changed_at: '2026-10-02T13:00:00Z', source: 'app' }];
+  assert.deepEqual(L.inferDialChanges(verdicts, before), []);
+  // Logged a few minutes AFTER the verdict at the new position (ANALYZE won the race): same move.
+  const after = [{ ...before[0], changed_at: '2026-10-02T14:04:00Z' }];
+  assert.deepEqual(L.inferDialChanges(verdicts, after), []);
+  // A verdict that disagrees with the last app log is a missed change.
+  const missed = L.inferDialChanges([...verdicts, v('2026-10-05T14:00:00Z', 'POSITION_LEAN')], before);
+  assert.deepEqual(missed.map(c => [c.from_position, c.to_position]), [['ACTIVE_LEAN', 'POSITION_LEAN']]);
+});
+
+test('audit: dial_shift tags calls within a week of a move', () => {
+  const changes = [{ user_email: 'a@x', direction: 'more_aggressive', changed_at: '2026-10-01T14:00:00Z' }];
+  const rows = L.annotateDialShift([
+    v('2026-09-30T14:00:00Z', 'NEUTRAL'), v('2026-10-03T14:00:00Z', 'ACTIVE_SWING'),
+    v('2026-10-09T14:00:00Z', 'ACTIVE_SWING'), { ...v('2026-10-03T14:00:00Z', 'NEUTRAL'), tier: 'free' },
+    { ...v('2026-10-03T14:00:00Z', 'NEUTRAL'), user_email: null },
+  ], changes);
+  assert.deepEqual(rows.map(r => r.dial_shift), ['steady', 'more_aggressive', 'steady', null, null]);
+  const s = L.computeSignalStats(rows.map(r => ({ ...r, verdict: 'UP', grade_long: 'TRUE' })));
+  assert.equal(s.find(x => x.call_type === 'long' && x.signal === 'dial_shift' && x.value === 'more_aggressive').n, 1);
+});
+
+test('audit: summary compares since the latest change vs before it', () => {
+  const changes = [
+    { from_position: 'NEUTRAL', to_position: 'ACTIVE_SWING', direction: 'more_aggressive', changed_at: '2026-09-01T00:00:00Z', source: 'rebuilt' },
+    { from_position: 'ACTIVE_SWING', to_position: 'ACTIVE_LEAN', direction: 'more_passive', changed_at: '2026-09-14T00:00:00Z', source: 'app' },
+  ];
+  const g = (t, dial, grade, path, verdict = 'UP') => ({ issued_at: t, dial_position: dial, verdict, grade_horizon: grade, path_outcome: path });
+  const rows = [
+    g('2026-08-20T14:00:00Z', 'NEUTRAL', 'TRUE', 'TARGET'),          // before the previous change: ignored
+    g('2026-09-05T14:00:00Z', 'ACTIVE_SWING', 'FALSE', 'STOP'), g('2026-09-06T14:00:00Z', 'ACTIVE_SWING', 'MARGINAL', 'NEITHER'),
+    g('2026-09-20T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', 'TARGET'), g('2026-09-21T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', 'NEITHER'),
+    g('2026-09-22T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', null, 'FLAT'),  // FLAT left out
+  ];
+  const s = L.dialAuditSummary(changes, rows);
+  assert.equal(s.changes[0].to, 'ACTIVE_LEAN');
+  assert.deepEqual(s.latest.after, { n: 2, pct: 100, stopPct: 0 });
+  assert.deepEqual(s.latest.before, { n: 2, pct: 25, stopPct: 50 });
+  assert.deepEqual(L.dialAuditSummary([], rows), { changes: [], latest: null });
+});

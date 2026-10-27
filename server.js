@@ -4383,7 +4383,7 @@ async function fetchLearningRows() {
   const out = [];
   for (let from = 0; ; from += 1000) {
     const { data, error } = await supabase.from("verdict_log")
-      .select("id, ticker, issued_at, verdict, size_action, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, grade_long, return_long_pct, grade_day, day_verdict, day_sizing, grade_day_call, return_day_call_pct, day_due_at")
+      .select("id, ticker, user_email, issued_at, verdict, size_action, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, grade_long, return_long_pct, grade_day, day_verdict, day_sizing, grade_day_call, return_day_call_pct, day_due_at")
       .eq("superseded", false).eq("issued_market_open", true).gte("issued_at", since)
       .order("issued_at", { ascending: true }).range(from, from + 999);
     if (error) throw new Error(error.message);
@@ -4392,7 +4392,8 @@ async function fetchLearningRows() {
   }
   return out;
 }
-async function writeSignalStats(rows) {
+async function writeSignalStats(rows, dialChanges) {
+  if (dialChanges) learn.annotateDialShift(rows, dialChanges);
   const stats = learn.computeSignalStats(rows).map(x => ({ ...x, window_days: LEARNING_LOOKBACK_DAYS, computed_at: new Date().toISOString() }));
   const { error: delErr } = await supabase.from("signal_stats").delete().neq("call_type", "");
   if (delErr) throw new Error("signal_stats delete: " + delErr.message);
@@ -4473,11 +4474,15 @@ async function maybeRunLearningJobs(force = false) {
       const last = data && data[0] && data[0].computed_at ? learn.etParts(data[0].computed_at) : null;
       if (last && last.date === c.date) { learningLastRunDate = c.date; return; }
     }
+    // Audit trail first, so tonight's dial_shift signal sees every change.
+    let dialAdded = 0, dialChanges = null;
+    try { dialAdded = await syncInferredDialChanges(); dialChanges = await fetchDialChanges(); }
+    catch (e) { console.error("[LEARNING] dial audit sync:", e.message); }
     const rows = await fetchLearningRows();
-    const nStats = await writeSignalStats(rows);
+    const nStats = await writeSignalStats(rows, dialChanges);
     const t = await runShadowTuner(rows);
     learningLastRunDate = c.date;
-    console.log(`[LEARNING] ${rows.length} calls -> ${nStats} signal rows; shadow tuner replayed ${t.calls} DAY calls, ${t.proposals} candidate(s) clear the guardrails (record only, nothing applied).`);
+    console.log(`[LEARNING] ${rows.length} calls -> ${nStats} signal rows; shadow tuner replayed ${t.calls} DAY calls, ${t.proposals} candidate(s) clear the guardrails (record only, nothing applied); ${dialAdded} dial change(s) rebuilt.`);
   } catch (e) {
     console.error("[LEARNING] failed:", e.message);
   } finally { learningRunning = false; }
@@ -4517,6 +4522,12 @@ setInterval(() => { runVerdictGradingSweep().catch(e => console.error("runVerdic
 // One pass shortly after boot so a deploy doesn't wait 30 minutes to work
 // through any backlog (e.g. the Sep 29, 2026 horizon backfill).
 setTimeout(() => { runVerdictGradingSweep().catch(e => console.error("runVerdictGradingSweep:", e.message)); }, 60 * 1000);
+// Audit trail: rebuild dial history once after boot (the nightly learning
+// job keeps it current from then on).
+setTimeout(() => {
+  syncInferredDialChanges().then(n => { if (n) console.log(`Dial audit: ${n} change(s) rebuilt from verdict history.`); })
+    .catch(e => console.error("syncInferredDialChanges:", e.message));
+}, 90 * 1000);
 
 // ─── PROPOSAL 3 — FIXED-PROXY REGIME VALIDATION (Aug 13, 2026) ────────
 // gates-extended.js's regimeValidation()/resolveFixedProxyBreak() have
@@ -5878,6 +5889,110 @@ app.get("/learning", async (req, res) => {
   } catch (e) {
     console.error("GET /learning:", e.message);
     res.status(500).json({ error: "Learning data unavailable" });
+  }
+});
+
+// ── Proposal 7: Gate-Override Audit Trail (Oct 27, 2026) ───────────────
+// Every Aggression Dial change, lined up later with how calls did before and
+// after (app grades only -- Mr. T's call, no Robinhood join). Observational:
+// nothing here blocks a dial move or touches a verdict. The client only
+// says where the dial landed; the server decides what it moved from, so a
+// stale or tampered client can't write a wrong change. Changes the app
+// never logged (history before this, an old cached page, a failed log
+// call) are rebuilt nightly from each account's verdict sequence
+// (learn.inferDialChanges, source 'rebuilt').
+const DIAL_TIERS = ["starter", "pro"];
+async function fetchDialVerdicts(userEmail) {
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    let q = supabase.from("verdict_log").select("user_email, tier, dial_position, issued_at")
+      .in("tier", DIAL_TIERS).not("user_email", "is", null).not("dial_position", "is", null);
+    if (userEmail) q = q.eq("user_email", userEmail);
+    const { data, error } = await q.order("issued_at", { ascending: true }).range(from, from + 999);
+    if (error) throw new Error(error.message);
+    out.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+async function fetchDialChanges(userEmail) {
+  let q = supabase.from("dial_changes").select("user_email, tier, from_position, to_position, direction, source, changed_at, changed_after");
+  if (userEmail) q = q.eq("user_email", userEmail);
+  const { data, error } = await q.order("changed_at", { ascending: true }).limit(5000);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+// Fills in missed changes; returns how many rows it added. userEmail scopes
+// it to one account (used before answering /dial-audit).
+async function syncInferredDialChanges(userEmail) {
+  if (!supabase) return 0;
+  const [verdicts, changes] = await Promise.all([fetchDialVerdicts(userEmail), fetchDialChanges(userEmail)]);
+  const add = learn.inferDialChanges(verdicts, changes).map(c => ({ ...c, changed_pt: ptTimestampStr(new Date(c.changed_at)) }));
+  if (!add.length) return 0;
+  const { error } = await supabase.from("dial_changes").insert(add);
+  if (error) throw new Error("dial_changes insert: " + error.message);
+  return add.length;
+}
+// Where the server last saw this account's dial: its newest logged change
+// or its newest verdict, whichever is later.
+async function lastKnownDialPosition(userEmail) {
+  const [{ data: c }, { data: v }] = await Promise.all([
+    supabase.from("dial_changes").select("to_position, changed_at").eq("user_email", userEmail).order("changed_at", { ascending: false }).limit(1),
+    supabase.from("verdict_log").select("dial_position, issued_at").eq("user_email", userEmail).in("tier", DIAL_TIERS).not("dial_position", "is", null).order("issued_at", { ascending: false }).limit(1),
+  ]);
+  const lc = c && c[0], lv = v && v[0];
+  if (lc && (!lv || Date.parse(lc.changed_at) >= Date.parse(lv.issued_at))) return lc.to_position;
+  return lv ? lv.dial_position : null;
+}
+const dialAuditCache = new Map(); // userEmail -> { at, body }
+const DIAL_AUDIT_CACHE_MS = 10 * 60 * 1000;
+
+app.post("/dial-change", async (req, res) => {
+  if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+  if (!req.tierConfig?.dial) return res.status(403).json({ error: "No dial on this tier" });
+  const to = req.body && req.body.to;
+  const allowed = DIAL_RANGES[req.tierConfig.dialRange] || DIAL_RANGES.full;
+  if (!DIAL_POSITIONS[to] || !allowed.includes(to)) return res.status(400).json({ error: "Invalid dial position" });
+  if (!supabase) return res.json({ logged: false });
+  try {
+    const from = await lastKnownDialPosition(req.userEmail);
+    if (from === to) return res.json({ logged: false, reason: "unchanged" });
+    const now = new Date();
+    const { error } = await supabase.from("dial_changes").insert({
+      user_email: req.userEmail, tier: req.userTier || null, from_position: from, to_position: to,
+      direction: learn.dialDirection(from, to), source: "app", changed_at: now.toISOString(), changed_pt: ptTimestampStr(now),
+    });
+    if (error) throw error;
+    dialAuditCache.delete(req.userEmail);
+    res.json({ logged: true, from, to });
+  } catch (e) {
+    console.error("POST /dial-change:", e.message);
+    res.status(500).json({ error: "Could not log the dial change" });
+  }
+});
+
+// The signed-in account's own audit: recent changes and, for the latest one,
+// accuracy + stop-out rate (dial-horizon grade) since vs before it.
+app.get("/dial-audit", async (req, res) => {
+  if (!req.userEmail) return res.status(401).json({ error: "Sign in required" });
+  if (!req.tierConfig?.dial) return res.status(403).json({ error: "No dial on this tier" });
+  if (!supabase) return res.json({ changes: [], latest: null });
+  const hit = dialAuditCache.get(req.userEmail);
+  if (hit && Date.now() - hit.at < DIAL_AUDIT_CACHE_MS) return res.json(hit.body);
+  try {
+    await syncInferredDialChanges(req.userEmail);
+    const changes = await fetchDialChanges(req.userEmail);
+    const { data: rows, error } = await supabase.from("verdict_log")
+      .select("issued_at, dial_position, verdict, grade_horizon, path_outcome")
+      .eq("user_email", req.userEmail).eq("superseded", false).eq("issued_market_open", true)
+      .not("grade_horizon", "is", null).order("issued_at", { ascending: true }).limit(5000);
+    if (error) throw new Error(error.message);
+    const body = { ...learn.dialAuditSummary(changes, rows || []), minGraded: SCORECARD_TICKER_MIN_GRADED };
+    dialAuditCache.set(req.userEmail, { at: Date.now(), body });
+    res.json(body);
+  } catch (e) {
+    console.error("GET /dial-audit:", e.message);
+    res.status(500).json({ error: "Dial audit unavailable" });
   }
 });
 

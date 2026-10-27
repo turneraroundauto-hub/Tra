@@ -4055,11 +4055,11 @@ function gradeDirectionalCall(bars, entry, direction, targetPct, closeReturnPct)
   const touched = (bars || []).some(b => dir === 1 ? b.h >= targetPx : b.l <= targetPx);
   return touched ? "MARGINAL" : "FALSE";
 }
-async function fetchSessionBars(symbol, fromIso, toIso) {
+async function fetchSessionBars(symbol, fromIso, toIso, barMinutes = 15) {
   if (!alpacaKeys()) return null;
   try {
     const data = await alpacaGet(
-      `/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=15Min&start=${encodeURIComponent(fromIso)}&end=${encodeURIComponent(toIso)}&limit=1000&feed=iex&adjustment=raw`
+      `/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${barMinutes}Min&start=${encodeURIComponent(fromIso)}&end=${encodeURIComponent(toIso)}&limit=1000&feed=iex&adjustment=raw`
     );
     return (data.bars || []).filter(b => {
       const { date, minutes } = etClock(b.t);
@@ -6139,38 +6139,56 @@ function nowCandle(now = new Date()) {
   return { date, minutes, closeMin, trading, key: trading ? g3w.candleKey(date, minutes, closeMin) : null };
 }
 
-// One Alpaca call per symbol per 15-min candle, shared by every caller --
-// the bars can't change until the next candle closes.
+// Options lens (Oct 27, 2026): the bar schedule and what counts as a real
+// bar come from the options data (probeOptionsForDay). Off switch:
+// GATE3_OPTIONS_LENS=off keeps the plain 15-min, any-move read.
+const DEFAULT_GATE3_SCHEDULE = { barMinutes: 15, yardstickPct: null, lean: null, source: "default" };
+function gate3ScheduleFrom(probe) {
+  if ((process.env.GATE3_OPTIONS_LENS || "").toLowerCase() === "off") return { ...DEFAULT_GATE3_SCHEDULE, source: "off" };
+  if (!probe || !probe.ok || !(probe.impliedDailyMovePct > 0)) return DEFAULT_GATE3_SCHEDULE;
+  const barMinutes = probe.wouldUseBarMinutes || 15;
+  return { barMinutes, yardstickPct: ah.barYardstickPct(probe.impliedDailyMovePct, barMinutes), lean: probe.deltaLeanLabel || null, source: "options" };
+}
+
+// One Alpaca call per symbol per candle of the schedule's bar size, shared
+// by every caller -- the bars can't change until the next candle closes.
 const gate3BarsCache = new Map(); // symbol -> { key, bars }
-async function fetchGate3Window(symbol, now = new Date()) {
+async function fetchGate3Window(symbol, now = new Date(), schedule = DEFAULT_GATE3_SCHEDULE) {
+  const sched = schedule || DEFAULT_GATE3_SCHEDULE;
+  const barMin = sched.barMinutes || 15;
   const c = nowCandle(now);
+  const key = c.trading ? g3w.candleKey(c.date, c.minutes, c.closeMin, barMin) : null;
   const openMs = Math.floor(now.getTime() / 60000) * 60000 - (c.minutes - g3w.SESSION_OPEN_MIN) * 60000;
-  const readyAt = new Date(openMs + g3w.BARS_NEEDED * g3w.BAR_MINUTES * 60000).toISOString();
+  const readyAt = new Date(openMs + g3w.BARS_NEEDED * barMin * 60000).toISOString();
   const cutoffAt = new Date(openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000).toISOString();
-  const base = { dateET: c.date, candleKey: c.key, readyAt, cutoffAt, barsNeeded: g3w.BARS_NEEDED };
+  const base = { dateET: c.date, candleKey: key, readyAt, cutoffAt, barsNeeded: g3w.BARS_NEEDED, schedule: sched };
   const preState = g3w.windowState(c.trading, c.minutes, c.closeMin, 0);
   if (preState === "CLOSED" || preState === "EXPIRED") return { ...base, state: preState, barsDone: 0, seq: null, asOf: null };
 
   let bars = [];
-  if (c.minutes >= g3w.SESSION_OPEN_MIN + g3w.BAR_MINUTES) {
-    const hit = gate3BarsCache.get(symbol);
-    if (hit && hit.key === c.key) bars = hit.bars;
+  if (c.minutes >= g3w.SESSION_OPEN_MIN + barMin) {
+    const hit = gate3BarsCache.get(`${symbol}:${barMin}`);
+    if (hit && hit.key === key) bars = hit.bars;
     else {
-      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), now.toISOString());
-      if (bars) gate3BarsCache.set(symbol, { key: c.key, bars });
+      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), now.toISOString(), barMin);
+      if (bars) gate3BarsCache.set(`${symbol}:${barMin}`, { key, bars });
     }
   }
   if (bars === null) return { ...base, state: "FORMING", barsDone: 0, seq: null, asOf: null, fetchFailed: true };
-  const done = g3w.completedBars(bars, now.getTime());
+  const done = g3w.completedBars(bars, now.getTime(), barMin);
   const state = g3w.windowState(c.trading, c.minutes, c.closeMin, done.length);
   const last = done[done.length - 1];
   return {
     ...base, state,
     barsDone: Math.min(done.length, g3w.BARS_NEEDED),
-    seq: state === "RESOLVED" ? g3w.classifySequence(done.slice(-g3w.BARS_NEEDED)) : null,
+    seq: state === "RESOLVED" ? g3w.classifySequence(done.slice(-g3w.BARS_NEEDED), { yardstickPct: sched.yardstickPct, lean: sched.lean, barMinutes: barMin }) : null,
     bars: done.slice(-g3w.BARS_NEEDED), // logged in verdict_log.gates.inputs; not sent to the card
-    asOf: last ? new Date(Date.parse(last.t) + g3w.BAR_MINUTES * 60000).toISOString() : null,
+    asOf: last ? new Date(Date.parse(last.t) + barMin * 60000).toISOString() : null,
   };
+}
+
+function ptClock(iso) {
+  try { return new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" }) + " PT"; } catch (e) { return ""; }
 }
 
 // The client-facing window block. long = the verdict the model + server
@@ -6180,7 +6198,7 @@ function buildWindowBlock(win, long, opts) {
   const gate3 = win.seq
     ? { status: win.seq.status, note: win.seq.note }
     : win.state === "FORMING"
-      ? { status: null, note: win.fetchFailed ? "Bar data unavailable right now." : `${win.barsDone}/${win.barsNeeded} bars done. Day read at 7:15 AM PT.` }
+      ? { status: null, note: win.fetchFailed ? "Bar data unavailable right now." : `${win.barsDone}/${win.barsNeeded} ${(win.schedule && win.schedule.barMinutes) || 15}-min bars done. Day read at ${ptClock(win.readyAt)}.` }
       : win.state === "EXPIRED"
         ? { status: null, note: "Day window passed (9:30 AM PT). Long verdict only." }
         : { status: null, note: "Market closed. Long verdict only." };
@@ -6188,6 +6206,9 @@ function buildWindowBlock(win, long, opts) {
   return {
     state: win.state, barsDone: win.barsDone, barsNeeded: win.barsNeeded,
     readyAt: win.readyAt, cutoffAt: win.cutoffAt, asOf: win.asOf, candleKey: win.candleKey,
+    // Options lens: which bar size this read used, the bar yardstick, and the delta lean.
+    barMinutes: (win.schedule && win.schedule.barMinutes) || 15,
+    lens: win.schedule && win.schedule.source === "options" ? { yardstickPct: win.schedule.yardstickPct, lean: win.schedule.lean } : null,
     pending: win.state === "FORMING", gate3, long: { verdict: long.verdict, sizing: long.sizing }, day,
     // Close of the bar the DAY read was made on -- the DAY call's entry price.
     dayEntryPrice: day && win.bars && win.bars.length ? win.bars[win.bars.length - 1].c : null,
@@ -6218,7 +6239,8 @@ async function windowCacheLookup(wkey, ticker, gate0) {
   if (!e) return null;
   const c = nowCandle();
   if (!c.key || e.dateET !== c.date) return null;
-  if (e.candleKey === c.key) return e.result;
+  // Same candle of the bar size that read used (5/15/30 min).
+  if (e.candleKey === g3w.candleKey(c.date, c.minutes, c.closeMin, e.barMinutes || 15)) return e.result;
   const postCutoff = c.minutes >= g3w.WINDOW_CUTOFF_MIN;
   if (postCutoff && e.postCutoff && e.gate0 === gate0 && (await catalystKey(ticker)) === e.catalyst) return e.result;
   return null;
@@ -6268,7 +6290,7 @@ async function broadcastDay(userId, payload) {
 // Resolve one pending job if its bars are in. Returns the job (updated).
 async function resolveDayJob(job) {
   if (job.status !== "PENDING" || Date.now() < Date.parse(job.readyAt)) return job;
-  const win = await fetchGate3Window(job.ticker);
+  const win = await fetchGate3Window(job.ticker, new Date(), job.long && job.long.schedule);
   if (win.dateET !== job.dateET || win.state === "CLOSED" || win.state === "EXPIRED") job.status = "EXPIRED";
   else if (win.state === "RESOLVED") job.status = "READY";
   else return job; // still forming (or a fetch hiccup) -- try again next tick
@@ -6468,7 +6490,7 @@ app.post("/analyze", async (req, res) => {
     ? probeOptionsForDay(T, typeof metricsData?.price === "number" ? metricsData.price : null).catch(() => null)
     : null;
   const windowP = windowMode
-    ? fetchGate3Window(T).then(w => {
+    ? optionsP.then(p => fetchGate3Window(T, new Date(), gate3ScheduleFrom(p))).then(w => {
         const b = buildWindowBlock(w, { verdict: "FLAT", sizing: "NONE" }, {});
         send({ type: "gate3", window: { state: b.state, barsDone: b.barsDone, barsNeeded: b.barsNeeded, readyAt: b.readyAt, asOf: b.asOf, pending: b.pending, gate3: b.gate3 } });
         return w;
@@ -7012,13 +7034,14 @@ Return only single-line minified JSON.
         windowBarsLog = win && win.bars ? win.bars : null;
         const locked = gate0Status === "RED" || !!gate1Result.forceDown || gate5ForceDown || earningsBlocked;
         const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
-        const long = { verdict: parsed.verdict, sizing: parsed.sizing, locked, fridaySkeptic };
+        // schedule rides along so a DAY read that lands later uses the same bar size.
+        const long = { verdict: parsed.verdict, sizing: parsed.sizing, locked, fridaySkeptic, schedule: win ? win.schedule : null };
         result.gateMissing = gateMissing;
         result.window = win ? buildWindowBlock(win, long, { locked, fridaySkeptic }) : null;
         const c = nowCandle();
         if (c.key) {
           if (windowVerdictCache.size > 2000) windowVerdictCache.clear();
-          windowVerdictCache.set(wkey, { result, dateET: c.date, candleKey: c.key, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
+          windowVerdictCache.set(wkey, { result, dateET: c.date, candleKey: win && win.candleKey ? win.candleKey : c.key, barMinutes: win && win.schedule ? win.schedule.barMinutes : 15, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
         }
         if (win && result.window.pending) pendingDayJob = { dateET: win.dateET, long, readyAt: win.readyAt };
       } else {
@@ -7053,6 +7076,8 @@ Return only single-line minified JSON.
           g3_bars_note: result.window.gate3 ? result.window.gate3.note : null,
           g3_bars_done: result.window.barsDone,
           g3_window: result.window.state,
+          g3_bar_minutes: result.window.barMinutes,
+          g3_lens: result.window.lens,
         } : {}, {
           // Oct 19, 2026: the numbers behind each color (ah.gateInputsForLog).
           inputs: logInputs,

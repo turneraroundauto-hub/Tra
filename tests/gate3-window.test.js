@@ -65,3 +65,35 @@ test('refineDayVerdict never adds a call on its own and respects overrides', () 
   assert.equal(g3.refineDayVerdict({ verdict: 'UP', sizing: 'FULL' }, green, { fridaySkeptic: true }).sizing, 'HALF');
   assert.equal(g3.refineDayVerdict({ verdict: 'UP', sizing: 'FULL' }, null), null);
 });
+
+// Options lens (Oct 27, 2026): IV yardstick, delta lean, other bar sizes.
+const mkb = (t, o, c) => ({ t, o, h: Math.max(o, c), l: Math.min(o, c), c });
+test('IV yardstick: small bars no longer count as a push', () => {
+  const tiny = [mkb('2026-10-27T13:30:00Z', 100, 100.05), mkb('2026-10-27T13:45:00Z', 100.05, 100.1), mkb('2026-10-27T14:00:00Z', 100.1, 100.15)];
+  assert.equal(g3.classifySequence(tiny).status, 'GREEN');                       // no IV: any move counts
+  const s = g3.classifySequence(tiny, { yardstickPct: 0.74 });                    // a bar needs 0.37%+
+  assert.equal(s.status, 'YELLOW');
+  assert.match(s.note, /too small to count/);
+  const real = [mkb('2026-10-27T13:30:00Z', 100, 100.5), mkb('2026-10-27T13:45:00Z', 100.5, 101), mkb('2026-10-27T14:00:00Z', 101, 101.5)];
+  assert.equal(g3.classifySequence(real, { yardstickPct: 0.74 }).status, 'GREEN');
+});
+test('delta lean against the bars drops GREEN/RED to YELLOW', () => {
+  const up = [mkb('2026-10-27T13:30:00Z', 100, 100.5), mkb('2026-10-27T13:45:00Z', 100.5, 101), mkb('2026-10-27T14:00:00Z', 101, 101.5)];
+  const s = g3.classifySequence(up, { yardstickPct: 0.74, lean: 'BEARISH' });
+  assert.equal(s.status, 'YELLOW'); assert.equal(s.direction, 0); assert.equal(s.leanApplied, true);
+  assert.match(s.note, /lean bearish/);
+  assert.equal(g3.classifySequence(up, { yardstickPct: 0.74, lean: 'BULLISH' }).status, 'GREEN');
+  assert.equal(g3.classifySequence(up, { lean: 'NEUTRAL' }).status, 'GREEN');
+  const down = up.map(b => ({ ...b, o: b.c, c: b.o }));
+  assert.equal(g3.classifySequence(down, { lean: 'BULLISH' }).status, 'YELLOW');
+  // DAY call steps down a size instead of confirming
+  assert.deepEqual(g3.refineDayVerdict({ verdict: 'UP', sizing: 'FULL' }, s), { verdict: 'UP', sizing: 'HALF', note: 'Bars not confirming yet: size down for the day.' });
+});
+test('5- and 30-min schedules: candles and completed bars', () => {
+  assert.equal(g3.candleKey('2026-10-27', 9 * 60 + 44, CLOSE, 5), '2026-10-27T09:40/5m');
+  assert.equal(g3.candleKey('2026-10-27', 10 * 60 + 59, CLOSE, 30), '2026-10-27T10:30/30m');
+  assert.equal(g3.candleKey('2026-10-27', 10 * 60 + 59, CLOSE), '2026-10-27T10:45');
+  const bars = [{ t: '2026-10-27T13:30:00Z' }, { t: '2026-10-27T13:35:00Z' }, { t: '2026-10-27T13:40:00Z' }];
+  assert.equal(g3.completedBars(bars, Date.parse('2026-10-27T13:45:00Z'), 5).length, 3);
+  assert.equal(g3.completedBars(bars, Date.parse('2026-10-27T13:45:00Z')).length, 1);
+});

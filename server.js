@@ -1643,6 +1643,74 @@ async function fetchImpliedVolatility(symbol, price) {
   }
 }
 
+// ─── OPTIONS PROBE FOR THE DAY CALL (Oct 27, 2026, logging only) ───
+// Records what Alpaca's options data actually returns for each DAY-eligible
+// call -- IV, delta, contract volume, open interest, and how delayed it is --
+// into verdict_log.gates.inputs.options, so the IV/delta-aware Gate 3 can be
+// tuned on real data first. Nothing here changes a verdict. Math is in
+// analyze-helpers (summarizeOptionsChain etc., tested). Cached per symbol per
+// 15-min candle; open interest (trading API, updates daily) per symbol per day.
+const optionsProbeCache = new Map(); // symbol -> { key, value }
+const optionsOiCache = new Map();    // symbol -> { date, oi }
+let alpacaTradingHost = null;        // learned on first success: live or paper
+async function alpacaTradingGet(path) {
+  const creds = alpacaKeys();
+  if (!creds) throw new Error("No ALPACA_KEY/ALPACA_SECRET");
+  const hosts = alpacaTradingHost ? [alpacaTradingHost] : ["https://api.alpaca.markets", "https://paper-api.alpaca.markets"];
+  let lastErr = null;
+  for (const host of hosts) {
+    await alpacaThrottle();
+    const r = await fetchWithTimeout(`${host}${path}`, { headers: { "APCA-API-KEY-ID": creds.key, "APCA-API-SECRET-KEY": creds.secret } }, 8000);
+    if (r.ok) { alpacaTradingHost = host; return r.json(); }
+    lastErr = new Error(`Alpaca trading ${r.status} (${host})`);
+  }
+  throw lastErr;
+}
+async function fetchOptionsOpenInterest(symbol, dateStr, expiryLte) {
+  const hit = optionsOiCache.get(symbol);
+  if (hit && hit.date === dateStr) return hit.oi;
+  let oi = null;
+  try {
+    const data = await alpacaTradingGet(`/v2/options/contracts?underlying_symbols=${symbol}&expiration_date_lte=${expiryLte}&limit=1000`);
+    const list = Array.isArray(data?.option_contracts) ? data.option_contracts : [];
+    oi = {};
+    for (const c of list) { const n = Number(c.open_interest); if (c.symbol && isFinite(n)) oi[c.symbol] = n; }
+  } catch (e) { console.error(`fetchOptionsOpenInterest ${symbol}:`, e.message); }
+  optionsOiCache.set(symbol, { date: dateStr, oi });
+  return oi;
+}
+const roundPct3 = (n) => n == null ? null : +n.toFixed(3);
+async function probeOptionsForDay(symbol, price) {
+  const c = nowCandle();
+  const key = `${c.date}:${c.key}`;
+  const hit = optionsProbeCache.get(symbol);
+  if (hit && hit.key === key) return hit.value;
+  let value;
+  try {
+    if (!alpacaKeys() || !(price > 0)) throw new Error(!alpacaKeys() ? "no Alpaca keys" : "no price");
+    const lte = new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10);
+    const gte = (price * 0.85).toFixed(2), lteStrike = (price * 1.15).toFixed(2);
+    const snapP = alpacaGet(`/v1beta1/options/snapshots/${symbol}?feed=indicative&limit=1000&expiration_date_lte=${lte}&strike_price_gte=${gte}&strike_price_lte=${lteStrike}`);
+    const [data, oi, normal] = await Promise.all([snapP, fetchOptionsOpenInterest(symbol, c.date, lte), fetchNormalDailyMovePct(symbol, c.date)]);
+    const sum = ah.summarizeOptionsChain(data?.snapshots, price, Date.now(), oi);
+    const sched = ah.dayBarSchedule(sum.impliedDailyMovePct, normal);
+    const lean = sum.deltaLeanOi != null ? sum.deltaLeanOi : sum.deltaLeanVolume;
+    value = {
+      ok: true, ...sum, normalDailyMovePct: roundPct3(normal), moveRatio: sched.ratio,
+      wouldUseBarMinutes: sched.barMinutes, barYardstickPct: ah.barYardstickPct(sum.impliedDailyMovePct, sched.barMinutes),
+      bar15YardstickPct: ah.barYardstickPct(sum.impliedDailyMovePct, 15),
+      deltaLean: lean, deltaLeanLabel: ah.deltaLeanLabel(lean), oiSource: oi ? alpacaTradingHost : null,
+    };
+    console.log(`[OPTIONS PROBE] ${symbol} contracts=${sum.contracts} iv=${sum.withIv} delta=${sum.withDelta} vol=${sum.withVolume} oi=${sum.withOi} age=${sum.newestQuoteAgeMin}m atmIv=${sum.atmIv} move=${sum.impliedDailyMovePct}%/normal=${roundPct3(normal)}% bars=${sched.barMinutes}m lean=${value.deltaLeanLabel}`);
+  } catch (e) {
+    console.error(`[OPTIONS PROBE] ${symbol} failed:`, e.message);
+    value = { ok: false, error: String(e.message || e).slice(0, 120) };
+  }
+  optionsProbeCache.set(symbol, { key, value });
+  if (optionsProbeCache.size > 500) optionsProbeCache.clear();
+  return value;
+}
+
 // ─── FINNHUB HELPERS ──────────────────────────────────────────────
 const FH_KEY = () => process.env.FINNHUB_KEY;
 
@@ -3697,7 +3765,7 @@ async function logVerdict(fields) {
     const marketOpenAtIssue = isMarketOpenAt(issuedAt);
     const horizonSessions = horizonSessionsFor(fields.dialPosition);
     const horizon = marketOpenAtIssue ? horizonTargetFor(issuedAt, horizonSessions) : null;
-    await supabase.from("verdict_log").insert({
+    const { data: inserted, error: insertErr } = await supabase.from("verdict_log").insert({
       ticker:                    fields.ticker,
       issued_at:                 issuedAt.toISOString(),
       issued_price:              fields.issuedPrice ?? null,
@@ -3736,10 +3804,36 @@ async function logVerdict(fields) {
       horizon_target_date:       horizon ? horizon.targetDate : null,
       horizon_due_at:            horizon ? horizon.dueAt.toISOString() : null,
       ...(marketOpenAtIssue ? dayLongTargetFields(issuedAt) : {}),
-    });
+      // Oct 27, 2026 (patch26): the DAY call, when it was ready at the tap.
+      // A DAY read that lands later is written by recordDayCall().
+      ...(fields.day ? dayCallFields(fields.day) : {}),
+    }).select("id").single();
+    if (insertErr) { console.error(`logVerdict ${fields.ticker}:`, insertErr.message); return null; }
+    return inserted ? inserted.id : null;
   } catch (e) {
     console.error(`logVerdict ${fields.ticker}:`, e.message);
+    return null;
   }
+}
+
+// The DAY call (Pro, Gate 3 window) is logged next to the Long call it
+// refines, so the Scorecard's Day tile grades the DAY call itself -- not the
+// Long call checked at the day's close (Oct 27, 2026). Entry price is the
+// close of the bar the DAY read was made on; the grader fetches it when null.
+function dayCallFields(day) {
+  return {
+    day_verdict:     day.verdict || null,
+    day_sizing:      day.sizing || null,
+    day_issued_at:   day.asOf || null,
+    day_entry_price: typeof day.entryPrice === "number" ? day.entryPrice : null,
+  };
+}
+async function recordDayCall(verdictLogId, windowBlock) {
+  if (!supabase || !verdictLogId || !windowBlock || !windowBlock.day) return;
+  const { error } = await supabase.from("verdict_log")
+    .update(dayCallFields({ ...windowBlock.day, asOf: windowBlock.asOf, entryPrice: windowBlock.dayEntryPrice }))
+    .eq("id", verdictLogId).is("day_verdict", null);
+  if (error) console.error(`recordDayCall ${verdictLogId}:`, error.message);
 }
 
 // Only logs actual hits (one row per source that matched), matching
@@ -4135,6 +4229,92 @@ async function gradeWindowRows(kind) {
   }
   return graded;
 }
+// Grades the DAY call itself (Oct 27, 2026) at the same session's close,
+// from the bar the DAY read was made on -- the Day tile's only input. Same
+// rules as the Day window (target, MARGINAL, FLAT band scaled to the time
+// left in the session at the DAY read). One bars fetch covers both the entry
+// bar and the path to the close.
+async function gradeDayCallRows() {
+  const w = GRADE_WINDOWS.day;
+  const now = Date.now();
+  const { data: due, error } = await supabase
+    .from("verdict_log")
+    .select("id, ticker, day_verdict, day_issued_at, day_entry_price, day_target_date, day_due_at")
+    .eq("issued_market_open", true)
+    .not("day_verdict", "is", null)
+    .not("day_issued_at", "is", null)
+    .is("graded_at_day_call", null)
+    .lte("day_due_at", new Date(now).toISOString())
+    .order("day_due_at", { ascending: true })
+    .limit(HORIZON_GRADING_BATCH_SIZE);
+  if (error) { console.error("gradeDayCallRows query:", error.message); return 0; }
+  if (!due || !due.length) return 0;
+  let graded = 0;
+  for (const row of due) {
+    const stale = now - new Date(row.day_due_at).getTime() > HORIZON_GIVE_UP_AFTER_MS;
+    const readMs = Date.parse(row.day_issued_at);
+    const close = await fetchSessionClose(row.ticker, row.day_target_date);
+    const bars = await fetchSessionBars(row.ticker, new Date(readMs - 60 * 60000).toISOString(), new Date(row.day_due_at).toISOString());
+    if (close == null || bars == null) {
+      if (stale) await supabase.from("verdict_log").update({ graded_at_day_call: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const before = bars.filter(b => Date.parse(b.t) < readMs);
+    const entry = row.day_entry_price != null ? Number(row.day_entry_price) : (before.length ? before[before.length - 1].c : null);
+    if (!(entry > 0)) {
+      if (stale) await supabase.from("verdict_log").update({ graded_at_day_call: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const r = (close - entry) / entry * 100;
+    let grade;
+    if (row.day_verdict === "UP" || row.day_verdict === "DOWN") {
+      grade = gradeDirectionalCall(bars.filter(b => Date.parse(b.t) >= readMs), entry, row.day_verdict, w.target, r);
+    } else {
+      const normal = await fetchNormalDailyMovePct(row.ticker, row.day_target_date);
+      grade = classifyFlatReturn(r, normal == null ? null : normal * flatScaleFor(row.day_issued_at, 0, w.flatScale));
+    }
+    await supabase.from("verdict_log").update({
+      day_entry_price: entry, return_day_call_pct: r, grade_day_call: grade, graded_at_day_call: new Date().toISOString(),
+    }).eq("id", row.id);
+    graded++;
+  }
+  return graded;
+}
+
+// One-time recovery (Oct 27, 2026): DAY reads that landed after the tap
+// between Oct 19 and this deploy were saved only in day_refinement_jobs.
+// Writes each onto its verdict_log row -- same ticker, same ET day, same
+// account, same Long verdict, the day's last (non-superseded) call -- then
+// marks the job with that row id so it never runs twice. A no-op after.
+async function backfillDayCallsFromJobs() {
+  const { data: jobs, error } = await supabase.from("day_refinement_jobs")
+    .select("wkey, date_et, user_key, ticker, long, status, window_block")
+    .eq("status", "READY").is("verdict_log_id", null).limit(200);
+  if (error) { console.error("backfillDayCallsFromJobs query:", error.message); return 0; }
+  let n = 0;
+  for (const j of jobs || []) {
+    const day = j.window_block && j.window_block.day;
+    const email = typeof j.user_key === "string" && j.user_key.startsWith("sub:") ? j.user_key.slice(4) : null;
+    let rowId = -1; // -1 = looked, nothing to attach (keeps it from re-running)
+    if (day && email && j.long && j.long.verdict) {
+      const start = new Date(`${j.date_et}T00:00:00-05:00`).getTime() - 2 * 3600000;
+      const { data: rows } = await supabase.from("verdict_log")
+        .select("id, issued_at, verdict, day_verdict")
+        .eq("ticker", j.ticker).eq("user_email", email).eq("superseded", false).eq("verdict", j.long.verdict)
+        .gte("issued_at", new Date(start).toISOString()).lte("issued_at", new Date(start + 28 * 3600000).toISOString())
+        .order("issued_at", { ascending: false }).limit(5);
+      const row = (rows || []).find(r => etDateStr(new Date(new Date(r.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" }))) === j.date_et);
+      if (row) {
+        rowId = row.id;
+        if (!row.day_verdict) await recordDayCall(row.id, j.window_block);
+        n++;
+      }
+    }
+    await supabase.from("day_refinement_jobs").update({ verdict_log_id: rowId }).eq("wkey", j.wkey).eq("date_et", j.date_et);
+  }
+  return n;
+}
+
 // Stamps day/long targets on market-hours rows logged before Sep 30, 2026.
 // Pure compute, no network; a no-op once every row is stamped.
 async function backfillDayLongFields() {
@@ -4195,10 +4375,13 @@ async function runVerdictGradingSweep() {
     if (dayLongStamped) console.log(`Verdict day/long backfill: ${dayLongStamped} row(s) stamped.`);
     const dayCount = await gradeUntilCaughtUp(() => gradeWindowRows("day"));
     const longCount = await gradeUntilCaughtUp(() => gradeWindowRows("long"));
-    if (primaryCount || secondaryCount || horizonCount || dayCount || longCount) {
-      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon, ${dayCount} day, ${longCount} long row(s) graded.`);
+    const dayRecovered = await backfillDayCallsFromJobs();
+    if (dayRecovered) console.log(`Day call backfill: ${dayRecovered} DAY read(s) attached from day_refinement_jobs.`);
+    const dayCallCount = await gradeUntilCaughtUp(gradeDayCallRows);
+    if (primaryCount || secondaryCount || horizonCount || dayCount || longCount || dayCallCount) {
+      console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon, ${dayCount} day, ${longCount} long, ${dayCallCount} DAY-call row(s) graded.`);
     }
-    if (horizonCount || dayCount || longCount) clearAccuracyCaches();
+    if (horizonCount || dayCount || longCount || dayCallCount) clearAccuracyCaches();
   } catch (e) {
     console.error("runVerdictGradingSweep:", e.message);
   } finally {
@@ -5448,9 +5631,9 @@ async function fetchScorecardPool() {
     return scorecardPoolCache.data;
   }
   const { data, error } = await supabase
-    .from("verdict_log").select("ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct")
+    .from("verdict_log").select("ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, day_verdict, grade_day_call, return_day_call_pct")
     .eq("superseded", false).eq("issued_market_open", true)
-    .or("grade_day.not.is.null,grade_long.not.is.null");
+    .or("grade_day.not.is.null,grade_long.not.is.null,grade_day_call.not.is.null");
   if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
   scorecardPoolCache = { data: data || [], time: Date.now() };
   return scorecardPoolCache.data;
@@ -5480,18 +5663,22 @@ function tileProof(rows, gradeKey, retKey, pct) {
   return { margin, alwaysUpPct };
 }
 const isDirectional = (r) => r.verdict === "UP" || r.verdict === "DOWN";
+// Oct 27, 2026: the Day tile grades the DAY call itself (Pro, Gate 3
+// window), not the Long call checked at the day's close. Kept separate from
+// the other tiers' calls until DAY calls prove out (Mr. T: 65%+).
+const isDirectionalDay = (r) => r.day_verdict === "UP" || r.day_verdict === "DOWN";
 const SCORECARD_TOP_TICKERS_LIMIT = 5;
 function computeTopTickers(pool, limit) {
   const byTicker = new Map();
-  for (const r of pool.filter(isDirectional)) {
+  for (const r of pool.filter(r => isDirectional(r) || isDirectionalDay(r))) {
     if (!byTicker.has(r.ticker)) byTicker.set(r.ticker, []);
     byTicker.get(r.ticker).push(r);
   }
   const ranked = [];
   for (const [ticker, rows] of byTicker) {
-    // Day and long grades pooled into one number per ticker, so the list
-    // stays a single column.
-    const samples = rows.flatMap(r => [r.grade_day, r.grade_long]).filter(g => GRADE_CREDIT[g] != null);
+    // DAY-call and Long grades pooled into one number per ticker, so the
+    // list stays a single column.
+    const samples = rows.flatMap(r => [isDirectionalDay(r) ? r.grade_day_call : null, r.grade_long]).filter(g => GRADE_CREDIT[g] != null);
     if (samples.length < SCORECARD_TICKER_MIN_GRADED) continue;
     const pct = +(samples.reduce((a, g) => a + GRADE_CREDIT[g], 0) / samples.length * 100).toFixed(1);
     ranked.push({ ticker, pct, gradedCount: samples.length });
@@ -5509,25 +5696,34 @@ app.get("/scorecard", async (req, res) => {
   try {
     const pool = await fetchScorecardPool();
     const directional = pool.filter(isDirectional);
-    const day  = windowStats(directional, "grade_day",  SCORECARD_MIN_GRADED);
+    const directionalDay = pool.filter(isDirectionalDay);
+    // Day = the DAY call graded at the day's close. Long = the Long call
+    // graded 5 trading days later. longAtClose = the Long call checked at
+    // the day's close (what the Day tile used to show), kept as its own line.
+    const day  = windowStats(directionalDay, "grade_day_call", SCORECARD_MIN_GRADED);
     const long = windowStats(directional, "grade_long", SCORECARD_MIN_GRADED);
-    if (day.pct == null && long.pct == null) {
-      return res.json({ insufficientData: true, gradedCount: Math.max(day.gradedCount, long.gradedCount) });
+    const longAtClose = windowStats(directional, "grade_day", SCORECARD_MIN_GRADED);
+    if (day.pct == null && long.pct == null && longAtClose.pct == null) {
+      return res.json({ insufficientData: true, gradedCount: Math.max(day.gradedCount, long.gradedCount, longAtClose.gradedCount) });
     }
-    const row = (verdict) => {
-      const rs = pool.filter(r => r.verdict === verdict);
-      return { day: windowStats(rs, "grade_day", SCORECARD_TICKER_MIN_GRADED), long: windowStats(rs, "grade_long", SCORECARD_TICKER_MIN_GRADED) };
-    };
+    const row = (verdict) => ({
+      day: windowStats(pool.filter(r => r.day_verdict === verdict), "grade_day_call", SCORECARD_TICKER_MIN_GRADED),
+      long: windowStats(pool.filter(r => r.verdict === verdict), "grade_long", SCORECARD_TICKER_MIN_GRADED),
+    });
+    // How often the DAY call differed from the Long call it refines.
+    const dayGraded = pool.filter(r => r.day_verdict && GRADE_CREDIT[r.grade_day_call] != null);
+    const dayVsLong = { calls: dayGraded.length, differed: dayGraded.filter(r => r.day_verdict !== r.verdict).length };
     // Range + always-UP comparison are Pro/Shark only (tierConfig.tracker).
     const proof = req.tierConfig?.tracker
-      ? { day: tileProof(directional, "grade_day", "return_day_pct", day.pct),
+      ? { day: tileProof(directionalDay, "grade_day_call", "return_day_call_pct", day.pct),
           long: tileProof(directional, "grade_long", "return_long_pct", long.pct) }
       : undefined;
     res.json({
       scope: "pooled",
       proof,
       gradedCount: Math.max(day.gradedCount, long.gradedCount),
-      day, long,
+      day, long, longAtClose,
+      dayVsLong: req.tierConfig?.tracker ? dayVsLong : undefined,
       breakdown: { up: row("UP"), down: row("DOWN"), flat: row("FLAT") },
       topTickers: computeTopTickers(pool, SCORECARD_TOP_TICKERS_LIMIT),
     });
@@ -5993,6 +6189,8 @@ function buildWindowBlock(win, long, opts) {
     state: win.state, barsDone: win.barsDone, barsNeeded: win.barsNeeded,
     readyAt: win.readyAt, cutoffAt: win.cutoffAt, asOf: win.asOf, candleKey: win.candleKey,
     pending: win.state === "FORMING", gate3, long: { verdict: long.verdict, sizing: long.sizing }, day,
+    // Close of the bar the DAY read was made on -- the DAY call's entry price.
+    dayEntryPrice: day && win.bars && win.bars.length ? win.bars[win.bars.length - 1].c : null,
   };
 }
 
@@ -6036,18 +6234,18 @@ async function saveDayJob(job) {
   const { error } = await supabase.from("day_refinement_jobs").upsert({
     wkey: job.wkey, date_et: job.dateET, user_key: job.userKey, user_id: job.userId || null,
     ticker: job.ticker, long: job.long, ready_at: job.readyAt, status: job.status,
-    window_block: job.window || null, updated_at: new Date().toISOString(),
+    window_block: job.window || null, verdict_log_id: job.verdictLogId || null, updated_at: new Date().toISOString(),
   }, { onConflict: "wkey,date_et" });
   if (error) console.error("saveDayJob:", error.message);
 }
 async function hydrateDayJobs() {
   if (!supabase) return;
   const { data, error } = await supabase.from("day_refinement_jobs")
-    .select("wkey,date_et,user_key,user_id,ticker,long,ready_at,status,window_block")
+    .select("wkey,date_et,user_key,user_id,ticker,long,ready_at,status,window_block,verdict_log_id")
     .eq("date_et", nowCandle().date).eq("status", "PENDING");
   if (error) { console.error("hydrateDayJobs:", error.message); return; }
   for (const r of data || []) {
-    dayJobs.set(r.wkey, { wkey: r.wkey, dateET: r.date_et, userKey: r.user_key, userId: r.user_id, ticker: r.ticker, long: r.long, readyAt: r.ready_at, status: r.status, window: r.window_block });
+    dayJobs.set(r.wkey, { wkey: r.wkey, dateET: r.date_et, userKey: r.user_key, userId: r.user_id, ticker: r.ticker, long: r.long, readyAt: r.ready_at, status: r.status, window: r.window_block, verdictLogId: r.verdict_log_id });
   }
 }
 
@@ -6076,6 +6274,7 @@ async function resolveDayJob(job) {
   else return job; // still forming (or a fetch hiccup) -- try again next tick
   job.window = buildWindowBlock(win, job.long, { locked: job.long.locked, fridaySkeptic: job.long.fridaySkeptic });
   await saveDayJob(job);
+  if (job.status === "READY") await recordDayCall(job.verdictLogId, job.window);
   const cached = windowVerdictCache.get(job.wkey);
   if (cached && cached.dateET === job.dateET) cached.result = { ...cached.result, window: job.window };
   await broadcastDay(job.userId, { ticker: job.ticker, status: job.status, window: job.window });
@@ -6107,9 +6306,9 @@ app.get("/day/:ticker", async (req, res) => {
   let job = dayJobs.get(wkey);
   if (!job && supabase) {
     const { data } = await supabase.from("day_refinement_jobs")
-      .select("wkey,date_et,user_key,user_id,ticker,long,ready_at,status,window_block")
+      .select("wkey,date_et,user_key,user_id,ticker,long,ready_at,status,window_block,verdict_log_id")
       .eq("wkey", wkey).eq("date_et", nowCandle().date).maybeSingle();
-    if (data) job = { wkey: data.wkey, dateET: data.date_et, userKey: data.user_key, userId: data.user_id, ticker: data.ticker, long: data.long, readyAt: data.ready_at, status: data.status, window: data.window_block };
+    if (data) job = { wkey: data.wkey, dateET: data.date_et, userKey: data.user_key, userId: data.user_id, ticker: data.ticker, long: data.long, readyAt: data.ready_at, status: data.status, window: data.window_block, verdictLogId: data.verdict_log_id };
   }
   if (!job) return res.status(404).json({ error: "No pending Day read for this ticker." });
   job = await resolveDayJob(job).catch(() => job);
@@ -6264,6 +6463,10 @@ app.post("/analyze", async (req, res) => {
       g5_korea: { status: gate5Result.status, note: gate5Result.note },
     } });
   }
+  // DAY-call options probe (logging only) runs alongside the window fetch.
+  const optionsP = windowMode
+    ? probeOptionsForDay(T, typeof metricsData?.price === "number" ? metricsData.price : null).catch(() => null)
+    : null;
   const windowP = windowMode
     ? fetchGate3Window(T).then(w => {
         const b = buildWindowBlock(w, { verdict: "FLAT", sizing: "NONE" }, {});
@@ -6799,6 +7002,7 @@ Return only single-line minified JSON.
       }
 
       let windowBarsLog = null;
+      let pendingDayJob = null; // saved after logVerdict, so it can carry the row id
       const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
       if (windowMode) {
         // The verdict above is the Long call (still what verdict_log grades,
@@ -6816,13 +7020,25 @@ Return only single-line minified JSON.
           if (windowVerdictCache.size > 2000) windowVerdictCache.clear();
           windowVerdictCache.set(wkey, { result, dateET: c.date, candleKey: c.key, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
         }
-        if (win && result.window.pending) {
-          await saveDayJob({ wkey, dateET: win.dateET, userKey: req.userKey, userId: req.userId, ticker: T, long, readyAt: win.readyAt, status: "PENDING" });
-        }
+        if (win && result.window.pending) pendingDayJob = { dateET: win.dateET, long, readyAt: win.readyAt };
       } else {
         setCache(cacheKey, result);
       }
-      await logVerdict({
+      // Logging only: what the options data says for this DAY-eligible call.
+      // Capped so a slow options call can't hold the response.
+      const optionsProbe = optionsP
+        ? await Promise.race([optionsP, new Promise(r => setTimeout(() => r({ ok: false, error: "timeout" }), 3000))])
+        : null;
+      const logInputs = ah.gateInputsForLog({
+            gate1: gate1Result, type: parsed.type, corroborationCount: contextCorroboration.matchCount,
+            rule, metrics: metricsData, windowMode, g3Read: windowMode ? !!(windowBarsLog && windowBarsLog.length >= 3) : g3Read,
+            windowBars: windowBarsLog, openingBar: openingBarData,
+            tickerPct, proxyPct, regime, coherence: coherenceResult,
+            redCount: [preGateResult.status, g1Status, g2Status, g4Status, gate5Result.status].filter(x => x === "RED").length,
+            override: overrideFired,
+          });
+      if (optionsProbe) logInputs.options = optionsProbe;
+      const verdictLogId = await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
         issuedPrice: typeof metricsData?.price === "number" ? metricsData.price : null,
         preGateState: preGateResult.status, gate1Branch: gate1Result.branch,
@@ -6839,17 +7055,17 @@ Return only single-line minified JSON.
           g3_window: result.window.state,
         } : {}, {
           // Oct 19, 2026: the numbers behind each color (ah.gateInputsForLog).
-          inputs: ah.gateInputsForLog({
-            gate1: gate1Result, type: parsed.type, corroborationCount: contextCorroboration.matchCount,
-            rule, metrics: metricsData, windowMode, g3Read: windowMode ? !!(windowBarsLog && windowBarsLog.length >= 3) : g3Read,
-            windowBars: windowBarsLog, openingBar: openingBarData,
-            tickerPct, proxyPct, regime, coherence: coherenceResult,
-            redCount: [preGateResult.status, g1Status, g2Status, g4Status, gate5Result.status].filter(x => x === "RED").length,
-            override: overrideFired,
-          }),
+          inputs: logInputs,
         }),
         userEmail: req.userEmail, tier: req.userTier,
+        day: result.window && result.window.day ? { ...result.window.day, asOf: result.window.asOf, entryPrice: result.window.dayEntryPrice } : null,
       });
+      // Saved after the log row exists so a DAY read that lands later can be
+      // written onto that same row (recordDayCall).
+      if (pendingDayJob) {
+        await saveDayJob({ wkey, dateET: pendingDayJob.dateET, userKey: req.userKey, userId: req.userId, ticker: T,
+          long: pendingDayJob.long, readyAt: pendingDayJob.readyAt, status: "PENDING", verdictLogId });
+      }
       if (streaming) { send({ type: "final", result }); res.end(); }
       else res.json(result);
     } catch (parseErr) {

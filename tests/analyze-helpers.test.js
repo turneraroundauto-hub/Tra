@@ -353,3 +353,48 @@ test("plain-word Sector Pulse", async (t) => {
     assert.ok(!ah.pulseHasNumbers("Chip stocks led."));
   });
 });
+
+test("options probe math (DAY call, logging only)", async (t) => {
+  const now = Date.parse("2026-10-27T15:00:00Z");
+  const snaps = {
+    "MU261120C00100000": { impliedVolatility: 0.6, greeks: { delta: 0.55 }, dailyBar: { v: 1000 }, latestQuote: { t: "2026-10-27T14:45:00Z" } },
+    "MU261120P00100000": { impliedVolatility: 0.62, greeks: { delta: -0.45 }, dailyBar: { v: 200 }, latestQuote: { t: "2026-10-27T14:44:00Z" } },
+    "MU261030C00100000": { impliedVolatility: 1.5, greeks: { delta: 0.5 }, dailyBar: { v: 0 } }, // 3 DTE: not the headline IV
+    "MU261120C00150000": { impliedVolatility: 0.9, greeks: { delta: 0.05 } },               // far OTM
+    "junk": { impliedVolatility: 0.5 },
+  };
+  await t.test("headline IV is near-the-money, 5-45 days out", () => {
+    const s = ah.summarizeOptionsChain(snaps, 100, now);
+    assert.strictEqual(s.contracts, 5);
+    assert.strictEqual(s.atmIv, 0.6);
+    assert.strictEqual(s.impliedDailyMovePct, +(60 / Math.sqrt(252)).toFixed(3));
+    assert.strictEqual(s.newestQuoteAgeMin, 15);
+    assert.strictEqual(s.withVolume, 2);
+  });
+  await t.test("volume-weighted delta lean", () => {
+    const s = ah.summarizeOptionsChain(snaps, 100, now);
+    // (0.55*1000 - 0.45*200) / (0.55*1000 + 0.45*200) = 460/640
+    assert.strictEqual(s.deltaLeanVolume, +(460 / 640).toFixed(3));
+    assert.strictEqual(ah.deltaLeanLabel(s.deltaLeanVolume), "BULLISH");
+    assert.strictEqual(s.deltaLeanOi, null);
+  });
+  await t.test("OI-weighted lean when open interest is supplied", () => {
+    const s = ah.summarizeOptionsChain(snaps, 100, now, { "MU261120C00100000": 100, "MU261120P00100000": 300 });
+    assert.strictEqual(s.withOi, 2);
+    assert.strictEqual(s.deltaLeanOi, +((55 - 135) / (55 + 135)).toFixed(3));
+    assert.strictEqual(ah.deltaLeanLabel(s.deltaLeanOi), "BEARISH");
+  });
+  await t.test("empty chain is safe", () => {
+    const s = ah.summarizeOptionsChain({}, 100, now);
+    assert.strictEqual(s.contracts, 0);
+    assert.strictEqual(s.atmIv, null);
+  });
+  await t.test("bar schedule and yardstick", () => {
+    assert.deepStrictEqual(ah.dayBarSchedule(4, 2), { ratio: 2, barMinutes: 5 });
+    assert.deepStrictEqual(ah.dayBarSchedule(2, 2), { ratio: 1, barMinutes: 15 });
+    assert.deepStrictEqual(ah.dayBarSchedule(1, 2), { ratio: 0.5, barMinutes: 30 });
+    assert.deepStrictEqual(ah.dayBarSchedule(null, 2), { ratio: null, barMinutes: 15 });
+    assert.strictEqual(ah.barYardstickPct(3.78, 15), +(3.78 * Math.sqrt(15 / 390)).toFixed(3));
+    assert.strictEqual(ah.deltaLeanLabel(0.1), "NEUTRAL");
+  });
+});

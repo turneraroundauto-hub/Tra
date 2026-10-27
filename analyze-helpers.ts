@@ -436,6 +436,86 @@ function pulseHasNumbers(text: string): boolean {
   return /[0-9%]/.test(text || "");
 }
 
+// ── Options probe for the DAY call (Oct 27, 2026, logging only) ─────────
+// Mr. T: IV and delta should give Gate 3 a more dynamic lens -- IV sets how
+// big a bar has to be to count and which bar schedule to use, delta says
+// whether options traders lean with the bars. Step one only RECORDS these
+// numbers on each DAY-eligible call (verdict_log.gates.inputs.options) so
+// the thresholds below get tuned on real data before any verdict uses them.
+// Alpaca's indicative options feed is ~15 min delayed.
+const TRADING_MINUTES_PER_DAY = 390;
+const DAY_SCHEDULE_FAST_RATIO = 1.3; // options expect a bigger day than usual
+const DAY_SCHEDULE_SLOW_RATIO = 0.8; // options expect a quieter day than usual
+const DELTA_LEAN_BAND = 0.15;
+
+function occParts(occ: string): { expiry: string; type: string; strike: number } | null {
+  const m = /^[A-Z.]+(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(occ || "");
+  if (!m) return null;
+  return { expiry: `20${m[1]}-${m[2]}-${m[3]}`, type: m[4], strike: parseInt(m[5], 10) / 1000 };
+}
+
+// snapshots: Alpaca's { [occSymbol]: snapshot } map. Pure; nowMs injected.
+function summarizeOptionsChain(snapshots: any, price: number, nowMs: number, oiBySymbol?: Record<string, number> | null): any {
+  const entries = Object.entries(snapshots || {});
+  const out: any = { contracts: entries.length, withIv: 0, withDelta: 0, withVolume: 0, newestQuoteAgeMin: null,
+    atmIv: null, atmDte: null, impliedDailyMovePct: null, deltaLeanVolume: null, deltaLeanOi: null, withOi: 0 };
+  if (!entries.length || !(price > 0)) return out;
+  let newest = 0, best: any = null, bestScore = Infinity;
+  let volNum = 0, volDen = 0, oiNum = 0, oiDen = 0;
+  for (const [occ, snap] of entries as Array<[string, any]>) {
+    const parts = occParts(occ);
+    if (!parts) continue;
+    const iv = typeof snap?.impliedVolatility === "number" ? snap.impliedVolatility : snap?.greeks?.impliedVolatility;
+    const delta = snap?.greeks?.delta;
+    const vol = snap?.dailyBar?.v;
+    const qt = Date.parse(snap?.latestQuote?.t || snap?.latestTrade?.t || "");
+    if (isFinite(qt) && qt > newest) newest = qt;
+    if (typeof iv === "number" && iv > 0) out.withIv++;
+    if (typeof delta === "number") out.withDelta++;
+    if (typeof vol === "number" && vol > 0) out.withVolume++;
+    const dte = (Date.parse(parts.expiry + "T20:00:00Z") - nowMs) / 86400000;
+    if (dte < 0) continue;
+    // Headline IV: nearest-the-money contract 5-45 days out (0-4 DTE IV
+    // swings wildly near expiry).
+    if (typeof iv === "number" && iv > 0 && dte >= 5 && dte <= 45) {
+      const score = Math.abs(parts.strike - price) / price * 100 + dte * 0.05;
+      if (score < bestScore) { bestScore = score; best = { iv, dte }; }
+    }
+    if (typeof delta === "number") {
+      if (typeof vol === "number" && vol > 0) { volNum += delta * vol; volDen += Math.abs(delta) * vol; }
+      const oi = oiBySymbol ? oiBySymbol[occ] : undefined;
+      if (typeof oi === "number" && oi > 0) { out.withOi++; oiNum += delta * oi; oiDen += Math.abs(delta) * oi; }
+    }
+  }
+  if (newest) out.newestQuoteAgeMin = Math.round((nowMs - newest) / 60000);
+  if (best) {
+    out.atmIv = +best.iv.toFixed(4);
+    out.atmDte = +best.dte.toFixed(1);
+    out.impliedDailyMovePct = +(best.iv * 100 / Math.sqrt(252)).toFixed(3);
+  }
+  if (volDen > 0) out.deltaLeanVolume = +(volNum / volDen).toFixed(3);
+  if (oiDen > 0) out.deltaLeanOi = +(oiNum / oiDen).toFixed(3);
+  return out;
+}
+
+// Which bar schedule the IV-aware Gate 3 WOULD use (not used for verdicts yet).
+function dayBarSchedule(impliedDailyMovePct: number | null, normalDailyMovePct: number | null): { ratio: number | null; barMinutes: number } {
+  if (!(impliedDailyMovePct! > 0) || !(normalDailyMovePct! > 0)) return { ratio: null, barMinutes: 15 };
+  const ratio = +(impliedDailyMovePct! / normalDailyMovePct!).toFixed(3);
+  return { ratio, barMinutes: ratio > DAY_SCHEDULE_FAST_RATIO ? 5 : ratio < DAY_SCHEDULE_SLOW_RATIO ? 30 : 15 };
+}
+
+// The move one bar of `barMinutes` is expected to make, from the daily move.
+function barYardstickPct(impliedDailyMovePct: number | null, barMinutes: number): number | null {
+  if (!(impliedDailyMovePct! > 0)) return null;
+  return +(impliedDailyMovePct! * Math.sqrt(barMinutes / TRADING_MINUTES_PER_DAY)).toFixed(3);
+}
+
+function deltaLeanLabel(lean: number | null): string | null {
+  if (lean == null) return null;
+  return lean > DELTA_LEAN_BAND ? "BULLISH" : lean < -DELTA_LEAN_BAND ? "BEARISH" : "NEUTRAL";
+}
+
 module.exports = {
   parsePctString: parsePctString,
   CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
@@ -458,4 +538,8 @@ module.exports = {
   pulseFallbackText: pulseFallbackText,
   pulseHasNumbers: pulseHasNumbers,
   LEANING_MEANING: LEANING_MEANING,
+  summarizeOptionsChain: summarizeOptionsChain,
+  dayBarSchedule: dayBarSchedule,
+  barYardstickPct: barYardstickPct,
+  deltaLeanLabel: deltaLeanLabel,
 };

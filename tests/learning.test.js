@@ -32,24 +32,30 @@ const base = {
   impliedDailyMovePct: 3.78, normalDailyMovePct: 2, deltaLean: -0.42,
 };
 
-test('replay matches the live rules', () => {
+test('replay: the Oct 27 options lens (now a candidate) reads as it did live', () => {
+  const lens = L.OCT27_LENS_PARAMS;
+  const r = L.replayDayCall(base, lens);
+  assert.equal(r.barMinutes, 5);                     // 3.78 / 2 = 1.89x -> 5-min bars
+  assert.equal(r.verdict, 'UP'); assert.equal(r.sizing, 'HALF'); // bearish lean steps it down
+  assert.equal(r.readMs, Date.parse('2026-10-27T13:45:00Z'));
+  assert.equal(L.replayDayCall(base, { ...lens, leanBand: null }).sizing, 'FULL');
+  assert.equal(L.replayDayCall(base, { ...lens, barShare: 1.0 }).sizing, 'HALF'); // 0.3% bars < 0.43% yardstick
+});
+
+test('replay: live is plain 15-min candles, any move counts, no lean (Oct 28)', () => {
   const live = L.replayDayCall(base, L.LIVE_PARAMS);
-  assert.equal(live.barMinutes, 5);                  // 3.78 / 2 = 1.89x -> 5-min bars
-  assert.equal(live.verdict, 'UP'); assert.equal(live.sizing, 'HALF'); // bearish lean steps it down
-  assert.equal(live.readMs, Date.parse('2026-10-27T13:45:00Z'));
-  const noLean = L.replayDayCall(base, { ...L.LIVE_PARAMS, leanBand: null });
-  assert.equal(noLean.sizing, 'FULL');
-  const big = L.replayDayCall(base, { ...L.LIVE_PARAMS, barShare: 1.0 }); // 0.3% bars < 0.43% yardstick
-  assert.equal(big.sizing, 'HALF');
-  const fifteen = L.replayDayCall(base, { ...L.LIVE_PARAMS, schedule: { fixed: 15 } });
-  assert.equal(fifteen.barMinutes, 15); assert.equal(fifteen.readMs, Date.parse('2026-10-27T14:15:00Z'));
+  assert.equal(live.barMinutes, 15); assert.equal(live.readMs, Date.parse('2026-10-27T14:15:00Z'));
+  assert.equal(live.verdict, 'UP'); assert.equal(live.sizing, 'FULL'); // bearish lean ignored live
+  assert.equal(live.window.length, 3);
+  assert.equal(L.TUNING_CANDIDATES[0].params, L.LIVE_PARAMS);
+  assert.ok(L.TUNING_CANDIDATES.find(c => c.candidate === 'Oct 27 options lens (all three)'));
 });
 
 test('replay: locked Long, after-cutoff taps, missing options data', () => {
   assert.equal(L.replayDayCall({ ...base, locked: true }, L.LIVE_PARAMS).sizing, 'FULL');
   assert.equal(L.replayDayCall({ ...base, issuedAtMs: Date.parse('2026-10-27T17:00:00Z') }, L.LIVE_PARAMS).skipped, 'after cutoff');
   const old = L.replayDayCall({ ...base, impliedDailyMovePct: null, deltaLean: null }, L.LIVE_PARAMS);
-  assert.equal(old.barMinutes, 15); assert.equal(old.sizing, 'FULL'); // pre-options calls replay as before
+  assert.equal(old.barMinutes, 15); assert.equal(old.sizing, 'FULL');
 });
 
 test('guardrails: a proposal needs enough calls, a real gain, and both halves', () => {
@@ -129,4 +135,69 @@ test('audit: summary compares since the latest change vs before it', () => {
   assert.deepEqual(s.latest.after, { n: 2, pct: 100, stopPct: 0 });
   assert.deepEqual(s.latest.before, { n: 2, pct: 25, stopPct: 50 });
   assert.deepEqual(L.dialAuditSummary([], rows), { changes: [], latest: null });
+});
+
+test('tuner: like-for-like bar schedule scales the normal move (Oct 27 live data)', () => {
+  const c = L.TUNING_CANDIDATES.find(x => x.candidate === 'like-for-like 1.3 / 0.8');
+  assert.ok(c && Math.abs(c.params.schedule.normalScale - 1.2533) < 0.001);
+  // [implied, normal] from Oct 27 Pro calls: live vs like-for-like bar size
+  const cases = { IREN: [8.75, 3.738, 5, 5], ARCC: [1.482, 0.952, 5, 15], NU: [3.281, 3.457, 15, 30], MU: [3.489, 2.758, 15, 15] };
+  for (const [sym, [imp, norm, live, fixed]] of Object.entries(cases)) {
+    assert.equal(L.pickBarMinutes(L.OCT27_LENS_PARAMS.schedule, imp, norm), live, sym + ' Oct 27 lens');
+    assert.equal(L.pickBarMinutes(c.params.schedule, imp, norm), fixed, sym + ' like-for-like');
+  }
+  assert.equal(L.pickBarMinutes(c.params.schedule, null, 2), 15); // no options data: old 15-min read
+});
+
+
+// ── Oct 28 shadow DAY design: Gates 2 + 3 decide ────────────────────────
+const g23 = (o) => L.dayFromGates23({ long: { verdict: 'DOWN', sizing: 'NONE' }, g2Status: 'YELLOW', impliedDailyMovePct: 5, normalDailyMovePct: 2, deltaLean: 0, ...o }, o.seq);
+const up = { direction: 1 }, down = { direction: -1 }, mixed = { direction: 0 };
+
+test('g23: Gates 2 and 3 set the DAY direction, even against LONG (IMVT/IREN case)', () => {
+  assert.deepEqual([g23({ seq: up, g2Status: 'GREEN' }).verdict, g23({ seq: up, g2Status: 'GREEN' }).strength], ['UP', 'both']);
+  assert.equal(g23({ seq: up, g2Status: 'GREEN' }).sizing, 'HALF');
+  assert.deepEqual([g23({ seq: up }).verdict, g23({ seq: up }).strength], ['UP', 'bars only']);           // LONG DOWN, bars up -> UP
+  assert.deepEqual([g23({ seq: mixed, g2Status: 'RED' }).verdict, g23({ seq: mixed, g2Status: 'RED' }).strength], ['DOWN', 'catalyst only']);
+  assert.deepEqual([g23({ seq: down, g2Status: 'GREEN' }).verdict, g23({ seq: down, g2Status: 'GREEN' }).strength], ['FLAT', 'conflict']);
+  assert.equal(g23({ seq: mixed }).verdict, 'FLAT');                                                       // big day, both quiet -> FLAT
+});
+
+test('g23: other gates only weigh in on a quiet day (expected move < 1.3x normal, neutral lean)', () => {
+  const quiet = { impliedDailyMovePct: 2.2, normalDailyMovePct: 2, deltaLean: 0.05 };
+  assert.equal(L.isQuietDay(quiet), true);
+  assert.equal(L.isQuietDay({ ...quiet, deltaLean: -0.4 }), false);       // lean not neutral
+  assert.equal(L.isQuietDay({ ...quiet, impliedDailyMovePct: 3 }), false); // 1.5x
+  assert.equal(L.isQuietDay({ impliedDailyMovePct: null, normalDailyMovePct: 2 }), false);
+  assert.deepEqual([g23({ ...quiet, seq: mixed }).verdict, g23({ ...quiet, seq: mixed }).strength], ['DOWN', 'quiet-day tiebreak']);
+  assert.equal(g23({ ...quiet, seq: up, g2Status: 'GREEN' }).sizing, 'QUARTER');  // LONG disagrees on a quiet day: step down
+  assert.equal(g23({ seq: up, g2Status: 'GREEN' }).sizing, 'HALF');               // not quiet: LONG ignored
+});
+
+test('g23: earnings block keeps the direction but sizes to NONE', () => {
+  const r = g23({ seq: up, g2Status: 'GREEN', earningsBlock: true });
+  assert.deepEqual([r.verdict, r.sizing], ['UP', 'NONE']);
+});
+
+test('g23 runs through the replay as its own candidate', () => {
+  const c = L.TUNING_CANDIDATES.find(x => x.params.dayModel === 'g23');
+  const r = L.replayDayCall({ ...base, long: { verdict: 'DOWN', sizing: 'NONE' }, g2Status: 'YELLOW' }, c.params);
+  assert.equal(r.barMinutes, 15); assert.equal(r.verdict, 'UP'); // three up 15-min bars beat a DOWN LONG
+});
+
+test('5-min confidence layer and thrust candle (record only)', () => {
+  const t = (m) => new Date(Date.parse('2026-10-27T13:30:00Z') + m * 60000).toISOString();
+  const w15 = [{ t: t(0), o: 100, c: 101 }, { t: t(15), o: 101, c: 102 }, { t: t(30), o: 102, c: 101 }];
+  const b5 = [0, 5, 10, 15, 20, 25, 30, 35, 40].map((m, i) => ({ t: t(m), o: 100, c: [101, 101, 101, 101, 101, 99, 99, 99, 99][i], v: m === 20 ? 9000 : 100 }));
+  assert.equal(L.subBarConviction(w15, b5), 'most agree');   // 8 of 9 agree with their 15-min bar
+  assert.equal(L.subBarConviction(w15.slice(0, 1), b5), 'all 5-min agree');
+  assert.equal(L.thrustCandle(b5, Date.parse(t(0)), 1), 'thrust agrees');    // heaviest volume at 9:50, up
+  assert.equal(L.thrustCandle(b5, Date.parse(t(0)), -1), 'thrust disagrees');
+  assert.equal(L.thrustCandle(b5, Date.parse(t(0)), 0), 'thrust up, call FLAT');
+  const rows = L.shadowTagStats('shadow_g23', [
+    { verdict: 'UP', grade: 'TRUE', ret: 2, tags: { thrust_candle: 'thrust agrees' } },
+    { verdict: 'DOWN', grade: 'FALSE', ret: 1, tags: { thrust_candle: 'thrust agrees' } },
+    { verdict: 'FLAT', grade: 'TRUE', ret: 0, tags: { thrust_candle: 'thrust agrees' } },     // FLAT left out
+  ]);
+  assert.deepEqual(rows, [{ call_type: 'shadow_g23', signal: 'thrust_candle', value: 'thrust agrees', n: 2, pct: 50, avg_move_pct: 0.5 }]);
 });

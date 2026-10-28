@@ -32,6 +32,8 @@ function band(x, cuts, labels) {
 }
 const g = (row, path) => path.reduce((o, k) => (o == null ? null : o[k]), row);
 // [signal name, extractor] -- every value the report breaks calls down by.
+// Cutoff for the record-only 'g4_stretched' signal; a starting guess, not a rule.
+const G4_STRETCH_PCT = 10;
 const SIGNALS = [
     ['direction', (r, c) => (c === 'day' ? r.day_verdict : r.verdict)],
     ['size', (r, c) => (c === 'day' ? r.day_sizing : r.size_action)],
@@ -56,6 +58,16 @@ const SIGNALS = [
     ['regime', r => g(r, ['gates', 'inputs', 'g5', 'regime'])],
     ['override', r => (r.gates && r.gates.inputs ? (r.gates.inputs.override || 'none') : null)],
     ['range_position', r => band(g(r, ['gates', 'inputs', 'g4', 'range_position']), [30, 70], ['<30%', '30-70%', '>70%'])],
+    // Gate 4 record-only (Oct 28, 2026): distance from the 50-day average, and
+    // the exact case the proposed modifier would act on (stretched >=10% while
+    // Gate 4 is GREEN/YELLOW). Compare its hit rate with 'not stretched'.
+    ['vs_50d_avg', r => band(g(r, ['gates', 'inputs', 'g4', 'pct_above_50d']), [-10, 0, 10], ['<-10%', '-10-0%', '0-10%', '>=10%'])],
+    ['g4_stretched', r => {
+            const p = g(r, ['gates', 'inputs', 'g4', 'pct_above_50d']), ph = g(r, ['gates', 'g4']);
+            if (p == null || !isFinite(Number(p)) || !ph || ph === 'RED')
+                return null;
+            return Number(p) >= G4_STRETCH_PCT ? 'stretched' : 'not stretched';
+        }],
     ['options_lean', r => g(r, ['gates', 'inputs', 'options', 'deltaLeanLabel'])],
     ['options_move_vs_normal', r => band(g(r, ['gates', 'inputs', 'options', 'moveRatio']), [0.8, 1.3], ['quiet (<0.8x)', 'normal', 'big (>1.3x)'])],
     ['day_vs_long', (r, c) => (c === 'day' && r.day_verdict ? (r.day_verdict === r.verdict ? 'same' : 'different') : null)],

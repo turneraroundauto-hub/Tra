@@ -7358,6 +7358,9 @@ Return only single-line minified JSON.
             gate1: gate1Result, type: parsed.type, corroborationCount: contextCorroboration.matchCount,
             rule, metrics: metricsData, windowMode, g3Read: windowMode ? !!(windowBarsLog && windowBarsLog.length >= 3) : g3Read,
             windowBars: windowBarsLog, openingBar: openingBarData,
+            // Gate 4 record-only (Oct 28): 50-day average from the server's own
+            // cached closes -- no client relay, so no frontend change.
+            dailyCloses: (symbolMarketCache.get(T) && symbolMarketCache.get(T).data) ? symbolMarketCache.get(T).data.dailyCloses : null,
             tickerPct, proxyPct, regime, coherence: coherenceResult,
             redCount: [preGateResult.status, g1Status, g2Status, g4Status, gate5Result.status].filter(x => x === "RED").length,
             override: overrideFired,

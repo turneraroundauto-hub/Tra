@@ -265,6 +265,32 @@ function pickBestRegime(tried: Array<{ symbol: string; result: any }>): { symbol
   }
   return best;
 }
+// Confidence v2 -- SHADOW ONLY (Oct 28, 2026). Live confidence on a "clean"
+// call is still the model's own rubric ("LOW: any YELLOW in critical
+// gates"), which made every FLAT LOW (364 of 364) and did not predict misses
+// (DOWN-LOW right more often than DOWN-MEDIUM). Mr. T chose the
+// price-confirmed rule for every call, recorded beside the live label and
+// graded, before anything user-facing changes.
+// UP/DOWN: priceConfirmedConfidence + the same two ceilings live uses.
+// FLAT: HIGH when the stock and its proxy are both quiet (within the same
+// +/-1% band), LOW when both move the same way beyond it (a breakout may be
+// starting), MEDIUM otherwise (one moving, opposite moves, or missing data).
+function flatPriceConfidence(tickerPct: number | null, proxyPct: number | null): 'HIGH' | 'MEDIUM' | 'LOW' {
+  const has = (v: number | null): v is number => v != null && isFinite(v);
+  const quiet = (v: number | null) => has(v) && Math.abs(v) <= CONFIDENCE_NEGLIGIBLE_MOVE_PCT;
+  const moving = (v: number | null) => has(v) && Math.abs(v) > CONFIDENCE_NEGLIGIBLE_MOVE_PCT;
+  if (quiet(tickerPct) && quiet(proxyPct)) return 'HIGH';
+  if (moving(tickerPct) && moving(proxyPct) && Math.sign(tickerPct as number) === Math.sign(proxyPct as number)) return 'LOW';
+  return 'MEDIUM';
+}
+function confidenceV2(verdict: string, tickerPct: number | null, proxyPct: number | null, proxyFit: number | null | undefined, sameDirectionPct: number | null | undefined): 'HIGH' | 'MEDIUM' | 'LOW' | null {
+  if (verdict === 'FLAT') return flatPriceConfidence(tickerPct, proxyPct);
+  if (verdict !== 'UP' && verdict !== 'DOWN') return null;
+  let c = priceConfirmedConfidence(verdict, tickerPct, proxyPct);
+  c = applyProxyFitCeiling(c, proxyFit);
+  return applyHistoricalAccuracyCeiling(c, sameDirectionPct);
+}
+
 // Agitator topical pool (Oct 28, 2026): put articles that mention the
 // topic's own words first and, when at least one does, send only those to
 // the model -- its "always pick the closest" rule otherwise picked an
@@ -577,6 +603,8 @@ module.exports = {
   pctAboveSma: pctAboveSma,
   pickBestRegime: pickBestRegime,
   rankTopicalArticles: rankTopicalArticles,
+  flatPriceConfidence: flatPriceConfidence,
+  confidenceV2: confidenceV2,
   sameSessionFlatScale: sameSessionFlatScale,
   computeGate0: computeGate0,
   pulsePct: pulsePct,

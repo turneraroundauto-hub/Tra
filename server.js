@@ -7455,6 +7455,17 @@ Return only single-line minified JSON.
             override: overrideFired,
           });
       if (optionsProbe) logInputs.options = optionsProbe;
+      // Confidence v2, shadow only (ah.confidenceV2): logged beside the live
+      // label so the two can be graded side by side. The historical-accuracy
+      // ceiling only needs its query when v2 would otherwise be HIGH.
+      try {
+        let v2 = ah.confidenceV2(parsed.verdict, tickerPct, proxyPct, regime?.rolling, null);
+        if (v2 === "HIGH" && (parsed.verdict === "UP" || parsed.verdict === "DOWN")) {
+          const acc = await computeDirectionalAccuracy(ticker.toUpperCase(), parsed.verdict);
+          v2 = ah.confidenceV2(parsed.verdict, tickerPct, proxyPct, regime?.rolling, acc?.directionalPct);
+        }
+        logInputs.confidence_v2 = v2;
+      } catch (e) { logInputs.confidence_v2 = null; }
       const verdictLogId = await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
         issuedPrice: typeof metricsData?.price === "number" ? metricsData.price : null,

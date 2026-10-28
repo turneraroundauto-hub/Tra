@@ -409,3 +409,27 @@ test("Gate 4 record-only: distance from the 50-day average", () => {
   assert.strictEqual(log.g4.pct_above_50d, -10);
   assert.strictEqual(ah.gateInputsForLog({ metrics: { price: 90 } }).g4.pct_above_50d, null);
 });
+
+test("best-fit proxy: highest rolling correlation wins, UNKNOWN loses", () => {
+  const r = (state, rolling) => ({ state, rolling });
+  assert.strictEqual(ah.pickBestRegime([{ symbol: "USO", result: r("BROKEN", -0.14) }, { symbol: "GLD", result: r("INTACT", 0.71) }]).symbol, "GLD");
+  assert.strictEqual(ah.pickBestRegime([{ symbol: "BTC", result: r("UNKNOWN", null) }, { symbol: "QQQ", result: r("INTACT", 0.4) }]).symbol, "QQQ");
+  assert.strictEqual(ah.pickBestRegime([{ symbol: "X", result: r("UNKNOWN", null) }]).symbol, "X");
+  assert.strictEqual(ah.pickBestRegime([]), null);
+});
+
+test("Agitator topical pool: on-topic articles only when any exist", () => {
+  const pool = [
+    { headline: "Waste Management Reports Q3 2026 Financial Results", summary: "Revenue beat." },
+    { headline: "Silver climbs as industrial demand firms", summary: "" },
+    { headline: "Miners rally", summary: "Pan American Silver led gains." },
+    { headline: "Silverware maker files", summary: "" },
+  ];
+  const r = ah.rankTopicalArticles("Silver", pool);
+  assert.strictEqual(r.matched, 2);
+  assert.deepStrictEqual(r.articles.map(a => a.headline), ["Silver climbs as industrial demand firms", "Miners rally"]);
+  const none = ah.rankTopicalArticles("Jackson Hole", pool);
+  assert.strictEqual(none.matched, 0);
+  assert.strictEqual(none.articles.length, 4);
+  assert.strictEqual(ah.rankTopicalArticles("the market", pool).matched, 0);
+});

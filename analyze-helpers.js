@@ -205,6 +205,41 @@ function pctAboveSma(closes, price, n) {
     const sma = c.slice(-n).reduce((a, b) => a + b, 0) / n;
     return { sma: +sma.toFixed(4), pct: +((p / sma - 1) * 100).toFixed(2) };
 }
+// Best-fit proxy (Oct 28, 2026): of the regime checks run against each of a
+// rule's proxy symbols, keep the one with the highest rolling correlation.
+// UNKNOWN results (too little data) lose to any real reading.
+function pickBestRegime(tried) {
+    let best = null;
+    for (const t of tried || []) {
+        if (!t || !t.result)
+            continue;
+        if (!best) {
+            best = t;
+            continue;
+        }
+        const bu = best.result.state === "UNKNOWN", tu = t.result.state === "UNKNOWN";
+        if (tu)
+            continue;
+        if (bu || Number(t.result.rolling) > Number(best.result.rolling))
+            best = t;
+    }
+    return best;
+}
+// Agitator topical pool (Oct 28, 2026): put articles that mention the
+// topic's own words first and, when at least one does, send only those to
+// the model -- its "always pick the closest" rule otherwise picked an
+// unrelated story from a generic news batch. Whole-word, case-insensitive,
+// words of 3+ letters minus common filler. No match -> the pool unchanged.
+const TOPIC_STOPWORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "are", "was", "will", "has", "have", "its", "into", "over", "about", "after", "news", "stock", "stocks", "price", "prices", "market", "markets", "today", "new"]);
+function rankTopicalArticles(query, articles) {
+    const list = Array.isArray(articles) ? articles : [];
+    const words = String(query || "").toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 3 && !TOPIC_STOPWORDS.has(w));
+    if (!words.length)
+        return { articles: list, matched: 0 };
+    const res = words.map(w => new RegExp("\\b" + w + "\\b", "i"));
+    const hits = list.filter(a => { const t = `${a && a.headline || ""} ${a && a.summary || ""}`; return res.some(r => r.test(t)); });
+    return hits.length ? { articles: hits, matched: hits.length } : { articles: list, matched: 0 };
+}
 function gateInputsForLog(x) {
     const r = x || {};
     const g1 = r.gate1 || {}, rule = r.rule || {}, m = r.metrics || {}, ob = r.openingBar, coh = r.coherence;
@@ -547,6 +582,8 @@ module.exports = {
     gatesForLog: gatesForLog,
     gateInputsForLog: gateInputsForLog,
     pctAboveSma: pctAboveSma,
+    pickBestRegime: pickBestRegime,
+    rankTopicalArticles: rankTopicalArticles,
     sameSessionFlatScale: sameSessionFlatScale,
     computeGate0: computeGate0,
     pulsePct: pulsePct,

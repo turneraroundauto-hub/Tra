@@ -127,10 +127,17 @@ function computeSignalStats(rows: any[]): any[] {
 // close, using the last 3 completed bars at that moment; no DAY call after
 // the cutoff.
 const LIVE_PARAMS = { schedule: { fast: 1.3, slow: 0.8 }, barShare: 0.5, leanBand: 0.15 };
+// Live compares the options-implied daily move (a standard deviation) with
+// the normal move (an average absolute move, about 0.8 of a standard
+// deviation), so an ordinary day already reads ~1.25 and most stocks clear
+// the 1.3 cutoff (Oct 27, 2026 live check: 12 of 16 Pro calls got 5-min
+// bars). schedule.normalScale lets the tuner test the like-for-like version
+// before anyone changes live (Mr. T: option B, "educated decisions only").
+const SD_PER_MEAN_ABS_MOVE = Math.sqrt(Math.PI / 2); // ~1.2533 for a normal distribution
 function pickBarMinutes(schedule: any, implied: number | null, normal: number | null): number {
   if (schedule && schedule.fixed) return schedule.fixed;
   if (!(implied! > 0) || !(normal! > 0)) return 15;
-  const ratio = implied! / normal!;
+  const ratio = implied! / (normal! * (schedule.normalScale || 1));
   return ratio > schedule.fast ? 5 : ratio < schedule.slow ? 30 : 15;
 }
 function leanLabel(lean: number | null, bandWidth: number | null): string | null {
@@ -164,6 +171,7 @@ const TUNING_CANDIDATES: Array<{ param: string; candidate: string; params: any }
   { param: 'bar_schedule', candidate: 'always 30-min', params: { ...LIVE_PARAMS, schedule: { fixed: 30 } } },
   { param: 'bar_schedule', candidate: 'ratio 1.2 / 0.9', params: { ...LIVE_PARAMS, schedule: { fast: 1.2, slow: 0.9 } } },
   { param: 'bar_schedule', candidate: 'ratio 1.5 / 0.7', params: { ...LIVE_PARAMS, schedule: { fast: 1.5, slow: 0.7 } } },
+  { param: 'bar_schedule', candidate: 'like-for-like 1.3 / 0.8', params: { ...LIVE_PARAMS, schedule: { fast: 1.3, slow: 0.8, normalScale: SD_PER_MEAN_ABS_MOVE } } },
   { param: 'bar_share', candidate: 'any move counts', params: { ...LIVE_PARAMS, barShare: 0 } },
   { param: 'bar_share', candidate: '0.25 of a bar', params: { ...LIVE_PARAMS, barShare: 0.25 } },
   { param: 'bar_share', candidate: '0.75 of a bar', params: { ...LIVE_PARAMS, barShare: 0.75 } },
@@ -311,6 +319,7 @@ module.exports = {
   LIVE_PARAMS: LIVE_PARAMS,
   TUNING_CANDIDATES: TUNING_CANDIDATES,
   PROPOSAL_MIN_CALLS: PROPOSAL_MIN_CALLS,
+  SD_PER_MEAN_ABS_MOVE: SD_PER_MEAN_ABS_MOVE,
   pickBarMinutes: pickBarMinutes,
   leanLabel: leanLabel,
   replayDayCall: replayDayCall,

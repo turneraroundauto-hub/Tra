@@ -130,3 +130,15 @@ test('audit: summary compares since the latest change vs before it', () => {
   assert.deepEqual(s.latest.before, { n: 2, pct: 25, stopPct: 50 });
   assert.deepEqual(L.dialAuditSummary([], rows), { changes: [], latest: null });
 });
+
+test('tuner: like-for-like bar schedule scales the normal move (Oct 27 live data)', () => {
+  const c = L.TUNING_CANDIDATES.find(x => x.candidate === 'like-for-like 1.3 / 0.8');
+  assert.ok(c && Math.abs(c.params.schedule.normalScale - 1.2533) < 0.001);
+  // [implied, normal] from Oct 27 Pro calls: live vs like-for-like bar size
+  const cases = { IREN: [8.75, 3.738, 5, 5], ARCC: [1.482, 0.952, 5, 15], NU: [3.281, 3.457, 15, 30], MU: [3.489, 2.758, 15, 15] };
+  for (const [sym, [imp, norm, live, fixed]] of Object.entries(cases)) {
+    assert.equal(L.pickBarMinutes(L.LIVE_PARAMS.schedule, imp, norm), live, sym + ' live');
+    assert.equal(L.pickBarMinutes(c.params.schedule, imp, norm), fixed, sym + ' like-for-like');
+  }
+  assert.equal(L.pickBarMinutes(c.params.schedule, null, 2), 15); // no options data: old 15-min read
+});

@@ -218,3 +218,18 @@ test('Gate 4 record-only signals: 50-day distance and the stretched case', () =>
   assert.equal(find('vs_50d_avg', '>=10%').n, 2);
   assert.equal(find('vs_50d_avg', '0-10%').n, 1);
 });
+
+test('confidence v2 shadow signal: UP/DOWN and FLAT graded apart', () => {
+  const rows = [
+    row({ verdict: 'UP', grade_long: 'TRUE', confidence: 'LOW', gates: { inputs: { confidence_v2: 'HIGH' } } }),
+    row({ verdict: 'FLAT', grade_long: 'TRUE', confidence: 'LOW', gates: { inputs: { confidence_v2: 'HIGH' } } }),
+    row({ verdict: 'FLAT', grade_long: 'FALSE', confidence: 'LOW', gates: { inputs: { confidence_v2: 'LOW' } } }),
+  ];
+  const s = L.computeSignalStats(rows);
+  const find = (signal, value) => s.find(x => x.call_type === 'long' && x.signal === signal && x.value === value);
+  assert.equal(find('confidence_v2', 'HIGH').n, 1);
+  assert.equal(find('confidence_v2', 'FLAT HIGH').pct, 100);
+  assert.equal(find('confidence_v2', 'FLAT LOW').pct, 0);
+  assert.equal(find('confidence', 'FLAT LOW').n, 2);
+  assert.equal(find('confidence', 'LOW').n, 1);
+});

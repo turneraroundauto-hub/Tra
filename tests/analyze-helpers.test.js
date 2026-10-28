@@ -433,3 +433,17 @@ test("Agitator topical pool: on-topic articles only when any exist", () => {
   assert.strictEqual(none.articles.length, 4);
   assert.strictEqual(ah.rankTopicalArticles("the market", pool).matched, 0);
 });
+
+test("confidence v2 (shadow): price rule on every call, FLAT by quietness", () => {
+  assert.strictEqual(ah.confidenceV2("UP", 2, 1.5, 0.8, 60), "HIGH");
+  assert.strictEqual(ah.confidenceV2("UP", 2, 1.5, 0.3, 60), "MEDIUM");    // weak proxy fit caps HIGH
+  assert.strictEqual(ah.confidenceV2("UP", 2, 1.5, 0.8, 20), "MEDIUM");    // poor same-direction record caps HIGH
+  assert.strictEqual(ah.confidenceV2("DOWN", 2, -0.2, null, null), "LOW"); // stock moving against the call
+  assert.strictEqual(ah.confidenceV2("DOWN", 0.4, null, null, null), "MEDIUM");
+  assert.strictEqual(ah.confidenceV2("FLAT", 0.4, -0.6, null, null), "HIGH");
+  assert.strictEqual(ah.confidenceV2("FLAT", 1.8, 0.2, null, null), "MEDIUM");
+  assert.strictEqual(ah.confidenceV2("FLAT", 1.8, 1.3, null, null), "LOW");
+  assert.strictEqual(ah.confidenceV2("FLAT", 1.8, -1.3, null, null), "MEDIUM");
+  assert.strictEqual(ah.confidenceV2("FLAT", null, 0.1, null, null), "MEDIUM");
+  assert.strictEqual(ah.confidenceV2("HOLD", 1, 1, null, null), null);
+});

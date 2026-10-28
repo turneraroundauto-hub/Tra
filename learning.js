@@ -34,10 +34,13 @@ const g = (row, path) => path.reduce((o, k) => (o == null ? null : o[k]), row);
 // [signal name, extractor] -- every value the report breaks calls down by.
 // Cutoff for the record-only 'g4_stretched' signal; a starting guess, not a rule.
 const G4_STRETCH_PCT = 10;
+const FLAT_CONFIDENCE_SIGNALS = new Set(['confidence', 'confidence_v2']);
 const SIGNALS = [
     ['direction', (r, c) => (c === 'day' ? r.day_verdict : r.verdict)],
     ['size', (r, c) => (c === 'day' ? r.day_sizing : r.size_action)],
     ['confidence', r => r.confidence],
+    // Shadow (Oct 28, 2026): the price-confirmed rule, to compare with 'confidence'.
+    ['confidence_v2', r => g(r, ['gates', 'inputs', 'confidence_v2'])],
     ['dial', r => r.dial_position],
     ['tier', r => r.tier],
     ['weekday', r => { const e = etParts(r.issued_at); return e && e.day; }],
@@ -99,7 +102,11 @@ function computeSignalStats(rows) {
                 continue;
             const directional = v.verdict === 'UP' || v.verdict === 'DOWN';
             for (const [name, fn] of SIGNALS) {
-                if (!directional && name !== 'direction')
+                // FLAT calls count only on their own 'direction' row -- except the two
+                // confidence signals on the LONG call, reported as "FLAT <label>" so
+                // FLAT confidence can be graded apart from UP/DOWN (Oct 28, 2026).
+                const flatConf = !directional && call === 'long' && FLAT_CONFIDENCE_SIGNALS.has(name);
+                if (!directional && name !== 'direction' && !flatConf)
                     continue;
                 let val;
                 try {
@@ -110,6 +117,8 @@ function computeSignalStats(rows) {
                 }
                 if (val == null || val === '')
                     continue;
+                if (flatConf)
+                    val = 'FLAT ' + val;
                 const key = `${call}|${name}|${val}`;
                 let a = acc.get(key);
                 if (!a) {

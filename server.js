@@ -1850,12 +1850,17 @@ async function fetchTickerFundamentals(symbol) {
   }
 }
 
+// Finnhub previous close per symbol, kept for /prices (live auto-refresh)
+// so its % change matches the card's own % change.
+const prevCloseBySymbol = new Map();  // symbol -> { pc, time } (Finnhub prev close, set by fetchTickerMetrics)
+
 async function fetchTickerMetrics(symbol) {
   try {
     const q = await finnhubGet(`/quote?symbol=${symbol}`).catch(() => null);
     if (!q?.c) throw new Error("No quote");
     let price = q.c;
     let pct   = q.dp ?? null; // today's %change — Gate 5 Proxy Coherence Check (Patch 4) needs this
+    if (typeof q.pc === "number" && q.pc > 0) prevCloseBySymbol.set(symbol, { pc: q.pc, time: Date.now() });
 
     // Pre/post-market: Finnhub's `c`/`dp` above are frozen at the last
     // regular-session values (see isExtendedHoursWindow()'s comment) —
@@ -5132,6 +5137,55 @@ app.get("/status", async (req, res) => {
 // Company-name -> ticker lookup, powering Import's free-text entry
 // (shared/watchlist.ts's addTickers()). Free, no credit cost -- a plain
 // data lookup like /ticker/:symbol, not an AI call like /analyze.
+// ─── Live prices for auto-refresh (Oct 28, 2026) ──────────────────────
+// Mr. T: refresh data as often as new data exists while the market is open,
+// with no AI involved. Two speeds: the app polls GET /prices every 60s for
+// price / % change / pill color, and re-fetches the full card on its tier's
+// own cache window (Free 15 / Starter 5 / Pro 1 min, unchanged). Prices for
+// every requested symbol come from ONE Alpaca multi-symbol snapshot call
+// (IEX feed, real time) through alpacaGet()'s shared throttle, cached 30s
+// per symbol across all users -- so the cost doesn't grow with users or
+// watchlist size the way per-ticker Finnhub quotes would (60/min free cap).
+// Regular session only; outside it the endpoint answers without calling
+// Alpaca and the cards keep their last full-refresh values.
+const LIVE_PRICE_TTL_MS = 30 * 1000;
+const LIVE_PRICE_MAX_SYMBOLS = 60;
+const livePriceCache = new Map();     // symbol -> { data: {price, pct}, time }
+async function fetchLivePrices(symbols) {
+  const now = Date.now();
+  const out = {};
+  const stale = [];
+  for (const sym of symbols) {
+    const hit = livePriceCache.get(sym);
+    if (hit && now - hit.time < LIVE_PRICE_TTL_MS) out[sym] = hit.data; else stale.push(sym);
+  }
+  if (stale.length && alpacaKeys()) {
+    try {
+      const data = await alpacaGet(`/v2/stocks/snapshots?symbols=${stale.map(encodeURIComponent).join(",")}&feed=iex`);
+      const snaps = (data && data.snapshots) || data || {};
+      const pcFreshMs = 18 * 60 * 60 * 1000; // a prev close from today's session, not last week's
+      for (const sym of stale) {
+        const pcEntry = prevCloseBySymbol.get(sym);
+        const pc = pcEntry && now - pcEntry.time < pcFreshMs ? pcEntry.pc : null;
+        const lp = ah.livePriceFromSnapshot(snaps[sym], pc);
+        if (lp) { out[sym] = lp; livePriceCache.set(sym, { data: lp, time: now }); }
+      }
+    } catch (e) {
+      console.error("fetchLivePrices:", e.message);
+    }
+  }
+  return out;
+}
+
+app.get("/prices", async (req, res) => {
+  const symbols = [...new Set(String(req.query.symbols || "").split(",")
+    .map(s => s.trim().toUpperCase())
+    .filter(s => /^[A-Z]{1,5}(\.[A-Z])?$/.test(s)))].slice(0, LIVE_PRICE_MAX_SYMBOLS);
+  if (!isMarketOpen()) return res.json({ marketOpen: false, prices: {} });
+  if (!symbols.length) return res.json({ marketOpen: true, prices: {} });
+  res.json({ marketOpen: true, prices: await fetchLivePrices(symbols) });
+});
+
 app.get("/lookup", async (req, res) => {
   const q = String(req.query.q || "").trim();
   if (!q) return res.status(400).json({ error: "q is required" });

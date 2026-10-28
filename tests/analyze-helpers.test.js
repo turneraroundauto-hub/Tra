@@ -463,3 +463,12 @@ test("Pre-Gate cache: a failed check is retried in minutes, not kept 24h", () =>
   assert.strictEqual(ah.preGateCacheMs({ status: "GREEN", checkFailed: true }, day), ah.PRE_GATE_FAILED_RETRY_MS);
   assert.strictEqual(ah.preGateCacheMs(null, day), day);
 });
+
+test("live price from an Alpaca snapshot: trade price, % vs the card's prev close", () => {
+  const snap = { latestTrade: { p: 102 }, dailyBar: { c: 101 }, prevDailyBar: { c: 99 } };
+  assert.deepStrictEqual(ah.livePriceFromSnapshot(snap, 100), { price: 102, pct: 2 });
+  assert.deepStrictEqual(ah.livePriceFromSnapshot(snap, null), { price: 102, pct: 3.0303 });
+  assert.deepStrictEqual(ah.livePriceFromSnapshot({ dailyBar: { c: 50 } }, null), { price: 50, pct: null });
+  assert.strictEqual(ah.livePriceFromSnapshot({}, 100), null);
+  assert.strictEqual(ah.livePriceFromSnapshot(null, 100), null);
+});

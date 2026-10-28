@@ -225,6 +225,23 @@ function pickBestRegime(tried) {
     }
     return best;
 }
+// Live price from one Alpaca stock snapshot (Oct 28, 2026, auto-refresh).
+// Price = the latest IEX trade (fallback: the day's bar close). % change is
+// measured against the SAME previous close the cards use (Finnhub's pc,
+// passed in) so a refreshed % lines up with the card; Alpaca's own
+// prevDailyBar close (IEX-only) is the fallback when that isn't known.
+function livePriceFromSnapshot(snap, prevClose) {
+    if (!snap)
+        return null;
+    const t = snap.latestTrade || snap.LatestTrade;
+    const d = snap.dailyBar || snap.DailyBar;
+    const pd = snap.prevDailyBar || snap.PrevDailyBar;
+    const price = Number(t && t.p) > 0 ? Number(t.p) : Number(d && d.c) > 0 ? Number(d.c) : null;
+    if (price == null)
+        return null;
+    const base = typeof prevClose === "number" && prevClose > 0 ? prevClose : Number(pd && pd.c) > 0 ? Number(pd.c) : null;
+    return { price: +price.toFixed(4), pct: base ? +(((price - base) / base) * 100).toFixed(4) : null };
+}
 // Market-open push body (Oct 28, 2026; finally live -- Tra #117 sat unmerged
 // as a draft since Sep 22 while the mirror carried it). The Sector Pulse's
 // first sentence when there is one, else the Gate note. Capped at 140
@@ -637,6 +654,7 @@ module.exports = {
     flatPriceConfidence: flatPriceConfidence,
     confidenceV2: confidenceV2,
     pulsePushBody: pulsePushBody,
+    livePriceFromSnapshot: livePriceFromSnapshot,
     preGateCacheMs: preGateCacheMs,
     PRE_GATE_FAILED_RETRY_MS: PRE_GATE_FAILED_RETRY_MS,
     sameSessionFlatScale: sameSessionFlatScale,

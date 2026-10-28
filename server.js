@@ -3088,7 +3088,33 @@ function computeTopicalFactors(aiFactors, companies) {
   return factors;
 }
 
-async function computeTopicalFallback(query, knownSymbols) {
+// On-topic articles for the Agitator's topical pool (Oct 28, 2026). The
+// pool used to be Marketaux keyword hits + a generic "latest market news"
+// batch; when Marketaux came back empty, the prompt's "always pick the
+// closest" rule chose an unrelated story ("silver" -> a Waste Management
+// earnings article). Symbol news for tickers already known to be on topic
+// (a commodity's proxy ETF and miners) is reliably about the subject.
+const symbolNewsListCache = new Map();
+async function fetchSymbolNewsList(symbol, limit = 5) {
+  const hit = symbolNewsListCache.get(symbol);
+  if (hit && Date.now() - hit.time < 15 * 60 * 1000) return hit.data;
+  try {
+    const now = new Date();
+    const from = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000).toISOString().split("T")[0];
+    const data = await finnhubGet(`/company-news?symbol=${symbol}&from=${from}&to=${now.toISOString().split("T")[0]}`);
+    const list = (Array.isArray(data) ? data : [])
+      .filter(i => i && i.headline && i.url && i.datetime && (now - i.datetime * 1000) / 3600000 <= MAX_NEWS_AGE_HOURS)
+      .sort((a, b) => b.datetime - a.datetime).slice(0, limit)
+      .map(i => ({ headline: i.headline, summary: i.summary || "", url: i.url, source: i.source || "Finnhub", timestamp: i.datetime * 1000 }));
+    symbolNewsListCache.set(symbol, { data: list, time: Date.now() });
+    return list;
+  } catch (e) {
+    console.error(`fetchSymbolNewsList ${symbol}:`, e.message);
+    return [];
+  }
+}
+
+async function computeTopicalFallback(query, knownSymbols, opts = {}) {
   const key = String(query).trim().toLowerCase();
   if (!key) return null;
   const cached = topicalCache.get(key);
@@ -3104,16 +3130,23 @@ async function computeTopicalFallback(query, knownSymbols) {
     // generic pool -- its hits are genuinely about the typed query, so
     // they're listed first, but the generic pool stays as a real fallback
     // if Marketaux has no key set / is out of quota / returns nothing.
-    const [marketauxArticles, generalArticles] = await Promise.all([
+    const newsSymbols = Array.isArray(opts.newsSymbols) ? opts.newsSymbols : [];
+    const [marketauxArticles, generalArticles, ...symbolLists] = await Promise.all([
       fetchMarketauxNews(query),
       fetchGeneralNews(),
+      ...newsSymbols.map(sym => fetchSymbolNewsList(sym, 4)),
     ]);
     const seenUrls = new Set();
-    const articles = [...marketauxArticles, ...generalArticles].filter(a => {
+    const pool = [...marketauxArticles, ...[].concat(...symbolLists), ...generalArticles].filter(a => {
       if (!a.url || seenUrls.has(a.url)) return false;
       seenUrls.add(a.url);
       return true;
     });
+    // Articles that actually mention the topic's words go to the model on
+    // their own; the whole pool only when none do (ah.rankTopicalArticles).
+    const ranked = ah.rankTopicalArticles(query, pool);
+    const articles = ranked.articles.slice(0, 20);
+    console.log(`computeTopicalFallback "${query}": pool ${pool.length} (marketaux ${marketauxArticles.length}, symbol ${[].concat(...symbolLists).length}), ${ranked.matched} mention the topic`);
     if (!apiKey) {
       console.error(`computeTopicalFallback "${query}": ANTHROPIC_API_KEY not set`);
     } else if (!articles.length) {
@@ -4632,29 +4665,44 @@ async function saveRegimeState(symbol, proxySymbol, result) {
 // /ticker/:symbol refresh. The cached row's own proxy_symbol is checked
 // against the one requested -- a classification/proxy reassignment can't
 // silently reuse a correlation computed against a now-wrong instrument.
-async function resolveProxyRegime(symbol, tickerCloses, proxySymbol) {
-  if (!tickerCloses || !proxySymbol) return null;
+// Best-fit proxy (Oct 28, 2026): a rule can list several proxy symbols
+// ("USO + GLD" for Commodities). The check used to use only the FIRST one, so
+// gold/silver/miners were measured against oil and all read BROKEN (r < 0).
+// Now every listed symbol is tried and the best-correlated one is kept and
+// saved as proxy_symbol. Symbols with no US daily bars (KOSPI) are skipped.
+// Multi-symbol rows cached before this fix are recomputed once.
+const REGIME_BEST_FIT_SINCE_MS = Date.parse("2026-10-28T00:00:00Z");
+async function resolveProxyRegime(symbol, tickerCloses, proxySymbols) {
+  const list = (Array.isArray(proxySymbols) ? proxySymbols : [proxySymbols]).filter(Boolean);
+  if (!tickerCloses || !list.length) return null;
 
   const cached = await getCachedRegimeState(symbol);
-  if (cached && cached.proxy_symbol === proxySymbol) {
+  const cacheFresh = cached && list.includes(cached.proxy_symbol)
+    && (list.length === 1 || Date.parse(cached.computed_at) >= REGIME_BEST_FIT_SINCE_MS);
+  if (cacheFresh) {
     const checkedDate = new Date(cached.computed_at).toLocaleDateString("en-US",
       { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" });
     return {
       state: cached.state, action: cached.action,
       rolling: cached.rolling_r, baseline: cached.baseline_r,
-      note: `Cached weekly regime check (${checkedDate}): ${cached.state}.`,
+      note: `Cached weekly regime check (${checkedDate}): ${cached.state}${list.length > 1 ? ` vs ${cached.proxy_symbol}` : ""}.`,
+      proxySymbol: cached.proxy_symbol,
     };
   }
 
-  const proxyCloses = await fetchDailyCloses(proxySymbol, 130);
-  if (!proxyCloses) return null;
-
-  const result = gx.regimeValidation(tickerCloses, proxyCloses);
-  if (result.state !== "UNKNOWN") {
-    await saveRegimeState(symbol, proxySymbol, result);
-    syncCorrelationToGraph(symbol, proxySymbol, result.rolling, result.state, "regime_check");
+  const tried = [];
+  for (const sym of list) {
+    const proxyCloses = await fetchDailyCloses(sym, 130);
+    if (proxyCloses) tried.push({ symbol: sym, result: gx.regimeValidation(tickerCloses, proxyCloses) });
   }
-  return result;
+  const pick = ah.pickBestRegime(tried);
+  if (!pick) return null;
+  const best = pick.result, bestSymbol = pick.symbol;
+  if (best.state !== "UNKNOWN") {
+    await saveRegimeState(symbol, bestSymbol, best);
+    syncCorrelationToGraph(symbol, bestSymbol, best.rolling, best.state, "regime_check");
+  }
+  return { ...best, proxySymbol: bestSymbol };
 }
 
 // ─── PROPOSAL 3 PREWARM — proactive correlation-table sweep (Sep 13, 2026) ──
@@ -4726,11 +4774,11 @@ async function runRegimePrewarmSweep() {
       // own `tickers` list, so classifyTicker's direct-ticker-match branch
       // resolves it without ever needing the keyword fallback.
       const staticRule = gx.classifyTicker(symbol, null);
-      const proxySymbol = staticRule.proxy?.symbols?.[0];
-      if (proxySymbol) {
+      const proxySymbols = staticRule.proxy?.symbols || [];
+      if (proxySymbols.length) {
         const tickerCloses = await fetchDailyCloses(symbol);
         if (tickerCloses) {
-          const regime = await resolveProxyRegime(symbol, tickerCloses, proxySymbol);
+          const regime = await resolveProxyRegime(symbol, tickerCloses, proxySymbols);
           await resolveCandidateIfBroken(symbol, tickerCloses, regime);
         }
       }
@@ -4936,6 +4984,45 @@ async function resolveGate5(symbol, metrics, tickerCloses, forceRecompute, regim
 // Topical extraction stays guarded by classifyEntityMatch() either way, so
 // a weaker pick can't put a wrong company on the card.
 const CLAUDE_MODEL_ANALYZE = "claude-sonnet-4-6";
+
+// Prompt-cache warm gate for /analyze (Oct 28, 2026). Analyze All fires up to
+// 15 calls at once; with a cold cache every one of them paid the 1.25x cache
+// WRITE for the ~4.4k-token rules block (Render logs, Oct 21-27: whole
+// batches at cache_write=4377, cache_read=0), because none could read an
+// entry another hadn't finished writing. Now, when the cache is cold, one
+// tiny request (max_tokens 1, same model + same system block) writes it and
+// every concurrent call waits on that before sending, so they read it at
+// ~0.1x. A warm cache (any hit in the last ANALYZE_CACHE_WARM_MS) skips the
+// gate. Never blocks longer than ANALYZE_WARM_WAIT_MS; a failed warm-up just
+// lets calls proceed as before.
+const ANALYZE_CACHE_WARM_MS = 4 * 60 * 1000;   // cache lives 5 min, refreshed on every hit
+const ANALYZE_WARM_WAIT_MS = 8000;
+let analyzeCacheWarmAt = 0;
+let analyzeCacheWarming = null;
+function noteAnalyzeCacheUse(usage) {
+  if (usage && ((usage.cache_read_input_tokens || 0) > 0 || (usage.cache_creation_input_tokens || 0) > 0)) analyzeCacheWarmAt = Date.now();
+}
+async function ensureAnalyzeCacheWarm(apiKey) {
+  if (Date.now() - analyzeCacheWarmAt < ANALYZE_CACHE_WARM_MS) return;
+  if (!analyzeCacheWarming) {
+    analyzeCacheWarming = (async () => {
+      const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({
+          model: CLAUDE_MODEL_ANALYZE, max_tokens: 1, temperature: 0,
+          system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+          messages: [{ role: "user", content: "ok" }],
+        }),
+      }, ANALYZE_WARM_WAIT_MS);
+      if (!res.ok) { console.error(`analyze cache warm: Anthropic ${res.status}`); return; }
+      const data = await res.json();
+      logClaudeUsage("analyze-warm", data.usage);
+      noteAnalyzeCacheUse(data.usage);
+    })().catch(e => console.error("analyze cache warm:", e.message)).finally(() => { analyzeCacheWarming = null; });
+  }
+  await Promise.race([analyzeCacheWarming, new Promise(r => setTimeout(r, ANALYZE_WARM_WAIT_MS))]);
+}
 const CLAUDE_MODEL_LIGHT   = "claude-haiku-4-5";
 
 // One line per Claude call so spend can be checked against the Anthropic
@@ -5178,7 +5265,7 @@ app.get("/agitator", async (req, res) => {
     const [spot, proxyQuote, topical] = await Promise.all([
       fetchCommodityPrice(commodityCode),
       fetchQuote(commodityEntry.proxyTicker),
-      computeTopicalFallback(commodityEntry.name, new Set()),
+      computeTopicalFallback(commodityEntry.name, new Set(), { newsSymbols: [commodityEntry.proxyTicker, ...(COMMODITY_RELATED_FALLBACK[commodityCode] || []).slice(0, 2).map(c => c.symbol)].filter(Boolean) }),
     ]);
     // Related recommendations: the dynamic, currently-relevant companies
     // computeTopicalFallback() actually found in real gold/silver news
@@ -6267,7 +6354,7 @@ async function refreshMarketEntry(symbol, hardTrigger = false) {
   // the regime STATE ever matters for that category's own forceDown logic.
   const staticRule = classifyTicker(symbol, metrics?.sectorInfo);
   const regime = staticRule !== DEFAULT_PROXY
-    ? await resolveProxyRegime(symbol, dailyCloses, staticRule.proxy?.symbols?.[0])
+    ? await resolveProxyRegime(symbol, dailyCloses, staticRule.proxy?.symbols || [])
     : null;
 
   // Gate 5 — static classification, falling through to the Dynamic Proxy
@@ -6983,6 +7070,7 @@ Return only single-line minified JSON.
 `;
 
   try {
+    await ensureAnalyzeCacheWarm(apiKey);
     const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -7016,6 +7104,7 @@ Return only single-line minified JSON.
 
     const data  = await response.json();
     logClaudeUsage(`analyze ${ticker}`, data.usage);
+    noteAnalyzeCacheUse(data.usage);
     const text  = data.content?.[0]?.text || "";
     const clean = text.replace(/```json|```/g, "").trim();
 

@@ -127,7 +127,12 @@ function computeSignalStats(rows) {
 // Mirrors the live flow: read at the later of the tap and the 3rd bar's
 // close, using the last 3 completed bars at that moment; no DAY call after
 // the cutoff.
-const LIVE_PARAMS = { schedule: { fast: 1.3, slow: 0.8 }, barShare: 0.5, leanBand: 0.15 };
+// Live DAY read since Oct 28, 2026 (Mr. T: "everything back to 15 minute
+// candles"; Render GATE3_OPTIONS_LENS=off): three 15-min bars, any move
+// counts, no options lean. The Oct 27 options lens lives on as candidates.
+const LIVE_PARAMS = { schedule: { fixed: 15 }, barShare: 0, leanBand: null };
+// The Oct 27-28 live options lens, kept for comparison only.
+const OCT27_LENS_PARAMS = { schedule: { fast: 1.3, slow: 0.8 }, barShare: 0.5, leanBand: 0.15 };
 // Live compares the options-implied daily move (a standard deviation) with
 // the normal move (an average absolute move, about 0.8 of a standard
 // deviation), so an ordinary day already reads ~1.25 and most stocks clear
@@ -164,28 +169,148 @@ function replayDayCall(input, params) {
     const seq = g3w.classifySequence(done.slice(-g3w.BARS_NEEDED), {
         yardstickPct: yard, lean: leanLabel(input.deltaLean, params.leanBand), barMinutes, minShare: params.barShare,
     });
-    const day = g3w.refineDayVerdict(input.long, seq, { locked: !!input.locked, fridaySkeptic: !!input.fridaySkeptic });
+    const day = params.dayModel === 'g23'
+        ? dayFromGates23(input, seq)
+        : g3w.refineDayVerdict(input.long, seq, { locked: !!input.locked, fridaySkeptic: !!input.fridaySkeptic });
     if (!day)
         return { skipped: 'no read', barMinutes };
     const last = done[done.length - 1];
-    return { verdict: day.verdict, sizing: day.sizing, barMinutes, readMs: Date.parse(last.t) + barMinutes * 60000, entry: last.c };
+    return { verdict: day.verdict, sizing: day.sizing, strength: day.strength || null, quiet: day.quiet,
+        barMinutes, window: done.slice(-g3w.BARS_NEEDED), readMs: Date.parse(last.t) + barMinutes * 60000, entry: last.c };
+}
+// ── Oct 28, 2026 DAY design, SHADOW ONLY (Mr. T) ─────────────────────────
+// "I want day calls to be decided off of gate 2&3. The other gates are a
+// confidence story that should only influence [when] moves [are] under that
+// 1.3 and low IV/delta." Decisions: the DAY call may point the opposite way
+// to LONG; quiet day = options-expected move < 1.3x normal AND a neutral
+// options lean; the earnings block still blocks a day trade (direction kept,
+// size NONE). Replayed nightly next to live; nothing here touches a live call.
+// Sizes are starting values only (the tuner grades direction, not size).
+const G23_QUIET_RATIO = 1.3;
+const dirOf = (status) => (status === 'GREEN' ? 1 : status === 'RED' ? -1 : 0);
+function isQuietDay(input) {
+    const imp = input.impliedDailyMovePct, norm = input.normalDailyMovePct;
+    if (!(imp > 0) || !(norm > 0))
+        return false; // no options data: can't call it quiet
+    const lean = leanLabel(input.deltaLean, OCT27_LENS_PARAMS.leanBand);
+    return imp / norm < G23_QUIET_RATIO && (lean == null || lean === 'NEUTRAL');
+}
+function dayFromGates23(input, seq) {
+    if (!seq)
+        return null;
+    const d2 = dirOf(input.g2Status), d3 = seq.direction || 0;
+    const quiet = isQuietDay(input);
+    const longDir = input.long && input.long.verdict === 'UP' ? 1 : input.long && input.long.verdict === 'DOWN' ? -1 : 0;
+    let dir = 0, strength = 'none', sizing = 'NONE';
+    if (d2 && d3 && d2 !== d3)
+        strength = 'conflict';
+    else if (d2 && d3) {
+        dir = d2;
+        strength = 'both';
+        sizing = 'HALF';
+    }
+    else if (d2 || d3) {
+        dir = d2 || d3;
+        strength = d2 ? 'catalyst only' : 'bars only';
+        sizing = 'QUARTER';
+    }
+    else if (quiet && longDir) {
+        dir = longDir;
+        strength = 'quiet-day tiebreak';
+        sizing = 'QUARTER';
+    }
+    // The other gates only weigh in on a quiet day: LONG disagreeing sizes down.
+    if (dir && quiet && longDir === -dir)
+        sizing = sizing === 'HALF' ? 'QUARTER' : 'NONE';
+    if (dir && input.earningsBlock)
+        sizing = 'NONE';
+    return { verdict: dir === 1 ? 'UP' : dir === -1 ? 'DOWN' : 'FLAT', sizing: dir ? sizing : 'NONE', strength, quiet };
+}
+// ── 5-min confidence layer + opening thrust candle, RECORD ONLY ─────────
+// Mr. T: "5 min bars between each 15 min give a more confident lean." The
+// 15-min bars decide; this counts how many of the 5-min bars inside them
+// agree with their 15-min bar's direction. Caveat: our 5-min bars are IEX
+// only (a thin slice of volume), so on small stocks this can be noise.
+function subBarConviction(window15, bars5) {
+    if (!window15 || !window15.length || !bars5 || !bars5.length)
+        return null;
+    let agree = 0, total = 0;
+    for (const b of window15) {
+        const d = b.c > b.o ? 1 : b.c < b.o ? -1 : 0;
+        if (!d)
+            continue;
+        const start = Date.parse(b.t), end = start + 15 * 60000;
+        for (const s of bars5) {
+            const t = Date.parse(s.t);
+            if (t < start || t >= end)
+                continue;
+            total++;
+            if ((s.c - s.o) * d > 0)
+                agree++;
+        }
+    }
+    if (!total)
+        return null;
+    return agree === total ? 'all 5-min agree' : agree / total >= 2 / 3 ? 'most agree' : 'mixed';
+}
+// The heaviest-volume 5-min candle in the first 30 minutes (SDGR Oct 27:
+// the 9:50 candle, +1.75% on the open's biggest volume). Its direction vs
+// the call it's being compared with.
+function thrustCandle(bars5, openMs, callDir) {
+    const early = (bars5 || []).filter(b => { const t = Date.parse(b.t); return t >= openMs && t < openMs + 30 * 60000 && b.o > 0; });
+    if (!early.length)
+        return null;
+    const top = early.reduce((a, b) => ((b.v || 0) > (a.v || 0) ? b : a));
+    if (!(top.v > 0))
+        return null;
+    const d = top.c > top.o ? 1 : top.c < top.o ? -1 : 0;
+    if (!d)
+        return 'flat thrust';
+    if (!callDir)
+        return d > 0 ? 'thrust up, call FLAT' : 'thrust down, call FLAT';
+    return d === callDir ? 'thrust agrees' : 'thrust disagrees';
+}
+// Tag-level hit rates for a shadow run, in signal_stats shape.
+function shadowTagStats(callType, items) {
+    const acc = new Map();
+    for (const it of items || []) {
+        if (!(it.verdict === 'UP' || it.verdict === 'DOWN') || CREDIT[it.grade] == null)
+            continue;
+        for (const [signal, value] of Object.entries(it.tags || {})) {
+            if (value == null || value === '')
+                continue;
+            const key = signal + '|' + value;
+            let a = acc.get(key);
+            if (!a) {
+                a = { signal, value: String(value), n: 0, credit: 0, moveSum: 0, moveN: 0 };
+                acc.set(key, a);
+            }
+            a.n++;
+            a.credit += CREDIT[it.grade];
+            if (it.ret != null && isFinite(it.ret)) {
+                a.moveSum += it.verdict === 'DOWN' ? -it.ret : it.ret;
+                a.moveN++;
+            }
+        }
+    }
+    return [...acc.values()].map(a => ({ call_type: callType, signal: a.signal, value: a.value, n: a.n,
+        pct: +(a.credit / a.n * 100).toFixed(1), avg_move_pct: a.moveN ? +(a.moveSum / a.moveN).toFixed(3) : null }));
 }
 // Candidate settings, each changing ONE thing from live.
 const TUNING_CANDIDATES = [
     { param: 'live', candidate: 'live', params: LIVE_PARAMS },
+    { param: 'day_model', candidate: 'Gate 2+3 decide (Oct 28 design)', params: { ...LIVE_PARAMS, dayModel: 'g23' } },
     { param: 'bar_schedule', candidate: 'always 5-min', params: { ...LIVE_PARAMS, schedule: { fixed: 5 } } },
-    { param: 'bar_schedule', candidate: 'always 15-min', params: { ...LIVE_PARAMS, schedule: { fixed: 15 } } },
     { param: 'bar_schedule', candidate: 'always 30-min', params: { ...LIVE_PARAMS, schedule: { fixed: 30 } } },
-    { param: 'bar_schedule', candidate: 'ratio 1.2 / 0.9', params: { ...LIVE_PARAMS, schedule: { fast: 1.2, slow: 0.9 } } },
-    { param: 'bar_schedule', candidate: 'ratio 1.5 / 0.7', params: { ...LIVE_PARAMS, schedule: { fast: 1.5, slow: 0.7 } } },
+    { param: 'bar_schedule', candidate: 'IV schedule 1.3 / 0.8', params: { ...LIVE_PARAMS, schedule: OCT27_LENS_PARAMS.schedule } },
     { param: 'bar_schedule', candidate: 'like-for-like 1.3 / 0.8', params: { ...LIVE_PARAMS, schedule: { fast: 1.3, slow: 0.8, normalScale: SD_PER_MEAN_ABS_MOVE } } },
-    { param: 'bar_share', candidate: 'any move counts', params: { ...LIVE_PARAMS, barShare: 0 } },
     { param: 'bar_share', candidate: '0.25 of a bar', params: { ...LIVE_PARAMS, barShare: 0.25 } },
-    { param: 'bar_share', candidate: '0.75 of a bar', params: { ...LIVE_PARAMS, barShare: 0.75 } },
+    { param: 'bar_share', candidate: '0.5 of a bar', params: { ...LIVE_PARAMS, barShare: 0.5 } },
     { param: 'bar_share', candidate: '1.0 of a bar', params: { ...LIVE_PARAMS, barShare: 1.0 } },
-    { param: 'lean_band', candidate: 'lean off', params: { ...LIVE_PARAMS, leanBand: null } },
     { param: 'lean_band', candidate: '±0.10', params: { ...LIVE_PARAMS, leanBand: 0.10 } },
+    { param: 'lean_band', candidate: '±0.15', params: { ...LIVE_PARAMS, leanBand: 0.15 } },
     { param: 'lean_band', candidate: '±0.25', params: { ...LIVE_PARAMS, leanBand: 0.25 } },
+    { param: 'bundle', candidate: 'Oct 27 options lens (all three)', params: OCT27_LENS_PARAMS },
 ];
 // Guardrails a candidate must clear before it is even PROPOSED to Mr. T
 // (nothing is applied automatically): enough graded UP/DOWN calls, a gain
@@ -361,6 +486,13 @@ module.exports = {
     computeSignalStats: computeSignalStats,
     etParts: etParts,
     LIVE_PARAMS: LIVE_PARAMS,
+    OCT27_LENS_PARAMS: OCT27_LENS_PARAMS,
+    G23_QUIET_RATIO: G23_QUIET_RATIO,
+    isQuietDay: isQuietDay,
+    dayFromGates23: dayFromGates23,
+    subBarConviction: subBarConviction,
+    thrustCandle: thrustCandle,
+    shadowTagStats: shadowTagStats,
     TUNING_CANDIDATES: TUNING_CANDIDATES,
     PROPOSAL_MIN_CALLS: PROPOSAL_MIN_CALLS,
     SD_PER_MEAN_ABS_MOVE: SD_PER_MEAN_ABS_MOVE,

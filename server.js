@@ -4430,6 +4430,9 @@ async function runShadowTuner(rows) {
         issuedAtMs: Date.parse(r.issued_at), openMs, cutoffMs: openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000,
         barsBySize, impliedDailyMovePct: opt.impliedDailyMovePct ?? null, normalDailyMovePct: opt.normalDailyMovePct ?? null,
         deltaLean: typeof opt.deltaLean === "number" ? opt.deltaLean : null,
+        // For the shadow Gate 2+3 DAY design (Oct 28): Gate 2's catalyst color, and the earnings block.
+        g2Status: r.gates.g2 || null,
+        earningsBlock: (r.gates.inputs && r.gates.inputs.override) === "earnings_block",
       },
     });
   }
@@ -4445,7 +4448,10 @@ async function runShadowTuner(rows) {
   const runAt = new Date().toISOString();
   const liveReps = inputs.map(x => learn.replayDayCall(x.input, learn.LIVE_PARAMS));
   const liveAgg = learn.aggregateResults(inputs.map((x, i) => ({ verdict: liveReps[i].verdict, grade: gradeOne(x, liveReps[i]), date: x.date })));
-  const logged = inputs.filter((x, i) => x.row.day_verdict && liveReps[i].verdict);
+  // Faithfulness: only calls made under the same read as today's live
+  // (plain 15-min, no options lens -- g3_lens null). Oct 27's lens-on calls
+  // are compared under the "Oct 27 options lens" candidate instead.
+  const logged = inputs.filter((x, i) => x.row.day_verdict && liveReps[i].verdict && !x.row.gates.g3_lens);
   const matches = logged.filter((x, i) => liveReps[inputs.indexOf(x)].verdict === x.row.day_verdict).length;
   const out = [];
   for (const c of learn.TUNING_CANDIDATES) {
@@ -4461,6 +4467,37 @@ async function runShadowTuner(rows) {
   }
   const { error } = await supabase.from("tuning_runs").insert(out);
   if (error) throw new Error("tuning_runs insert: " + error.message);
+  // Record-only tag breakdowns for live and the shadow Gate 2+3 design:
+  // the 5-min confidence layer, the opening thrust candle, quiet vs big day
+  // and (shadow) which gates drove the call. Lands in signal_stats under
+  // call_type shadow_live / shadow_g23.
+  try {
+    const g23 = learn.TUNING_CANDIDATES.find(c => c.params.dayModel === "g23");
+    const sets = [["shadow_live", liveReps], ["shadow_g23", g23 ? inputs.map(x => learn.replayDayCall(x.input, g23.params)) : []]];
+    const rowsOut = [];
+    for (const [callType, reps] of sets) {
+      const items = inputs.map((x, i) => {
+        const rep = reps[i];
+        if (!rep || rep.skipped) return null;
+        const callDir = rep.verdict === "UP" ? 1 : rep.verdict === "DOWN" ? -1 : 0;
+        return {
+          verdict: rep.verdict, grade: gradeOne(x, rep),
+          ret: x.close != null && rep.entry > 0 ? (x.close - rep.entry) / rep.entry * 100 : null,
+          tags: {
+            sub5_conviction: learn.subBarConviction(rep.window, x.input.barsBySize[5]),
+            thrust_candle: learn.thrustCandle(x.input.barsBySize[5], x.input.openMs, callDir),
+            expected_move: learn.isQuietDay(x.input) ? "quiet day" : (x.input.impliedDailyMovePct > 0 ? "not quiet" : "no options data"),
+            g23_strength: rep.strength,
+          },
+        };
+      }).filter(Boolean);
+      rowsOut.push(...learn.shadowTagStats(callType, items).map(r => ({ ...r, window_days: LEARNING_LOOKBACK_DAYS, computed_at: runAt })));
+    }
+    if (rowsOut.length) {
+      const { error: tagErr } = await supabase.from("signal_stats").insert(rowsOut);
+      if (tagErr) throw new Error(tagErr.message);
+    }
+  } catch (e) { console.error("[LEARNING] shadow tag stats:", e.message); }
   return { calls: inputs.length, proposals: out.filter(x => x.meets_guardrails).length };
 }
 async function maybeRunLearningJobs(force = false) {

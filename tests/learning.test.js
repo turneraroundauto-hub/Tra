@@ -201,3 +201,20 @@ test('5-min confidence layer and thrust candle (record only)', () => {
   ]);
   assert.deepEqual(rows, [{ call_type: 'shadow_g23', signal: 'thrust_candle', value: 'thrust agrees', n: 2, pct: 50, avg_move_pct: 0.5 }]);
 });
+
+test('Gate 4 record-only signals: 50-day distance and the stretched case', () => {
+  const gates = (ph, p) => ({ g4: ph, inputs: { g4: { pct_above_50d: p } } });
+  const rows = [
+    row({ verdict: 'UP', grade_long: 'FALSE', gates: gates('YELLOW', 12) }),
+    row({ verdict: 'UP', grade_long: 'TRUE', gates: gates('GREEN', 3) }),
+    row({ verdict: 'UP', grade_long: 'TRUE', gates: gates('RED', 25) }),    // RED: modifier would not act
+    row({ verdict: 'UP', grade_long: 'TRUE', gates: gates('YELLOW', null) }),
+  ];
+  const s = L.computeSignalStats(rows);
+  const find = (signal, value) => s.find(x => x.call_type === 'long' && x.signal === signal && x.value === value);
+  assert.equal(find('g4_stretched', 'stretched').n, 1);
+  assert.equal(find('g4_stretched', 'stretched').pct, 0);
+  assert.equal(find('g4_stretched', 'not stretched').n, 1);
+  assert.equal(find('vs_50d_avg', '>=10%').n, 2);
+  assert.equal(find('vs_50d_avg', '0-10%').n, 1);
+});

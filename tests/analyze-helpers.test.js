@@ -398,3 +398,14 @@ test("options probe math (DAY call, logging only)", async (t) => {
     assert.strictEqual(ah.deltaLeanLabel(0.1), "NEUTRAL");
   });
 });
+
+test("Gate 4 record-only: distance from the 50-day average", () => {
+  const closes = Array.from({ length: 60 }, (_, i) => (i < 10 ? 999 : 100));
+  assert.deepStrictEqual(ah.pctAboveSma(closes, 110, 50), { sma: 100, pct: 10 });
+  assert.strictEqual(ah.pctAboveSma(closes.slice(0, 40), 110, 50), null);
+  assert.strictEqual(ah.pctAboveSma(closes, null, 50), null);
+  const log = ah.gateInputsForLog({ metrics: { price: 90, rangePosition: 40 }, dailyCloses: closes });
+  assert.strictEqual(log.g4.sma50, 100);
+  assert.strictEqual(log.g4.pct_above_50d, -10);
+  assert.strictEqual(ah.gateInputsForLog({ metrics: { price: 90 } }).g4.pct_above_50d, null);
+});

@@ -189,6 +189,22 @@ function barsForLog(bars) {
         return null;
     return bars.map((b) => ({ t: b.t || null, o: num(b.o), h: num(b.h), l: num(b.l), c: num(b.c), v: typeof b.v === "number" ? b.v : null }));
 }
+// Gate 4 record-only input (Oct 28, 2026): how far the price sits from its
+// 50-day average, in %. Logged so the learning loop can test the proposed
+// "stretched above the 50-day bumps one phase" modifier; nothing reads it
+// for a verdict. A Sep-Oct backtest (217 graded calls) found only 10
+// stretched (>=10%) GREEN/YELLOW cases and no hit-rate gap, so there is no
+// cutoff to build on yet. Null without 50 closes or a price.
+function pctAboveSma(closes, price, n) {
+    if (!Array.isArray(closes))
+        return null;
+    const c = closes.map(Number).filter(v => isFinite(v) && v > 0);
+    const p = Number(price);
+    if (c.length < n || !isFinite(p) || p <= 0)
+        return null;
+    const sma = c.slice(-n).reduce((a, b) => a + b, 0) / n;
+    return { sma: +sma.toFixed(4), pct: +((p / sma - 1) * 100).toFixed(2) };
+}
 function gateInputsForLog(x) {
     const r = x || {};
     const g1 = r.gate1 || {}, rule = r.rule || {}, m = r.metrics || {}, ob = r.openingBar, coh = r.coherence;
@@ -211,7 +227,11 @@ function gateInputsForLog(x) {
                 ? barsForLog(r.windowBars)
                 : (ob ? [{ t: null, o: num(ob.open), h: num(ob.high), l: num(ob.low), c: num(ob.close), v: typeof ob.volume === "number" ? ob.volume : null }] : null),
         },
-        g4: { range_position: num(m.rangePosition), price: num(m.price), week52hi: num(m.week52hi), week52lo: num(m.week52lo) },
+        g4: (() => {
+            const ext = pctAboveSma(r.dailyCloses, m.price, 50);
+            return { range_position: num(m.rangePosition), price: num(m.price), week52hi: num(m.week52hi), week52lo: num(m.week52lo),
+                sma50: ext ? ext.sma : null, pct_above_50d: ext ? ext.pct : null };
+        })(),
         g5: {
             ticker_pct: num(r.tickerPct), proxy_pct: num(r.proxyPct),
             regime: (r.regime && r.regime.state) || null,
@@ -526,6 +546,7 @@ module.exports = {
     evaluateProxyStatus: evaluateProxyStatus,
     gatesForLog: gatesForLog,
     gateInputsForLog: gateInputsForLog,
+    pctAboveSma: pctAboveSma,
     sameSessionFlatScale: sameSessionFlatScale,
     computeGate0: computeGate0,
     pulsePct: pulsePct,

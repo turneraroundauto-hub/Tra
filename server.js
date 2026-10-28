@@ -3698,7 +3698,11 @@ async function getCachedProxyResolution(symbol) {
       .select("*")
       .eq("ticker", symbol)
       .maybeSingle();
-    if (error || !data) return null;
+    // Logged, not swallowed (Oct 28, 2026): service_role lost its grant on
+    // this table around Aug 18, every read came back "permission denied",
+    // and it looked exactly like a cache miss for two months.
+    if (error) { console.error(`getCachedProxyResolution ${symbol}: ${error.message}`); return null; }
+    if (!data) return null;
     const ageMs = Date.now() - new Date(data.computed_at).getTime();
     const maxAge = proxyCandidatePromoted(data.candidate_confirms) ? GATE5_RECOMPUTE_MAX_AGE_MS : GATE5_CANDIDATE_RECHECK_MAX_AGE_MS;
     if (ageMs > maxAge) return null;
@@ -3715,9 +3719,10 @@ async function saveProxyResolution(symbol, resolved, trigger) {
   if (!supabase) return null;
   const clearsPrimaryFloor = resolved.tier === "primary";
   try {
-    const { data: prior } = await supabase
+    const { data: prior, error: priorErr } = await supabase
       .from("proxy_resolution").select("proxy_symbol, candidate_confirms, candidate_since")
       .eq("ticker", symbol).maybeSingle();
+    if (priorErr) { console.error(`saveProxyResolution ${symbol} read: ${priorErr.message}`); return null; }
     let candidateConfirms = 0;
     let candidateSince = null;
     if (clearsPrimaryFloor) {
@@ -3725,7 +3730,7 @@ async function saveProxyResolution(symbol, resolved, trigger) {
       candidateConfirms = sameCandidateAsBefore ? (prior.candidate_confirms || 0) + 1 : 1;
       candidateSince = sameCandidateAsBefore && prior.candidate_since ? prior.candidate_since : new Date().toISOString();
     }
-    await supabase.from("proxy_resolution").upsert({
+    const { error: upsertErr } = await supabase.from("proxy_resolution").upsert({
       ticker:             symbol,
       tier:               resolved.tier,
       proxy_symbol:       resolved.proxy || null,
@@ -3735,6 +3740,7 @@ async function saveProxyResolution(symbol, resolved, trigger) {
       candidate_confirms: candidateConfirms,
       candidate_since:    candidateSince,
     }, { onConflict: "ticker" });
+    if (upsertErr) { console.error(`saveProxyResolution ${symbol} write: ${upsertErr.message}`); return null; }
     return { candidateConfirms, candidateSince };
   } catch (e) {
     console.error(`saveProxyResolution ${symbol}:`, e.message);
@@ -4788,7 +4794,22 @@ async function runRegimePrewarmSweep() {
     await new Promise(r => setTimeout(r, REGIME_PREWARM_DELAY_MS));
   }
 }
-setInterval(() => { runRegimePrewarmSweep().catch(e => console.error("runRegimePrewarmSweep:", e.message)); }, REGIME_PREWARM_INTERVAL_MS);
+// The sweep used to run only on the 24h interval, which a restart resets --
+// and Tra redeploys several times a day, so it almost never ran (Oct 28,
+// 2026). Now it also runs ~2 min after boot, and at most once per ET day:
+// the daily tick and the boot run share runRegimePrewarmOncePerDay().
+const REGIME_PREWARM_BOOT_DELAY_MS = 2 * 60 * 1000;
+let regimePrewarmLastDateET = null;
+function runRegimePrewarmOncePerDay() {
+  const today = etDateStr(new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" })));
+  if (regimePrewarmLastDateET === today) return;
+  regimePrewarmLastDateET = today;
+  runRegimePrewarmSweep()
+    .then(() => console.log(`runRegimePrewarmSweep: done (${today})`))
+    .catch(e => console.error("runRegimePrewarmSweep:", e.message));
+}
+setTimeout(runRegimePrewarmOncePerDay, REGIME_PREWARM_BOOT_DELAY_MS);
+setInterval(runRegimePrewarmOncePerDay, 60 * 60 * 1000);
 
 // Maps a resolveFixedProxyBreak()-shaped result (fresh or reconstructed from
 // a cached row) into a proxyRule-compatible object: ah.evaluateProxyStatus() can

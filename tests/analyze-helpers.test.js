@@ -447,3 +447,19 @@ test("confidence v2 (shadow): price rule on every call, FLAT by quietness", () =
   assert.strictEqual(ah.confidenceV2("FLAT", null, 0.1, null, null), "MEDIUM");
   assert.strictEqual(ah.confidenceV2("HOLD", 1, 1, null, null), null);
 });
+
+test("market-open push body: Pulse first sentence, else Gate note", () => {
+  assert.strictEqual(ah.pulsePushBody({ pulse: "Risk-on, led by chips. Energy lagged.", gateNote: "x" }), "Risk-on, led by chips.");
+  assert.strictEqual(ah.pulsePushBody({ pulse: "", gateNote: "SPY +0.4% QQQ +0.9%" }), "SPY +0.4% QQQ +0.9%");
+  assert.strictEqual(ah.pulsePushBody({}), "Check today's read.");
+  const long = ah.pulsePushBody({ pulse: "A".repeat(200) });
+  assert.strictEqual(long.length, 140);
+  assert.ok(long.endsWith("…"));
+});
+
+test("Pre-Gate cache: a failed check is retried in minutes, not kept 24h", () => {
+  const day = 24 * 60 * 60 * 1000;
+  assert.strictEqual(ah.preGateCacheMs({ status: "GREEN" }, day), day);
+  assert.strictEqual(ah.preGateCacheMs({ status: "GREEN", checkFailed: true }, day), ah.PRE_GATE_FAILED_RETRY_MS);
+  assert.strictEqual(ah.preGateCacheMs(null, day), day);
+});

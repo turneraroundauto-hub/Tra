@@ -225,6 +225,27 @@ function pickBestRegime(tried) {
     }
     return best;
 }
+// Market-open push body (Oct 28, 2026; finally live -- Tra #117 sat unmerged
+// as a draft since Sep 22 while the mirror carried it). The Sector Pulse's
+// first sentence when there is one, else the Gate note. Capped at 140
+// characters so Android doesn't cut the notification mid-word.
+function pulsePushBody(cache) {
+    const pulse = cache && cache.pulse ? String(cache.pulse).trim() : "";
+    if (pulse) {
+        const splitAt = pulse.indexOf(". ");
+        const first = splitAt > 0 ? pulse.slice(0, splitAt + 1) : pulse;
+        return first.length > 140 ? first.slice(0, 139).trimEnd() + "\u2026" : first;
+    }
+    return cache && cache.gateNote ? String(cache.gateNote).slice(0, 110) : "Check today's read.";
+}
+// Pre-Gate cache lifetime (Oct 28, 2026). A real result is kept 24h; a
+// FAILED check (SEC down, timeout) used to be cached as GREEN for the same
+// 24h, leaving those tickers unscreened all day after a brief SEC outage.
+// A failure is now kept only PRE_GATE_FAILED_RETRY_MS, then re-checked.
+const PRE_GATE_FAILED_RETRY_MS = 10 * 60 * 1000;
+function preGateCacheMs(result, normalMs) {
+    return result && result.checkFailed ? PRE_GATE_FAILED_RETRY_MS : normalMs;
+}
 // Confidence v2 -- SHADOW ONLY (Oct 28, 2026). Live confidence on a "clean"
 // call is still the model's own rubric ("LOW: any YELLOW in critical
 // gates"), which made every FLAT LOW (364 of 364) and did not predict misses
@@ -615,6 +636,9 @@ module.exports = {
     rankTopicalArticles: rankTopicalArticles,
     flatPriceConfidence: flatPriceConfidence,
     confidenceV2: confidenceV2,
+    pulsePushBody: pulsePushBody,
+    preGateCacheMs: preGateCacheMs,
+    PRE_GATE_FAILED_RETRY_MS: PRE_GATE_FAILED_RETRY_MS,
     sameSessionFlatScale: sameSessionFlatScale,
     computeGate0: computeGate0,
     pulsePct: pulsePct,

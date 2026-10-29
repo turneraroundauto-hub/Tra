@@ -472,3 +472,37 @@ test("live price from an Alpaca snapshot: trade price, % vs the card's prev clos
   assert.strictEqual(ah.livePriceFromSnapshot({}, 100), null);
   assert.strictEqual(ah.livePriceFromSnapshot(null, 100), null);
 });
+
+// ─── Oct 29, 2026: DAY supersede + refresh-chain grace ───
+test("daySupersedeSplit: latest DAY call stands, LONG-only rows ignored", () => {
+  const rows = [
+    { id: 1, issued_at: "2026-10-29T13:50:00Z", day_verdict: "FLAT" },
+    { id: 2, issued_at: "2026-10-29T14:20:00Z", day_verdict: "DOWN" },
+    { id: 3, issued_at: "2026-10-29T18:31:00Z", day_verdict: null },
+  ];
+  const r = ah.daySupersedeSplit(rows);
+  assert.strictEqual(r.keep, 2);
+  assert.deepStrictEqual(r.supersede, [1]);
+  assert.deepStrictEqual(ah.daySupersedeSplit([{ id: 9, issued_at: "x", day_verdict: null }]), { keep: null, supersede: [] });
+});
+test("dropSupersededLong: blanks LONG grades only on superseded rows", () => {
+  const out = ah.dropSupersededLong([
+    { id: 1, superseded: true, grade_long: "TRUE", return_long_pct: 2, grade_day: "TRUE", return_day_pct: 1, grade_day_call: "FALSE" },
+    { id: 2, superseded: false, grade_long: "TRUE" },
+  ]);
+  assert.strictEqual(out[0].grade_long, null);
+  assert.strictEqual(out[0].grade_day, null);
+  assert.strictEqual(out[0].grade_day_call, "FALSE");
+  assert.strictEqual(out[1].grade_long, "TRUE");
+});
+test("followRefreshChain: walks to the newest exchange, ignores stale and unknown", () => {
+  const m = new Map();
+  const now = 1_000_000_000;
+  m.set("a", { nextKey: "b", at: now - 1000, session: { token: "s1" } });
+  m.set("b", { nextKey: "c", at: now - 500, session: { token: "s2" } });
+  const r = ah.followRefreshChain(m, "a", now, 24 * 3600000);
+  assert.strictEqual(r.entry.session.token, "s2");
+  assert.strictEqual(r.key, "c");
+  assert.strictEqual(ah.followRefreshChain(m, "c", now, 24 * 3600000), null);
+  assert.strictEqual(ah.followRefreshChain(m, "a", now + 48 * 3600000, 24 * 3600000), null);
+});

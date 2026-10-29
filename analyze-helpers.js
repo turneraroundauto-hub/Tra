@@ -636,7 +636,47 @@ function deltaLeanLabel(lean) {
         return null;
     return lean > DELTA_LEAN_BAND ? "BULLISH" : lean < -DELTA_LEAN_BAND ? "BEARISH" : "NEUTRAL";
 }
+// ─── DAY calls survive a later same-day LONG re-run (Oct 29, 2026) ───
+// "Last call of the day wins" (superseded) is the LONG rule. A re-run after
+// the 12:30 ET DAY cutoff carries no DAY call, so it must not wipe the
+// morning's DAY call: a DAY call is only replaced by a later same-day row
+// that has its own DAY call (day_superseded). Given one account's same-day
+// rows for a ticker, returns which DAY calls stand and which are replaced.
+function daySupersedeSplit(rows) {
+    const withDay = (rows || []).filter(r => r && r.day_verdict)
+        .sort((a, b) => Date.parse(b.issued_at) - Date.parse(a.issued_at));
+    return { keep: withDay.length ? withDay[0].id : null, supersede: withDay.slice(1).map(r => r.id) };
+}
+// A superseded row kept only for its DAY call: blank its LONG grades so no
+// LONG stat counts it twice (the later row carries the day's LONG call).
+function dropSupersededLong(rows) {
+    return (rows || []).map(r => (r && r.superseded
+        ? { ...r, grade_long: null, return_long_pct: null, grade_day: null, return_day_pct: null }
+        : r));
+}
+// ─── /auth/refresh grace for lost replies (Oct 29, 2026) ───
+// Supabase rotates the refresh token on every use. When a phone sleeps or
+// drops signal mid-refresh, Supabase has already issued the new token but
+// the reply never reaches the page; the page's next refresh sends the
+// burned token, Supabase calls it reuse, and the user is signed out. Tra
+// remembers each exchange it made (old token -> new session); a token it
+// already exchanged resolves to the newest session in its chain instead.
+// Keys are hashes supplied by the caller; entries older than graceMs are ignored.
+function followRefreshChain(map, key, nowMs, graceMs) {
+    let cur = key, last = null;
+    for (let hops = 0; hops < 100; hops++) {
+        const e = map.get(cur);
+        if (!e || nowMs - e.at > graceMs)
+            break;
+        last = e;
+        cur = e.nextKey;
+    }
+    return last ? { key: cur, entry: last } : null;
+}
 module.exports = {
+    daySupersedeSplit: daySupersedeSplit,
+    dropSupersededLong: dropSupersededLong,
+    followRefreshChain: followRefreshChain,
     parsePctString: parsePctString,
     CONFIDENCE_NEGLIGIBLE_MOVE_PCT: CONFIDENCE_NEGLIGIBLE_MOVE_PCT,
     PROXY_FIT_FLOOR: PROXY_FIT_FLOOR,

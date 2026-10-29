@@ -3878,7 +3878,36 @@ async function recordDayCall(verdictLogId, windowBlock) {
   const { error } = await supabase.from("verdict_log")
     .update(dayCallFields({ ...windowBlock.day, asOf: windowBlock.asOf, entryPrice: windowBlock.dayEntryPrice }))
     .eq("id", verdictLogId).is("day_verdict", null);
-  if (error) console.error(`recordDayCall ${verdictLogId}:`, error.message);
+  if (error) { console.error(`recordDayCall ${verdictLogId}:`, error.message); return; }
+  await markDaySuperseded(verdictLogId);
+}
+
+// The DAY call's own "last call of the day wins" (Oct 29, 2026). Runs after
+// a DAY call lands: among the account's same-UTC-day rows for the ticker
+// (same day scope as supersedeSameDayVerdicts), the latest DAY call stands
+// and earlier ones are marked day_superseded. A later LONG-only re-run (past
+// the 12:30 ET cutoff, no DAY call) never touches the morning's DAY call.
+async function markDaySuperseded(verdictLogId) {
+  try {
+    const { data: row } = await supabase.from("verdict_log")
+      .select("ticker, user_email, issued_at").eq("id", verdictLogId).single();
+    if (!row || !row.user_email) return;
+    const dayStart = new Date(row.issued_at); dayStart.setUTCHours(0, 0, 0, 0);
+    const { data: rows, error } = await supabase.from("verdict_log")
+      .select("id, issued_at, day_verdict, day_superseded")
+      .eq("ticker", row.ticker).eq("user_email", row.user_email)
+      .not("day_verdict", "is", null)
+      .gte("issued_at", dayStart.toISOString())
+      .lt("issued_at", new Date(dayStart.getTime() + 86400000).toISOString());
+    if (error) { console.error(`markDaySuperseded ${verdictLogId}:`, error.message); return; }
+    const { keep } = ah.daySupersedeSplit(rows || []);
+    for (const r of rows || []) {
+      const want = r.id !== keep;
+      if (!!r.day_superseded !== want) await supabase.from("verdict_log").update({ day_superseded: want }).eq("id", r.id);
+    }
+  } catch (e) {
+    console.error(`markDaySuperseded ${verdictLogId}:`, e.message);
+  }
 }
 
 // Only logs actual hits (one row per source that matched), matching
@@ -4422,16 +4451,21 @@ function etSessionOpenMs(dateStr) {
   const offsetH = 16 - etHour; // 4 in EDT, 5 in EST
   return Date.UTC(y, m - 1, d, 9 + offsetH, 30);
 }
+// A row stands for its LONG call (not superseded) or for its DAY call (a DAY
+// call no later same-day DAY call replaced). See markDaySuperseded().
+const DAY_OR_LONG_STANDS = "superseded.eq.false,and(day_superseded.eq.false,day_verdict.not.is.null)";
 async function fetchLearningRows() {
   const since = new Date(Date.now() - LEARNING_LOOKBACK_DAYS * 86400000).toISOString();
   const out = [];
   for (let from = 0; ; from += 1000) {
     const { data, error } = await supabase.from("verdict_log")
-      .select("id, ticker, user_email, issued_at, verdict, size_action, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, grade_long, return_long_pct, grade_day, day_verdict, day_sizing, grade_day_call, return_day_call_pct, day_due_at")
-      .eq("superseded", false).eq("issued_market_open", true).gte("issued_at", since)
+      .select("id, ticker, user_email, issued_at, verdict, size_action, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, grade_long, return_long_pct, grade_day, day_verdict, day_sizing, grade_day_call, return_day_call_pct, day_due_at, superseded")
+      // LONG calls: the day's last row. DAY calls: the day's last DAY call,
+      // which may sit on a row a later LONG-only re-run superseded.
+      .or(DAY_OR_LONG_STANDS).eq("issued_market_open", true).gte("issued_at", since)
       .order("issued_at", { ascending: true }).range(from, from + 999);
     if (error) throw new Error(error.message);
-    out.push(...(data || []));
+    out.push(...ah.dropSupersededLong(data || []));
     if (!data || data.length < 1000) break;
   }
   return out;
@@ -5965,12 +5999,20 @@ async function fetchScorecardPool() {
   if (scorecardPoolCache.data && Date.now() - scorecardPoolCache.time < SCORECARD_POOL_CACHE_MAX_AGE_MS) {
     return scorecardPoolCache.data;
   }
-  const { data, error } = await supabase
-    .from("verdict_log").select("ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, day_verdict, grade_day_call, return_day_call_pct")
-    .eq("superseded", false).eq("issued_market_open", true)
-    .or("grade_day.not.is.null,grade_long.not.is.null,grade_day_call.not.is.null");
-  if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
-  scorecardPoolCache = { data: data || [], time: Date.now() };
+  // Paged (Oct 29, 2026): a single select stops at Supabase's 1,000-row cap
+  // and the pool was ~900 rows, so it would have started dropping calls.
+  const data = [];
+  for (let from = 0; ; from += 1000) {
+    const { data: page, error } = await supabase
+      .from("verdict_log").select("id, ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, day_verdict, grade_day_call, return_day_call_pct, superseded")
+      .eq("issued_market_open", true)
+      .or("and(superseded.eq.false,or(grade_day.not.is.null,grade_long.not.is.null,grade_day_call.not.is.null)),and(day_superseded.eq.false,grade_day_call.not.is.null)")
+      .order("id", { ascending: true }).range(from, from + 999);
+    if (error) { console.error("fetchScorecardPool:", error.message); return scorecardPoolCache.data || []; }
+    data.push(...ah.dropSupersededLong(page || []));
+    if (!page || page.length < 1000) break;
+  }
+  scorecardPoolCache = { data, time: Date.now() };
   return scorecardPoolCache.data;
 }
 const GRADE_CREDIT = { TRUE: 1, MARGINAL: 0.5, FALSE: 0 };
@@ -7631,19 +7673,53 @@ app.post("/auth/login", async (req, res) => {
 // Trade a refresh token for a fresh access token. Uses the throwaway
 // authClient(), never the shared admin client (see the Aug 4, 2026
 // session-contamination fix above).
+// Lost-reply grace (Oct 29, 2026): see ah.followRefreshChain(). Every
+// exchange Tra makes is remembered (sha256 of the old token -> the new
+// session) for REFRESH_GRACE_MS. A token Tra already exchanged gets the
+// newest session in its chain (refreshed again if that one is about to
+// expire) instead of a "refresh_token_already_used" sign-out. Memory only:
+// a deploy forgets the chain. Same-token requests share one Supabase call.
+const REFRESH_GRACE_MS = 24 * 60 * 60 * 1000;
+const REFRESH_REUSE_MIN_LEFT_SEC = 5 * 60;
+const refreshExchanges = new Map(); // tokenHash -> { nextKey, nextToken, session, at }
+const refreshInFlight = new Map();  // tokenHash -> Promise<session>
+function refreshTokenKey(t) { return require("crypto").createHash("sha256").update(String(t)).digest("hex"); }
+async function exchangeRefreshToken(token) {
+  const key = refreshTokenKey(token);
+  if (refreshInFlight.has(key)) return refreshInFlight.get(key);
+  const p = (async () => {
+    const { data, error } = await authClient().auth.refreshSession({ refresh_token: token });
+    if (error || !data?.session) { const e = new Error((error && error.message) || "Refresh failed"); e.status = 401; throw e; }
+    const session = { token: data.session.access_token, refreshToken: data.session.refresh_token, expiresAt: data.session.expires_at };
+    const now = Date.now();
+    refreshExchanges.set(key, { nextKey: refreshTokenKey(session.refreshToken), nextToken: session.refreshToken, session, at: now });
+    for (const [k, v] of refreshExchanges) if (now - v.at > REFRESH_GRACE_MS) refreshExchanges.delete(k);
+    return session;
+  })();
+  refreshInFlight.set(key, p);
+  try { return await p; } finally { refreshInFlight.delete(key); }
+}
 app.post("/auth/refresh", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Auth not configured" });
   const { refreshToken } = req.body || {};
   if (!refreshToken) return res.status(400).json({ error: "refreshToken required" });
   try {
-    const { data, error } = await authClient().auth.refreshSession({ refresh_token: refreshToken });
-    if (error || !data?.session) return res.status(401).json({ error: (error && error.message) || "Refresh failed" });
-    res.json({
-      token:        data.session.access_token,
-      refreshToken: data.session.refresh_token,
-      expiresAt:    data.session.expires_at,
-    });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const chain = ah.followRefreshChain(refreshExchanges, refreshTokenKey(refreshToken), Date.now(), REFRESH_GRACE_MS);
+    let session;
+    if (chain) {
+      const s = chain.entry.session;
+      session = s.expiresAt && s.expiresAt - Date.now() / 1000 > REFRESH_REUSE_MIN_LEFT_SEC
+        ? s
+        : await exchangeRefreshToken(chain.entry.nextToken);
+      console.log("/auth/refresh: already-exchanged token resolved from Tra's chain (lost reply recovered)");
+    } else {
+      session = await exchangeRefreshToken(refreshToken);
+    }
+    res.json(session);
+  } catch(e) {
+    if (e.status === 401) return res.status(401).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Signup

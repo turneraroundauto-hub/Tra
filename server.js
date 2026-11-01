@@ -141,8 +141,9 @@ function horizonTargetFor(issuedAt, sessions) {
 // hours verdict is graded twice, the same way for every user and tier:
 //   day  = close of the session it was issued in (half credit if it touched
 //          +4% in the call's direction but closed wrong -- Aggressive's target)
-//   long = close of the 5th session after issue (half credit at +16% --
-//          Passive's target)
+//   long = 5th AND 14th session after issue, one merged TRUE/FALSE grade
+//          (Nov 1, 2026, ah.gradeLongCall -- Mr. T's rules; was: close of
+//          the 5th session, half credit at +16%)
 // FLAT uses the ticker's normal daily move as its band; the long window
 // scales that band by sqrt(5), since a 5-session move is naturally bigger
 // than a 1-day one (standard volatility-over-time scaling).
@@ -154,6 +155,8 @@ const GRADE_WINDOWS = {
   long: { sessions: 5, target: 16, flatScale: Math.sqrt(5),
           due: "long_due_at", date: "long_target_date", grade: "grade_long", ret: "return_long_pct", at: "graded_at_long" },
 };
+// The LONG grade's confirming window (Nov 1, 2026): the grade waits for it.
+const LONG_CONFIRM_SESSIONS = 14;
 function dayLongTargetFields(issuedAt) {
   const out = {};
   for (const w of Object.values(GRADE_WINDOWS)) {
@@ -161,6 +164,9 @@ function dayLongTargetFields(issuedAt) {
     out[w.date] = t.targetDate;
     out[w.due] = t.dueAt.toISOString();
   }
+  const c = horizonTargetFor(issuedAt, LONG_CONFIRM_SESSIONS);
+  out.long14_target_date = c.targetDate;
+  out.long14_due_at = c.dueAt.toISOString();
   return out;
 }
 
@@ -4266,6 +4272,44 @@ async function backfillHorizonFields() {
 
 // Grades one window (day or long) for every due market-hours verdict. Same
 // close source, give-up rule and batching as gradeHorizonRows above.
+// LONG (Nov 1, 2026): one grade from the 5th and 14th session closes,
+// ah.gradeLongCall. Due once the 14th session has closed.
+async function gradeLongRows() {
+  const w = GRADE_WINDOWS.long;
+  const now = Date.now();
+  const { data: due, error } = await supabase
+    .from("verdict_log")
+    .select("id, ticker, verdict, issued_price, issued_at, long_target_date, long14_target_date, long14_due_at")
+    .eq("issued_market_open", true)
+    .is(w.at, null)
+    .not("long14_due_at", "is", null)
+    .lte("long14_due_at", new Date(now).toISOString())
+    .order("long14_due_at", { ascending: true })
+    .limit(HORIZON_GRADING_BATCH_SIZE);
+  if (error) { console.error("gradeLongRows query:", error.message); return 0; }
+  if (!due || !due.length) return 0;
+  let graded = 0;
+  for (const row of due) {
+    const c5 = row.issued_price == null ? null : await fetchSessionClose(row.ticker, row.long_target_date);
+    const c14 = c5 == null ? null : await fetchSessionClose(row.ticker, row.long14_target_date);
+    if (c5 == null || c14 == null) {
+      const stale = row.issued_price == null || now - new Date(row.long14_due_at).getTime() > HORIZON_GIVE_UP_AFTER_MS;
+      if (stale) await supabase.from("verdict_log").update({ [w.at]: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const r5 = (c5 - row.issued_price) / row.issued_price * 100;
+    const r14 = (c14 - row.issued_price) / row.issued_price * 100;
+    let normal = null;
+    if (row.verdict !== "UP" && row.verdict !== "DOWN") {
+      const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
+      normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
+    }
+    const grade = ah.gradeLongCall(row.verdict, r5, r14, normal);
+    await supabase.from("verdict_log").update({ [w.ret]: r5, return_long14_pct: r14, [w.grade]: grade, [w.at]: new Date().toISOString() }).eq("id", row.id);
+    graded++;
+  }
+  return graded;
+}
 async function gradeWindowRows(kind) {
   const w = GRADE_WINDOWS[kind];
   const now = Date.now();
@@ -4396,7 +4440,7 @@ async function backfillDayLongFields() {
     .from("verdict_log")
     .select("id, issued_at")
     .eq("issued_market_open", true)
-    .is("day_due_at", null)
+    .or("day_due_at.is.null,long14_due_at.is.null")
     .limit(HORIZON_BACKFILL_BATCH_SIZE);
   if (error) { console.error("backfillDayLongFields query:", error.message); return 0; }
   if (!rows || !rows.length) return 0;
@@ -4618,7 +4662,7 @@ async function runVerdictGradingSweep() {
     const dayLongStamped = await backfillDayLongFields();
     if (dayLongStamped) console.log(`Verdict day/long backfill: ${dayLongStamped} row(s) stamped.`);
     const dayCount = await gradeUntilCaughtUp(() => gradeWindowRows("day"));
-    const longCount = await gradeUntilCaughtUp(() => gradeWindowRows("long"));
+    const longCount = await gradeUntilCaughtUp(gradeLongRows);
     const dayRecovered = await backfillDayCallsFromJobs();
     if (dayRecovered) console.log(`Day call backfill: ${dayRecovered} DAY read(s) attached from day_refinement_jobs.`);
     const dayCallCount = await gradeUntilCaughtUp(gradeDayCallRows);
@@ -6004,7 +6048,7 @@ async function fetchScorecardPool() {
   const data = [];
   for (let from = 0; ; from += 1000) {
     const { data: page, error } = await supabase
-      .from("verdict_log").select("id, ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, day_verdict, grade_day_call, return_day_call_pct, superseded")
+      .from("verdict_log").select("id, ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, return_long14_pct, day_verdict, grade_day_call, return_day_call_pct, superseded")
       .eq("issued_market_open", true)
       .or("and(superseded.eq.false,or(grade_day.not.is.null,grade_long.not.is.null,grade_day_call.not.is.null)),and(day_superseded.eq.false,grade_day_call.not.is.null)")
       .order("id", { ascending: true }).range(from, from + 999);
@@ -6038,6 +6082,23 @@ function tileProof(rows, gradeKey, retKey, pct) {
     ? +(withRet.filter(r => Number(r[retKey]) > 0).length / withRet.length * 100).toFixed(1)
     : null;
   return { margin, alwaysUpPct };
+}
+// LONG tile proof (Nov 1, 2026). Under the 5+14 rules UP and DOWN have very
+// different base rates (a random stock clears the UP bar ~20% of the time,
+// the DOWN bar ~50%), so "always UP" no longer says anything. Baseline =
+// "random pick": for each graded call, how often ANY graded stock in the
+// pool passed that call's rule; averaged over the calls.
+function longTileProof(pool, directional, pct) {
+  const proof = tileProof(directional, "grade_long", "return_long_pct", pct);
+  if (!proof) return null;
+  const moves = pool.filter(r => r.return_long_pct != null && r.return_long14_pct != null)
+    .map(r => [Number(r.return_long_pct), Number(r.return_long14_pct)]);
+  const graded = directional.filter(r => GRADE_CREDIT[r.grade_long] != null);
+  if (!moves.length || !graded.length) return { margin: proof.margin, randomPct: null };
+  const passRate = (v) => moves.filter(([a, b]) => ah.gradeLongCall(v, a, b, null) === "TRUE").length / moves.length;
+  const rate = { UP: passRate("UP"), DOWN: passRate("DOWN") };
+  const randomPct = +(graded.reduce((a, r) => a + rate[r.verdict], 0) / graded.length * 100).toFixed(1);
+  return { margin: proof.margin, randomPct };
 }
 const isDirectional = (r) => r.verdict === "UP" || r.verdict === "DOWN";
 // Oct 27, 2026: the Day tile grades the DAY call itself (Pro, Gate 3
@@ -6093,7 +6154,7 @@ app.get("/scorecard", async (req, res) => {
     // Range + always-UP comparison are Pro/Shark only (tierConfig.tracker).
     const proof = req.tierConfig?.tracker
       ? { day: tileProof(directionalDay, "grade_day_call", "return_day_call_pct", day.pct),
-          long: tileProof(directional, "grade_long", "return_long_pct", long.pct) }
+          long: longTileProof(pool, directional, long.pct) }
       : undefined;
     res.json({
       scope: "pooled",

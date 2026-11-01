@@ -643,7 +643,7 @@ function daySupersedeSplit(rows: any[]): { keep: any; supersede: any[] } {
 // LONG stat counts it twice (the later row carries the day's LONG call).
 function dropSupersededLong(rows: any[]): any[] {
   return (rows || []).map(r => (r && r.superseded
-    ? { ...r, grade_long: null, return_long_pct: null, grade_day: null, return_day_pct: null }
+    ? { ...r, grade_long: null, return_long_pct: null, return_long14_pct: null, grade_day: null, return_day_pct: null }
     : r));
 }
 
@@ -665,7 +665,30 @@ function followRefreshChain(map: Map<string, any>, key: string, nowMs: number, g
   return last ? { key: cur, entry: last } : null;
 }
 
+// ─── LONG grade: 5 + 14 sessions, one merged grade (Nov 1, 2026) ───
+// Mr. T's rules. A LONG call is right only if BOTH windows agree:
+//   UP   -- gained more than +2% by the 5th session AND +3% or more by the 14th.
+//   DOWN -- gained less than +1% at the 5th session AND at the 14th.
+//   FLAT -- stayed within the ticker's normal move, scaled to each window
+//           (normal daily move x sqrt(sessions)), at both the 5th and 14th.
+// TRUE / FALSE only -- no half credit. r5/r14 = % move from the call price.
+const LONG_UP_MIN_5 = 2;
+const LONG_UP_MIN_14 = 3;
+const LONG_DOWN_MAX = 1;
+const LONG_FLAT_FALLBACK_DAILY = 1; // % per day when there's no history to size from
+function gradeLongCall(verdict: string, r5: number, r14: number, normalDailyPct: number | null): string | null {
+  if (!isFinite(r5) || !isFinite(r14)) return null;
+  if (verdict === 'UP') return r5 > LONG_UP_MIN_5 && r14 >= LONG_UP_MIN_14 ? 'TRUE' : 'FALSE';
+  if (verdict === 'DOWN') return r5 < LONG_DOWN_MAX && r14 < LONG_DOWN_MAX ? 'TRUE' : 'FALSE';
+  const daily = normalDailyPct != null && normalDailyPct > 0 ? normalDailyPct : LONG_FLAT_FALLBACK_DAILY;
+  return Math.abs(r5) <= daily * Math.sqrt(5) && Math.abs(r14) <= daily * Math.sqrt(14) ? 'TRUE' : 'FALSE';
+}
+
 module.exports = {
+  gradeLongCall: gradeLongCall,
+  LONG_UP_MIN_5: LONG_UP_MIN_5,
+  LONG_UP_MIN_14: LONG_UP_MIN_14,
+  LONG_DOWN_MAX: LONG_DOWN_MAX,
   daySupersedeSplit: daySupersedeSplit,
   dropSupersededLong: dropSupersededLong,
   followRefreshChain: followRefreshChain,

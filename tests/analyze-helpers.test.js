@@ -506,3 +506,24 @@ test("followRefreshChain: walks to the newest exchange, ignores stale and unknow
   assert.strictEqual(ah.followRefreshChain(m, "c", now, 24 * 3600000), null);
   assert.strictEqual(ah.followRefreshChain(m, "a", now + 48 * 3600000, 24 * 3600000), null);
 });
+
+// ─── Nov 1, 2026: LONG grade, 5 + 14 sessions ───
+test("gradeLongCall: UP needs >2% at 5 and >=3% at 14", () => {
+  assert.strictEqual(ah.gradeLongCall("UP", 2.5, 3, null), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("UP", 2, 5, null), "FALSE");   // not more than 2 at 5
+  assert.strictEqual(ah.gradeLongCall("UP", 6, 2.9, null), "FALSE"); // gave it back by 14
+});
+test("gradeLongCall: DOWN needs under +1% at both", () => {
+  assert.strictEqual(ah.gradeLongCall("DOWN", 0.9, -4, null), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("DOWN", -3, 1, null), "FALSE");
+  assert.strictEqual(ah.gradeLongCall("DOWN", 1, -1, null), "FALSE");
+});
+test("gradeLongCall: FLAT within normal move x sqrt(sessions)", () => {
+  // normal 2%/day -> bands 4.47% (5) and 7.48% (14)
+  assert.strictEqual(ah.gradeLongCall("FLAT", -4.4, 7.4, 2), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("FLAT", 4.5, 0, 2), "FALSE");
+  assert.strictEqual(ah.gradeLongCall("FLAT", 0, -7.5, 2), "FALSE");
+  // no history -> 1%/day fallback
+  assert.strictEqual(ah.gradeLongCall("FLAT", 2, 3.7, null), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("UP", NaN, 3, null), null);
+});

@@ -881,6 +881,61 @@ function pickRelevantNews(pool, symbol, companyName) {
     }
     return best;
 }
+// ── Related / sector news fallback (Nov 2, 2026) ────────────────────────
+// Used only after a ticker's own news search finds nothing (ETFs most of
+// all). Associated tickers in priority order, deduped, self and index/crypto
+// symbols removed, capped.
+const NON_EQUITY_SYMBOLS = new Set(["SPY", "QQQ", "DIA", "IWM", "VTI", "BTC", "ETH", "KOSPI", "VIX", "^VIX"]);
+function associatedTickers(symbol, lists, cap = 4) {
+    const self = String(symbol || "").toUpperCase();
+    const out = [];
+    for (const list of lists) {
+        for (const raw of list || []) {
+            const t = String(raw || "").toUpperCase();
+            if (!/^[A-Z]{1,5}$/.test(t) || t === self || NON_EQUITY_SYMBOLS.has(t) || out.includes(t))
+                continue;
+            out.push(t);
+            if (out.length >= cap)
+                return out;
+        }
+    }
+    return out;
+}
+// Newest article whose headline or summary names one of the sector's
+// keywords as a whole word. null when the sector has no keywords or none match.
+function pickSectorNews(pool, keywords) {
+    const kws = (keywords || []).filter(k => k && k.length >= 3);
+    if (!kws.length)
+        return null;
+    const re = new RegExp("\\b(" + kws.map(escapeRe).join("|") + ")s?\\b", "i");
+    let best = null;
+    for (const a of pool || []) {
+        if (!a || !a.headline || !a.url || !Number.isFinite(a.timeMs))
+            continue;
+        if (!re.test(a.headline) && !re.test(a.summary || ""))
+            continue;
+        if (!best || a.timeMs > best.timeMs)
+            best = a;
+    }
+    return best;
+}
+// The Gate 2 prompt line for a related/sector headline: labeled so the model
+// reads it as sector context, never as the ticker's own catalyst. Only
+// server-shaped fields are trusted (via must look like a ticker).
+function relatedNewsContext(ticker, news) {
+    if (!news || !news.basis || !news.headline)
+        return null;
+    const head = String(news.headline).replace(/"/g, "'").slice(0, 300);
+    const age = String(news.ageLabel || "").slice(0, 20);
+    if (news.basis === "related" && /^[A-Z]{1,5}$/.test(String(news.via || ""))) {
+        return `Related news via ${news.via} (${age}), NOT about ${ticker} itself: "${head}". No ${ticker}-specific news was found. For Gate 2, read this only as sector context for ${ticker}; a related company's story is not ${ticker}'s own catalyst, so do not classify it as COMPANY-SPECIFIC.`;
+    }
+    if (news.basis === "sector") {
+        const sector = String(news.sector || "its sector").replace(/[^A-Za-z/ &-]/g, "").slice(0, 40);
+        return `Sector news for ${sector} (${age}), NOT about ${ticker} itself: "${head}". No ${ticker}-specific news was found. For Gate 2, read this only as sector context for ${ticker}; do not classify it as COMPANY-SPECIFIC.`;
+    }
+    return null;
+}
 module.exports = {
     etOffsetIso: etOffsetIso,
     sessionOpenIso: sessionOpenIso,
@@ -937,4 +992,7 @@ module.exports = {
     textNamesTicker: textNamesTicker,
     newsRelevanceTier: newsRelevanceTier,
     pickRelevantNews: pickRelevantNews,
+    associatedTickers: associatedTickers,
+    pickSectorNews: pickSectorNews,
+    relatedNewsContext: relatedNewsContext,
 };

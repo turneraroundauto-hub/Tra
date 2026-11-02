@@ -714,7 +714,24 @@ function ruleB2(verdict: string, trend: string | null, rangePos: number | null):
   return { verdict: verdict, check: null };
 }
 
+// ET's UTC offset ("-04:00" in EDT, "-05:00" in EST) for an ET calendar date
+// "YYYY-MM-DD", read at noon UTC that day (well clear of the 2am switch).
+// fetchOpeningBar used to type "-04:00" in, so after DST ended its 9:30
+// start became 8:30 ET and bar 1 was a pre-market bar (Nov 2, 2026).
+function etOffsetIso(dateStr: string): string {
+  const probe = new Date(dateStr + 'T12:00:00Z');
+  const etNoon = new Date(probe.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const h = 12 - etNoon.getHours();
+  return '-' + String(h).padStart(2, '0') + ':00';
+}
+// The regular-session open (9:30 ET) for an ET date, as an ISO timestamp.
+function sessionOpenIso(dateStr: string): string {
+  return dateStr + 'T09:30:00' + etOffsetIso(dateStr);
+}
+
 module.exports = {
+  etOffsetIso: etOffsetIso,
+  sessionOpenIso: sessionOpenIso,
   B2_VERSION: B2_VERSION,
   B2_TOP_PCT: B2_TOP_PCT,
   rangePosition: rangePosition,

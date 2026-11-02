@@ -545,3 +545,15 @@ test("ruleB2: the four frozen checks, nothing else", () => {
   assert.deepStrictEqual(ah.ruleB2("FLAT", "DOWNTREND", 10), { verdict: "FLAT", check: null });
   assert.deepStrictEqual(ah.ruleB2("UP", null, null), { verdict: "UP", check: null }); // missing inputs never filter
 });
+
+test('sessionOpenIso / etOffsetIso: 9:30 ET open follows DST (Nov 2, 2026 fix)', () => {
+  assert.equal(ah.etOffsetIso('2026-10-30'), '-04:00'); // last Friday of EDT
+  assert.equal(ah.etOffsetIso('2026-11-01'), '-05:00'); // switch day: 9:30 is EST
+  assert.equal(ah.etOffsetIso('2026-11-02'), '-05:00'); // first trading day of EST
+  assert.equal(ah.etOffsetIso('2027-03-12'), '-05:00');
+  assert.equal(ah.etOffsetIso('2027-03-15'), '-04:00'); // first trading day of EDT
+  assert.equal(ah.sessionOpenIso('2026-11-02'), '2026-11-02T09:30:00-05:00');
+  // The resolved instant is 9:30 ET = 14:30 UTC in winter, 13:30 UTC in summer.
+  assert.equal(new Date(ah.sessionOpenIso('2026-11-02')).toISOString(), '2026-11-02T14:30:00.000Z');
+  assert.equal(new Date(ah.sessionOpenIso('2026-10-30')).toISOString(), '2026-10-30T13:30:00.000Z');
+});

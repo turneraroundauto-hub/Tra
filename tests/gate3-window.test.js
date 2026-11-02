@@ -30,8 +30,9 @@ test('windowState: 0/1/2/3/4+ bars, cutoff, closed', () => {
   assert.equal(g3.windowState(true, m, CLOSE, 2), 'FORMING');
   assert.equal(g3.windowState(true, 10 * 60 + 15, CLOSE, 3), 'RESOLVED');
   assert.equal(g3.windowState(true, 11 * 60, CLOSE, 6), 'RESOLVED');
-  assert.equal(g3.windowState(true, 12 * 60 + 29, CLOSE, 11), 'RESOLVED');
-  assert.equal(g3.windowState(true, 12 * 60 + 30, CLOSE, 12), 'EXPIRED');
+  assert.equal(g3.windowState(true, 12 * 60 + 30, CLOSE, 12), 'RESOLVED'); // old cutoff, now still open
+  assert.equal(g3.windowState(true, 13 * 60 + 29, CLOSE, 15), 'RESOLVED');
+  assert.equal(g3.windowState(true, 13 * 60 + 30, CLOSE, 16), 'EXPIRED');
   assert.equal(g3.windowState(true, 9 * 60, CLOSE, 0), 'CLOSED');
   assert.equal(g3.windowState(false, 11 * 60, CLOSE, 6), 'CLOSED'); // holiday/weekend
   assert.equal(g3.windowState(true, 13 * 60, 13 * 60, 14), 'CLOSED'); // after early close

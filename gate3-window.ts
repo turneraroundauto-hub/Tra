@@ -8,7 +8,7 @@
  * module reads the last 3 COMPLETED 15-min bars instead (the in-progress
  * bar is never counted) and turns them into:
  *   - a window state: FORMING (n/3 bars done) / RESOLVED / EXPIRED (after
- *     the 12:30 ET = 9:30 PT cutoff) / CLOSED (outside the session);
+ *     the 1:30 PM ET = 10:30 AM PT cutoff; was 12:30 ET until Nov 2, 2026, Mr. T) / CLOSED (outside the session);
  *   - a bar-sequence read (GREEN / YELLOW / RED);
  *   - a Day verdict: the Long verdict refined by that read, using fixed
  *     rules -- no model call, so the Day verdict never adds cost.
@@ -28,7 +28,7 @@ const BAR_MINUTES = 15;
 const SESSION_OPEN_MIN = 9 * 60 + 30;  // 9:30 ET
 const BARS_NEEDED = 3;
 const FIRST_READ_MIN = SESSION_OPEN_MIN + BARS_NEEDED * BAR_MINUTES; // 10:15 ET = 7:15 PT
-const WINDOW_CUTOFF_MIN = 12 * 60 + 30; // 12:30 ET = 9:30 PT
+const WINDOW_CUTOFF_MIN = 13 * 60 + 30; // 1:30 PM ET = 10:30 AM PT (Nov 2, 2026; was 12:30 ET)
 
 type BarLite = { t: string; o: number; h: number; l: number; c: number; v?: number };
 type WindowState = 'CLOSED' | 'FORMING' | 'RESOLVED' | 'EXPIRED';

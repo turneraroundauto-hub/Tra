@@ -3918,7 +3918,7 @@ async function recordDayCall(verdictLogId, windowBlock) {
 // a DAY call lands: among the account's same-UTC-day rows for the ticker
 // (same day scope as supersedeSameDayVerdicts), the latest DAY call stands
 // and earlier ones are marked day_superseded. A later LONG-only re-run (past
-// the 12:30 ET cutoff, no DAY call) never touches the morning's DAY call.
+// the 1:30 PM ET / 10:30 AM PT cutoff, no DAY call) never touches the morning's DAY call.
 async function markDaySuperseded(verdictLogId) {
   try {
     const { data: row } = await supabase.from("verdict_log")
@@ -6798,7 +6798,7 @@ function buildWindowBlock(win, long, opts) {
     : win.state === "FORMING"
       ? { status: null, note: win.fetchFailed ? "Bar data unavailable right now." : `${win.barsDone}/${win.barsNeeded} ${(win.schedule && win.schedule.barMinutes) || 15}-min bars done. Day read at ${ptClock(win.readyAt)}.` }
       : win.state === "EXPIRED"
-        ? { status: null, note: "Day window passed (9:30 AM PT). Long verdict only." }
+        ? { status: null, note: "Day window passed (10:30 AM PT). Long verdict only." }
         : { status: null, note: "Market closed. Long verdict only." };
   const day = win.state === "RESOLVED" ? g3w.refineDayVerdict(long, win.seq, opts) : null;
   return {
@@ -6827,7 +6827,7 @@ async function catalystKey(symbol) {
   return `${e.data?.headline || ""}|${pg?.status || ""}`;
 }
 
-// Per-user verdict cache. Same candle -> reuse. After the 9:30 PT cutoff ->
+// Per-user verdict cache. Same candle -> reuse. After the 10:30 AM PT cutoff ->
 // reuse a cached Long made after the cutoff, if the catalyst check passes
 // and Gate 0 hasn't changed. Anything else -> a fresh analysis.
 const windowVerdictCache = new Map(); // wkey -> { result, dateET, candleKey, postCutoff, catalyst, gate0 }

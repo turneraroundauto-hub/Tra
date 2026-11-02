@@ -630,7 +630,7 @@ function deltaLeanLabel(lean: number | null): string | null {
 
 // ─── DAY calls survive a later same-day LONG re-run (Oct 29, 2026) ───
 // "Last call of the day wins" (superseded) is the LONG rule. A re-run after
-// the 12:30 ET DAY cutoff carries no DAY call, so it must not wipe the
+// the 1:30 PM ET (10:30 AM PT) DAY cutoff carries no DAY call, so it must not wipe the
 // morning's DAY call: a DAY call is only replaced by a later same-day row
 // that has its own DAY call (day_superseded). Given one account's same-day
 // rows for a ticker, returns which DAY calls stand and which are replaced.

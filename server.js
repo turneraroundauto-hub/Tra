@@ -1549,7 +1549,7 @@ async function fetchOpeningBar(symbol) {
     if (mins < 570) return null; // before 9:30am ET
 
     // Fetch 15-min bars for today — first bar is the opening bar
-    const data = await alpacaGet(`/v2/stocks/${symbol}/bars?timeframe=15Min&start=${today}T09:30:00-04:00&limit=5&feed=iex`);
+    const data = await alpacaGet(`/v2/stocks/${symbol}/bars?timeframe=15Min&start=${encodeURIComponent(ah.sessionOpenIso(today))}&limit=5&feed=iex`);
     const bars = data.bars || [];
     if (!bars.length) return null;
 

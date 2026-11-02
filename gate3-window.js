@@ -3,7 +3,7 @@ const BAR_MINUTES = 15;
 const SESSION_OPEN_MIN = 9 * 60 + 30; // 9:30 ET
 const BARS_NEEDED = 3;
 const FIRST_READ_MIN = SESSION_OPEN_MIN + BARS_NEEDED * BAR_MINUTES; // 10:15 ET = 7:15 PT
-const WINDOW_CUTOFF_MIN = 12 * 60 + 30; // 12:30 ET = 9:30 PT
+const WINDOW_CUTOFF_MIN = 13 * 60 + 30; // 1:30 PM ET = 10:30 AM PT (Nov 2, 2026; was 12:30 ET)
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
 function hhmm(min) { return pad2(Math.floor(min / 60)) + ':' + pad2(min % 60); }
 // Start (ET minutes) of the 15-min candle the clock is currently inside, or

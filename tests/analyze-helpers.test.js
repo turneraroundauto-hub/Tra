@@ -506,3 +506,42 @@ test("followRefreshChain: walks to the newest exchange, ignores stale and unknow
   assert.strictEqual(ah.followRefreshChain(m, "c", now, 24 * 3600000), null);
   assert.strictEqual(ah.followRefreshChain(m, "a", now + 48 * 3600000, 24 * 3600000), null);
 });
+
+// ─── Nov 1, 2026: LONG grade, 5 + 14 sessions ───
+test("gradeLongCall: UP needs >2% at 5 and >=3% at 14", () => {
+  assert.strictEqual(ah.gradeLongCall("UP", 2.5, 3, null), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("UP", 2, 5, null), "FALSE");   // not more than 2 at 5
+  assert.strictEqual(ah.gradeLongCall("UP", 6, 2.9, null), "FALSE"); // gave it back by 14
+});
+test("gradeLongCall: DOWN needs under +1% at both", () => {
+  assert.strictEqual(ah.gradeLongCall("DOWN", 0.9, -4, null), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("DOWN", -3, 1, null), "FALSE");
+  assert.strictEqual(ah.gradeLongCall("DOWN", 1, -1, null), "FALSE");
+});
+test("gradeLongCall: FLAT within normal move x sqrt(sessions)", () => {
+  // normal 2%/day -> bands 4.47% (5) and 7.48% (14)
+  assert.strictEqual(ah.gradeLongCall("FLAT", -4.4, 7.4, 2), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("FLAT", 4.5, 0, 2), "FALSE");
+  assert.strictEqual(ah.gradeLongCall("FLAT", 0, -7.5, 2), "FALSE");
+  // no history -> 1%/day fallback
+  assert.strictEqual(ah.gradeLongCall("FLAT", 2, 3.7, null), "TRUE");
+  assert.strictEqual(ah.gradeLongCall("UP", NaN, 3, null), null);
+});
+
+// ─── Nov 2, 2026: rule B-2 (shadow) ───
+test("rangePosition: last 20 completed closes, null when thin", () => {
+  const closes = Array.from({ length: 25 }, (_, i) => 40 + (i % 11)); // last 20 span 40..50
+  assert.strictEqual(ah.rangePosition(closes, 48), 80);
+  assert.strictEqual(ah.rangePosition(closes, 52), 120);
+  assert.strictEqual(ah.rangePosition(closes.slice(0, 14), 48), null);
+});
+test("ruleB2: the four frozen checks, nothing else", () => {
+  assert.deepStrictEqual(ah.ruleB2("UP", "UPTREND", 10), { verdict: "FLAT", check: 1 });
+  assert.deepStrictEqual(ah.ruleB2("UP", "DOWNTREND", 75), { verdict: "FLAT", check: 2 });
+  assert.deepStrictEqual(ah.ruleB2("UP", "DOWNTREND", 74.9), { verdict: "UP", check: null });
+  assert.deepStrictEqual(ah.ruleB2("DOWN", "DOWNTREND", 50), { verdict: "FLAT", check: 3 });
+  assert.deepStrictEqual(ah.ruleB2("DOWN", "UPTREND", 90), { verdict: "DOWN", check: null });
+  assert.deepStrictEqual(ah.ruleB2("FLAT", "UPTREND", 10), { verdict: "DOWN", check: 4 });
+  assert.deepStrictEqual(ah.ruleB2("FLAT", "DOWNTREND", 10), { verdict: "FLAT", check: null });
+  assert.deepStrictEqual(ah.ruleB2("UP", null, null), { verdict: "UP", check: null }); // missing inputs never filter
+});

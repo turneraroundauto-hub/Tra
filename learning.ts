@@ -396,13 +396,14 @@ function annotateDialShift(rows: any[], changes: any[], windowDays: number = DIA
 
 // Accuracy (dial-horizon grade, MARGINAL = half) and stop-out rate for a set
 // of verdict rows. UP/DOWN calls only, same rule as the Scorecard headline.
-function dialStats(rows: any[]): { n: number; pct: number | null; stopPct: number | null } {
-  const d = (rows || []).filter(r => (r.verdict === 'UP' || r.verdict === 'DOWN') && CREDIT[r.grade_horizon] != null);
-  if (!d.length) return { n: 0, pct: null, stopPct: null };
-  const credit = d.reduce((s, r) => s + CREDIT[r.grade_horizon], 0);
-  const withPath = d.filter(r => r.path_outcome);
-  return { n: d.length, pct: +(credit / d.length * 100).toFixed(1),
-    stopPct: withPath.length ? +(withPath.filter(r => r.path_outcome === 'STOP').length / withPath.length * 100).toFixed(1) : null };
+// Nov 2, 2026 (Mr. T): the audit uses the same LONG and DAY grades as the
+// Scorecard -- one test for every dial setting -- instead of each dial's own
+// horizon and stop-out path. n/pct = LONG calls (UP/DOWN); dayN/dayPct = DAY.
+function dialStats(rows: any[]): { n: number; pct: number | null; dayN: number; dayPct: number | null } {
+  const pct = (xs: any[], g: string) => xs.length ? +(xs.reduce((s, r) => s + CREDIT[r[g]], 0) / xs.length * 100).toFixed(1) : null;
+  const L = (rows || []).filter(r => (r.verdict === 'UP' || r.verdict === 'DOWN') && CREDIT[r.grade_long] != null);
+  const D = (rows || []).filter(r => (r.day_verdict === 'UP' || r.day_verdict === 'DOWN') && CREDIT[r.grade_day_call] != null);
+  return { n: L.length, pct: pct(L, 'grade_long'), dayN: D.length, dayPct: pct(D, 'grade_day_call') };
 }
 
 // One account's audit summary: its changes (newest first) and, for the

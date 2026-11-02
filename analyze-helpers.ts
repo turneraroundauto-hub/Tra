@@ -630,7 +630,7 @@ function deltaLeanLabel(lean: number | null): string | null {
 
 // ─── DAY calls survive a later same-day LONG re-run (Oct 29, 2026) ───
 // "Last call of the day wins" (superseded) is the LONG rule. A re-run after
-// the 12:30 ET DAY cutoff carries no DAY call, so it must not wipe the
+// the 1:30 PM ET (10:30 AM PT) DAY cutoff carries no DAY call, so it must not wipe the
 // morning's DAY call: a DAY call is only replaced by a later same-day row
 // that has its own DAY call (day_superseded). Given one account's same-day
 // rows for a ticker, returns which DAY calls stand and which are replaced.
@@ -643,7 +643,7 @@ function daySupersedeSplit(rows: any[]): { keep: any; supersede: any[] } {
 // LONG stat counts it twice (the later row carries the day's LONG call).
 function dropSupersededLong(rows: any[]): any[] {
   return (rows || []).map(r => (r && r.superseded
-    ? { ...r, grade_long: null, return_long_pct: null, grade_day: null, return_day_pct: null }
+    ? { ...r, grade_long: null, return_long_pct: null, return_long14_pct: null, grade_day: null, return_day_pct: null }
     : r));
 }
 
@@ -665,7 +665,64 @@ function followRefreshChain(map: Map<string, any>, key: string, nowMs: number, g
   return last ? { key: cur, entry: last } : null;
 }
 
+// ─── LONG grade: 5 + 14 sessions, one merged grade (Nov 1, 2026) ───
+// Mr. T's rules. A LONG call is right only if BOTH windows agree:
+//   UP   -- gained more than +2% by the 5th session AND +3% or more by the 14th.
+//   DOWN -- gained less than +1% at the 5th session AND at the 14th.
+//   FLAT -- stayed within the ticker's normal move, scaled to each window
+//           (normal daily move x sqrt(sessions)), at both the 5th and 14th.
+// TRUE / FALSE only -- no half credit. r5/r14 = % move from the call price.
+const LONG_UP_MIN_5 = 2;
+const LONG_UP_MIN_14 = 3;
+const LONG_DOWN_MAX = 1;
+const LONG_FLAT_FALLBACK_DAILY = 1; // % per day when there's no history to size from
+function gradeLongCall(verdict: string, r5: number, r14: number, normalDailyPct: number | null): string | null {
+  if (!isFinite(r5) || !isFinite(r14)) return null;
+  if (verdict === 'UP') return r5 > LONG_UP_MIN_5 && r14 >= LONG_UP_MIN_14 ? 'TRUE' : 'FALSE';
+  if (verdict === 'DOWN') return r5 < LONG_DOWN_MAX && r14 < LONG_DOWN_MAX ? 'TRUE' : 'FALSE';
+  const daily = normalDailyPct != null && normalDailyPct > 0 ? normalDailyPct : LONG_FLAT_FALLBACK_DAILY;
+  return Math.abs(r5) <= daily * Math.sqrt(5) && Math.abs(r14) <= daily * Math.sqrt(14) ? 'TRUE' : 'FALSE';
+}
+
+// ─── Rule B-2: LONG trend filter, SHADOW only (frozen Nov 2, 2026) ───
+// Approved by Mr. T. Never changes a live call: /analyze logs what B-2
+// would say next to the live LONG call and both are graded the same way.
+// Live only with his OK after >=100 kept post-approval calls clear 60% (both
+// halves, and >=55% without the biggest ticker). Any change = new version.
+//   1  UP   + Gate 1 UPTREND            -> FLAT
+//   2  UP   + top 25% of 20-day range   -> FLAT
+//   3  DOWN + Gate 1 DOWNTREND          -> FLAT
+//   4  FLAT + Gate 1 UPTREND            -> DOWN (correction expected)
+const B2_VERSION = 'B-2';
+const B2_RANGE_SESSIONS = 20;
+const B2_RANGE_MIN_SESSIONS = 15;
+const B2_TOP_PCT = 75;
+// Call price's position in the range of the last 20 completed closes, 0-100
+// (above the high reads >100). null with fewer than 15 closes.
+function rangePosition(completedCloses: number[], price: number): number | null {
+  const c = (completedCloses || []).filter(x => typeof x === 'number' && x > 0).slice(-B2_RANGE_SESSIONS);
+  if (c.length < B2_RANGE_MIN_SESSIONS || !(price > 0)) return null;
+  const lo = Math.min(...c), hi = Math.max(...c);
+  if (hi === lo) return 100;
+  return +((price - lo) / (hi - lo) * 100).toFixed(1);
+}
+function ruleB2(verdict: string, trend: string | null, rangePos: number | null): { verdict: string; check: number | null } {
+  if (verdict === 'UP' && trend === 'UPTREND') return { verdict: 'FLAT', check: 1 };
+  if (verdict === 'UP' && rangePos != null && rangePos >= B2_TOP_PCT) return { verdict: 'FLAT', check: 2 };
+  if (verdict === 'DOWN' && trend === 'DOWNTREND') return { verdict: 'FLAT', check: 3 };
+  if (verdict === 'FLAT' && trend === 'UPTREND') return { verdict: 'DOWN', check: 4 };
+  return { verdict: verdict, check: null };
+}
+
 module.exports = {
+  B2_VERSION: B2_VERSION,
+  B2_TOP_PCT: B2_TOP_PCT,
+  rangePosition: rangePosition,
+  ruleB2: ruleB2,
+  gradeLongCall: gradeLongCall,
+  LONG_UP_MIN_5: LONG_UP_MIN_5,
+  LONG_UP_MIN_14: LONG_UP_MIN_14,
+  LONG_DOWN_MAX: LONG_DOWN_MAX,
   daySupersedeSplit: daySupersedeSplit,
   dropSupersededLong: dropSupersededLong,
   followRefreshChain: followRefreshChain,

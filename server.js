@@ -141,8 +141,9 @@ function horizonTargetFor(issuedAt, sessions) {
 // hours verdict is graded twice, the same way for every user and tier:
 //   day  = close of the session it was issued in (half credit if it touched
 //          +4% in the call's direction but closed wrong -- Aggressive's target)
-//   long = close of the 5th session after issue (half credit at +16% --
-//          Passive's target)
+//   long = 5th AND 14th session after issue, one merged TRUE/FALSE grade
+//          (Nov 1, 2026, ah.gradeLongCall -- Mr. T's rules; was: close of
+//          the 5th session, half credit at +16%)
 // FLAT uses the ticker's normal daily move as its band; the long window
 // scales that band by sqrt(5), since a 5-session move is naturally bigger
 // than a 1-day one (standard volatility-over-time scaling).
@@ -154,6 +155,8 @@ const GRADE_WINDOWS = {
   long: { sessions: 5, target: 16, flatScale: Math.sqrt(5),
           due: "long_due_at", date: "long_target_date", grade: "grade_long", ret: "return_long_pct", at: "graded_at_long" },
 };
+// The LONG grade's confirming window (Nov 1, 2026): the grade waits for it.
+const LONG_CONFIRM_SESSIONS = 14;
 function dayLongTargetFields(issuedAt) {
   const out = {};
   for (const w of Object.values(GRADE_WINDOWS)) {
@@ -161,6 +164,9 @@ function dayLongTargetFields(issuedAt) {
     out[w.date] = t.targetDate;
     out[w.due] = t.dueAt.toISOString();
   }
+  const c = horizonTargetFor(issuedAt, LONG_CONFIRM_SESSIONS);
+  out.long14_target_date = c.targetDate;
+  out.long14_due_at = c.dueAt.toISOString();
   return out;
 }
 
@@ -1923,6 +1929,13 @@ async function fetchTickerMetrics(symbol) {
 // reason to keep a dead fallback path for a 403 that isn't going away on
 // its own. adjustment=split avoids a stock split reading as a fake crash
 // in Gate 1's % change math.
+const dailyCloseLastDate = new Map(); // symbol -> "YYYY-MM-DD" of the last daily bar fetched
+// Daily closes without today's still-forming bar (rule B-2's 20-day range).
+function completedDailyCloses(symbol, closes) {
+  if (!Array.isArray(closes)) return null;
+  const today = etDateStr(new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" })));
+  return dailyCloseLastDate.get(symbol) === today ? closes.slice(0, -1) : closes;
+}
 async function fetchDailyCloses(symbol, lookbackDays = 130) {
   if (!alpacaKeys()) return null;
   try {
@@ -1935,6 +1948,9 @@ async function fetchDailyCloses(symbol, lookbackDays = 130) {
     );
     const bars = data.bars || [];
     if (bars.length < 2) return null;
+    // Rule B-2 (Nov 2, 2026) needs completed sessions only: remember the
+    // last bar's date so today's in-progress bar can be left out.
+    if (bars[bars.length - 1].t) dailyCloseLastDate.set(symbol, String(bars[bars.length - 1].t).slice(0, 10));
     return bars.map(b => b.c);
   } catch (e) {
     console.error(`fetchDailyCloses ${symbol}:`, e.message);
@@ -3386,8 +3402,11 @@ async function computeHistoricalReaction(symbol) {
   const cached = historicalReactionCache.get(symbol);
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
-    const { data, error } = await supabase.from("verdict_log").select("verdict, grade:grade_horizon")
-      .eq("ticker", symbol).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
+    // Nov 2, 2026 (Mr. T): the ticker card's TRACK RECORD is the one LONG
+    // grade (5 + 14 sessions), the same for every tier and dial setting --
+    // not each dial's own horizon.
+    const { data, error } = await supabase.from("verdict_log").select("verdict, grade:grade_long")
+      .eq("ticker", symbol).eq("superseded", false).eq("issued_market_open", true).not("grade_long", "is", null);
     if (error) { console.error(`computeHistoricalReaction ${symbol}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
     const result = stats.insufficientData ? null : {
@@ -3416,14 +3435,16 @@ async function computeHistoricalReaction(symbol) {
 // staying direction-agnostic. Same shape, same floor
 // (SCORECARD_TICKER_MIN_GRADED), same fail-safe-to-stale-cache posture.
 const directionalAccuracyCache = new Map(); // "symbol:direction" -> { data, time }
-async function computeDirectionalAccuracy(symbol, direction) {
+// gradeCol: "grade_horizon" (live confidence ceiling) or "grade_long" (Nov 2,
+// 2026 shadow: the same ceiling on the one LONG grade every surface shows).
+async function computeDirectionalAccuracy(symbol, direction, gradeCol = "grade_horizon") {
   if (!supabase) return null;
-  const key = `${symbol}:${direction}`;
+  const key = `${symbol}:${direction}:${gradeCol}`;
   const cached = directionalAccuracyCache.get(key);
   if (cached && Date.now() - cached.time < HISTORICAL_REACTION_CACHE_MAX_AGE_MS) return cached.data;
   try {
-    const { data, error } = await supabase.from("verdict_log").select("verdict, grade:grade_horizon")
-      .eq("ticker", symbol).eq("verdict", direction).eq("superseded", false).eq("issued_market_open", true).not("grade_horizon", "is", null);
+    const { data, error } = await supabase.from("verdict_log").select(`verdict, grade:${gradeCol}`)
+      .eq("ticker", symbol).eq("verdict", direction).eq("superseded", false).eq("issued_market_open", true).not(gradeCol, "is", null);
     if (error) { console.error(`computeDirectionalAccuracy ${symbol} ${direction}:`, error.message); return cached ? cached.data : null; }
     const stats = tickerStatsWithFloor(data || [], SCORECARD_TICKER_MIN_GRADED);
     const result = stats.insufficientData ? null : {
@@ -3776,14 +3797,19 @@ async function saveProxyResolution(symbol, resolved, trigger) {
 // from the same visitor or two different ones, so no supersession is
 // applied there (same "can't attribute, don't guess" posture as every
 // other anonymous-data limitation in this file).
-async function supersedeSameDayVerdicts(ticker, userEmail) {
-  if (!supabase || !userEmail) return;
+// Anonymous Free rows (no account) are scoped by device id since Nov 2,
+// 2026 -- Free sends its random per-install id with ANALYZE. Rows with
+// neither are still left alone (can't attribute, don't guess).
+async function supersedeSameDayVerdicts(ticker, userEmail, deviceId) {
+  if (!supabase || (!userEmail && !deviceId)) return;
   try {
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
-    await supabase.from("verdict_log")
+    let q = supabase.from("verdict_log")
       .update({ superseded: true })
-      .eq("ticker", ticker).eq("user_email", userEmail)
+      .eq("ticker", ticker);
+    q = userEmail ? q.eq("user_email", userEmail) : q.is("user_email", null).eq("device_id", deviceId);
+    await q
       .eq("superseded", false)
       .gte("issued_at", todayStart.toISOString());
   } catch (e) {
@@ -3800,7 +3826,7 @@ async function supersedeSameDayVerdicts(ticker, userEmail) {
 async function logVerdict(fields) {
   if (!supabase) return;
   try {
-    await supersedeSameDayVerdicts(fields.ticker, fields.userEmail || null);
+    await supersedeSameDayVerdicts(fields.ticker, fields.userEmail || null, fields.deviceId || null);
     const issuedAt = new Date();
     const dueAtPrimary = addHours(issuedAt, PRIMARY_GRADING_WINDOW_HOURS);
     const dueAtSecondary = addTradingDays(issuedAt, SECONDARY_GRADING_WINDOW_TRADING_DAYS);
@@ -3843,6 +3869,12 @@ async function logVerdict(fields) {
       grade_due_at:              dueAtPrimary.toISOString(),
       grade_due_at_secondary:    dueAtSecondary.toISOString(),
       user_email:                fields.userEmail || null,
+      device_id:                 fields.userEmail ? null : (fields.deviceId || null),
+      long_b2_verdict:           fields.longB2 ? fields.longB2.verdict : null,
+      long_b2_check:             fields.longB2 ? fields.longB2.check : null,
+      long_b2_range_pos:         fields.longB2 ? fields.longB2.rangePos : null,
+      long_b2_trend:             fields.longB2 ? fields.longB2.trend : null,
+      long_b2_version:           fields.longB2 ? ah.B2_VERSION : null,
       tier:                      fields.tier,
       issued_market_open:        marketOpenAtIssue,
       horizon_sessions:          marketOpenAtIssue ? horizonSessions : null,
@@ -3886,7 +3918,7 @@ async function recordDayCall(verdictLogId, windowBlock) {
 // a DAY call lands: among the account's same-UTC-day rows for the ticker
 // (same day scope as supersedeSameDayVerdicts), the latest DAY call stands
 // and earlier ones are marked day_superseded. A later LONG-only re-run (past
-// the 12:30 ET cutoff, no DAY call) never touches the morning's DAY call.
+// the 1:30 PM ET / 10:30 AM PT cutoff, no DAY call) never touches the morning's DAY call.
 async function markDaySuperseded(verdictLogId) {
   try {
     const { data: row } = await supabase.from("verdict_log")
@@ -4266,6 +4298,47 @@ async function backfillHorizonFields() {
 
 // Grades one window (day or long) for every due market-hours verdict. Same
 // close source, give-up rule and batching as gradeHorizonRows above.
+// LONG (Nov 1, 2026): one grade from the 5th and 14th session closes,
+// ah.gradeLongCall. Due once the 14th session has closed.
+async function gradeLongRows() {
+  const w = GRADE_WINDOWS.long;
+  const now = Date.now();
+  const { data: due, error } = await supabase
+    .from("verdict_log")
+    .select("id, ticker, verdict, issued_price, issued_at, long_target_date, long14_target_date, long14_due_at, long_b2_verdict")
+    .eq("issued_market_open", true)
+    .is(w.at, null)
+    .not("long14_due_at", "is", null)
+    .lte("long14_due_at", new Date(now).toISOString())
+    .order("long14_due_at", { ascending: true })
+    .limit(HORIZON_GRADING_BATCH_SIZE);
+  if (error) { console.error("gradeLongRows query:", error.message); return 0; }
+  if (!due || !due.length) return 0;
+  let graded = 0;
+  for (const row of due) {
+    const c5 = row.issued_price == null ? null : await fetchSessionClose(row.ticker, row.long_target_date);
+    const c14 = c5 == null ? null : await fetchSessionClose(row.ticker, row.long14_target_date);
+    if (c5 == null || c14 == null) {
+      const stale = row.issued_price == null || now - new Date(row.long14_due_at).getTime() > HORIZON_GIVE_UP_AFTER_MS;
+      if (stale) await supabase.from("verdict_log").update({ [w.at]: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const r5 = (c5 - row.issued_price) / row.issued_price * 100;
+    const r14 = (c14 - row.issued_price) / row.issued_price * 100;
+    let normal = null;
+    const isFlat = (v) => v != null && v !== "UP" && v !== "DOWN";
+    if (isFlat(row.verdict) || isFlat(row.long_b2_verdict)) {
+      const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
+      normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
+    }
+    const grade = ah.gradeLongCall(row.verdict, r5, r14, normal);
+    // Rule B-2 shadow graded by the same rule on the same moves.
+    const gradeB2 = row.long_b2_verdict ? ah.gradeLongCall(row.long_b2_verdict, r5, r14, normal) : null;
+    await supabase.from("verdict_log").update({ [w.ret]: r5, return_long14_pct: r14, [w.grade]: grade, grade_long_b2: gradeB2, [w.at]: new Date().toISOString() }).eq("id", row.id);
+    graded++;
+  }
+  return graded;
+}
 async function gradeWindowRows(kind) {
   const w = GRADE_WINDOWS[kind];
   const now = Date.now();
@@ -4396,7 +4469,7 @@ async function backfillDayLongFields() {
     .from("verdict_log")
     .select("id, issued_at")
     .eq("issued_market_open", true)
-    .is("day_due_at", null)
+    .or("day_due_at.is.null,long14_due_at.is.null")
     .limit(HORIZON_BACKFILL_BATCH_SIZE);
   if (error) { console.error("backfillDayLongFields query:", error.message); return 0; }
   if (!rows || !rows.length) return 0;
@@ -4618,7 +4691,7 @@ async function runVerdictGradingSweep() {
     const dayLongStamped = await backfillDayLongFields();
     if (dayLongStamped) console.log(`Verdict day/long backfill: ${dayLongStamped} row(s) stamped.`);
     const dayCount = await gradeUntilCaughtUp(() => gradeWindowRows("day"));
-    const longCount = await gradeUntilCaughtUp(() => gradeWindowRows("long"));
+    const longCount = await gradeUntilCaughtUp(gradeLongRows);
     const dayRecovered = await backfillDayCallsFromJobs();
     if (dayRecovered) console.log(`Day call backfill: ${dayRecovered} DAY read(s) attached from day_refinement_jobs.`);
     const dayCallCount = await gradeUntilCaughtUp(gradeDayCallRows);
@@ -6004,7 +6077,7 @@ async function fetchScorecardPool() {
   const data = [];
   for (let from = 0; ; from += 1000) {
     const { data: page, error } = await supabase
-      .from("verdict_log").select("id, ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, day_verdict, grade_day_call, return_day_call_pct, superseded")
+      .from("verdict_log").select("id, ticker, verdict, grade_day, grade_long, return_day_pct, return_long_pct, return_long14_pct, day_verdict, grade_day_call, return_day_call_pct, superseded")
       .eq("issued_market_open", true)
       .or("and(superseded.eq.false,or(grade_day.not.is.null,grade_long.not.is.null,grade_day_call.not.is.null)),and(day_superseded.eq.false,grade_day_call.not.is.null)")
       .order("id", { ascending: true }).range(from, from + 999);
@@ -6038,6 +6111,23 @@ function tileProof(rows, gradeKey, retKey, pct) {
     ? +(withRet.filter(r => Number(r[retKey]) > 0).length / withRet.length * 100).toFixed(1)
     : null;
   return { margin, alwaysUpPct };
+}
+// LONG tile proof (Nov 1, 2026). Under the 5+14 rules UP and DOWN have very
+// different base rates (a random stock clears the UP bar ~20% of the time,
+// the DOWN bar ~50%), so "always UP" no longer says anything. Baseline =
+// "random pick": for each graded call, how often ANY graded stock in the
+// pool passed that call's rule; averaged over the calls.
+function longTileProof(pool, directional, pct) {
+  const proof = tileProof(directional, "grade_long", "return_long_pct", pct);
+  if (!proof) return null;
+  const moves = pool.filter(r => r.return_long_pct != null && r.return_long14_pct != null)
+    .map(r => [Number(r.return_long_pct), Number(r.return_long14_pct)]);
+  const graded = directional.filter(r => GRADE_CREDIT[r.grade_long] != null);
+  if (!moves.length || !graded.length) return { margin: proof.margin, randomPct: null };
+  const passRate = (v) => moves.filter(([a, b]) => ah.gradeLongCall(v, a, b, null) === "TRUE").length / moves.length;
+  const rate = { UP: passRate("UP"), DOWN: passRate("DOWN") };
+  const randomPct = +(graded.reduce((a, r) => a + rate[r.verdict], 0) / graded.length * 100).toFixed(1);
+  return { margin: proof.margin, randomPct };
 }
 const isDirectional = (r) => r.verdict === "UP" || r.verdict === "DOWN";
 // Oct 27, 2026: the Day tile grades the DAY call itself (Pro, Gate 3
@@ -6093,7 +6183,7 @@ app.get("/scorecard", async (req, res) => {
     // Range + always-UP comparison are Pro/Shark only (tierConfig.tracker).
     const proof = req.tierConfig?.tracker
       ? { day: tileProof(directionalDay, "grade_day_call", "return_day_call_pct", day.pct),
-          long: tileProof(directional, "grade_long", "return_long_pct", long.pct) }
+          long: longTileProof(pool, directional, long.pct) }
       : undefined;
     res.json({
       scope: "pooled",
@@ -6224,11 +6314,13 @@ app.get("/dial-audit", async (req, res) => {
     await syncInferredDialChanges(req.userEmail);
     const changes = await fetchDialChanges(req.userEmail);
     const { data: rows, error } = await supabase.from("verdict_log")
-      .select("issued_at, dial_position, verdict, grade_horizon, path_outcome")
-      .eq("user_email", req.userEmail).eq("superseded", false).eq("issued_market_open", true)
-      .not("grade_horizon", "is", null).order("issued_at", { ascending: true }).limit(5000);
+      // Nov 2, 2026 (Mr. T): the same LONG and DAY grades as the Scorecard,
+      // not each dial's own horizon or stop-out path.
+      .select("issued_at, dial_position, verdict, grade_long, day_verdict, grade_day_call, superseded")
+      .eq("user_email", req.userEmail).eq("issued_market_open", true)
+      .or(DAY_OR_LONG_STANDS).order("issued_at", { ascending: true }).limit(5000);
     if (error) throw new Error(error.message);
-    const body = { ...learn.dialAuditSummary(changes, rows || []), minGraded: SCORECARD_TICKER_MIN_GRADED };
+    const body = { ...learn.dialAuditSummary(changes, ah.dropSupersededLong(rows || [])), minGraded: SCORECARD_TICKER_MIN_GRADED };
     dialAuditCache.set(req.userEmail, { at: Date.now(), body });
     res.json(body);
   } catch (e) {
@@ -6706,7 +6798,7 @@ function buildWindowBlock(win, long, opts) {
     : win.state === "FORMING"
       ? { status: null, note: win.fetchFailed ? "Bar data unavailable right now." : `${win.barsDone}/${win.barsNeeded} ${(win.schedule && win.schedule.barMinutes) || 15}-min bars done. Day read at ${ptClock(win.readyAt)}.` }
       : win.state === "EXPIRED"
-        ? { status: null, note: "Day window passed (9:30 AM PT). Long verdict only." }
+        ? { status: null, note: "Day window passed (10:30 AM PT). Long verdict only." }
         : { status: null, note: "Market closed. Long verdict only." };
   const day = win.state === "RESOLVED" ? g3w.refineDayVerdict(long, win.seq, opts) : null;
   return {
@@ -6735,7 +6827,7 @@ async function catalystKey(symbol) {
   return `${e.data?.headline || ""}|${pg?.status || ""}`;
 }
 
-// Per-user verdict cache. Same candle -> reuse. After the 9:30 PT cutoff ->
+// Per-user verdict cache. Same candle -> reuse. After the 10:30 AM PT cutoff ->
 // reuse a cached Long made after the cutoff, if the catalyst check passes
 // and Gate 0 hasn't changed. Anything else -> a fresh analysis.
 const windowVerdictCache = new Map(); // wkey -> { result, dateET, candleKey, postCutoff, catalyst, gate0 }
@@ -6849,7 +6941,10 @@ app.get("/day/:ticker", async (req, res) => {
 const ANALYSIS_UNAVAILABLE_MSG = "Analysis is temporarily unavailable. You weren't charged a credit \u2014 please try again later.";
 
 app.post("/analyze", async (req, res) => {
-  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData, dialPosition, holdThroughEarnings, stream } = req.body;
+  const { ticker, sectorContext, marketContext, metricsData, newsData, openingBarData, proxyRule, gate1Data, preGateData, weeklyCarryoverData, regimeData, dialPosition, holdThroughEarnings, stream, deviceId } = req.body;
+  // Anonymous Free calls carry the device id (Nov 2, 2026) so "last call of
+  // the day counts" applies per device, like it does per signed-in account.
+  const anonDeviceId = !req.userEmail && typeof deviceId === "string" && DEVICE_ID_RE.test(deviceId) ? deviceId.toLowerCase() : null;
   if (!ticker) return res.status(400).json({ error: "ticker is required" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
@@ -7497,6 +7592,7 @@ Return only single-line minified JSON.
       // a stronger intervention). Only queried when it could actually
       // matter -- a clean HIGH on a real UP/DOWN call -- so the common
       // non-HIGH case costs zero extra Supabase load.
+      const confidenceBeforeHistCeiling = parsed.confidence;
       if (parsed.confidence === "HIGH" && (parsed.verdict === "UP" || parsed.verdict === "DOWN")) {
         const directionalAccuracy = await computeDirectionalAccuracy(ticker.toUpperCase(), parsed.verdict);
         parsed.confidence = ah.applyHistoricalAccuracyCeiling(parsed.confidence, directionalAccuracy?.directionalPct);
@@ -7585,6 +7681,25 @@ Return only single-line minified JSON.
         }
         logInputs.confidence_v2 = v2;
       } catch (e) { logInputs.confidence_v2 = null; }
+      // Shadow (Nov 2, 2026): the same historical ceiling read from the LONG
+      // grade instead of the dial horizon. Logged only; the live ceiling is
+      // unchanged until Mr. T approves switching it.
+      try {
+        if (confidenceBeforeHistCeiling === "HIGH" && (parsed.verdict === "UP" || parsed.verdict === "DOWN")) {
+          const accL = await computeDirectionalAccuracy(ticker.toUpperCase(), parsed.verdict, "grade_long");
+          logInputs.conf_ceiling_long = { pct: accL ? accL.directionalPct : null, n: accL ? accL.gradedCount : 0,
+            would: ah.applyHistoricalAccuracyCeiling("HIGH", accL ? accL.directionalPct : undefined) };
+        }
+      } catch (e) { /* shadow only */ }
+      // Rule B-2 shadow (frozen Nov 2, 2026; ah.ruleB2): what the LONG call
+      // would be under the trend filter, from inputs known right now.
+      let longB2 = null;
+      try {
+        const cachedCloses = symbolMarketCache.get(T) && symbolMarketCache.get(T).data ? symbolMarketCache.get(T).data.dailyCloses : null;
+        const rangePos = ah.rangePosition(completedDailyCloses(T, cachedCloses), metricsData?.price);
+        const trend = gate1Result.branch === "UPTREND" || gate1Result.branch === "DOWNTREND" ? gate1Result.branch : null;
+        longB2 = { ...ah.ruleB2(parsed.verdict, trend, rangePos), rangePos, trend };
+      } catch (e) { longB2 = null; }
       const verdictLogId = await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
         issuedPrice: typeof metricsData?.price === "number" ? metricsData.price : null,
@@ -7608,7 +7723,7 @@ Return only single-line minified JSON.
           // Oct 19, 2026: the numbers behind each color (ah.gateInputsForLog).
           inputs: logInputs,
         }),
-        userEmail: req.userEmail, tier: req.userTier,
+        userEmail: req.userEmail, tier: req.userTier, deviceId: anonDeviceId, longB2,
         day: result.window && result.window.day ? { ...result.window.day, asOf: result.window.asOf, entryPrice: result.window.dayEntryPrice } : null,
       });
       // Saved after the log row exists so a DAY read that lands later can be

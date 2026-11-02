@@ -3875,6 +3875,11 @@ async function logVerdict(fields) {
       long_b2_range_pos:         fields.longB2 ? fields.longB2.rangePos : null,
       long_b2_trend:             fields.longB2 ? fields.longB2.trend : null,
       long_b2_version:           fields.longB2 ? ah.B2_VERSION : null,
+      // LONG bracket shadow (patch32). Columns must exist before this deploys.
+      long_bracket_verdict:      fields.longBracket ? fields.longBracket.verdict : null,
+      long_bracket_score:        fields.longBracket ? fields.longBracket.score : null,
+      long_bracket_version:      fields.longBracket ? ah.BRACKET_VERSION : null,
+      long_bracket_source:       fields.longBracket ? "live" : null,
       tier:                      fields.tier,
       issued_market_open:        marketOpenAtIssue,
       horizon_sessions:          marketOpenAtIssue ? horizonSessions : null,
@@ -4305,7 +4310,7 @@ async function gradeLongRows() {
   const now = Date.now();
   const { data: due, error } = await supabase
     .from("verdict_log")
-    .select("id, ticker, verdict, issued_price, issued_at, long_target_date, long14_target_date, long14_due_at, long_b2_verdict")
+    .select("id, ticker, verdict, issued_price, issued_at, long_target_date, long14_target_date, long14_due_at, long_b2_verdict, long_bracket_verdict")
     .eq("issued_market_open", true)
     .is(w.at, null)
     .not("long14_due_at", "is", null)
@@ -4327,17 +4332,48 @@ async function gradeLongRows() {
     const r14 = (c14 - row.issued_price) / row.issued_price * 100;
     let normal = null;
     const isFlat = (v) => v != null && v !== "UP" && v !== "DOWN";
-    if (isFlat(row.verdict) || isFlat(row.long_b2_verdict)) {
+    if (isFlat(row.verdict) || isFlat(row.long_b2_verdict) || isFlat(row.long_bracket_verdict)) {
       const issueDate = etDateStr(new Date(new Date(row.issued_at).toLocaleString("en-US", { timeZone: "America/New_York" })));
       normal = await fetchNormalDailyMovePct(row.ticker, issueDate);
     }
     const grade = ah.gradeLongCall(row.verdict, r5, r14, normal);
     // Rule B-2 shadow graded by the same rule on the same moves.
     const gradeB2 = row.long_b2_verdict ? ah.gradeLongCall(row.long_b2_verdict, r5, r14, normal) : null;
-    await supabase.from("verdict_log").update({ [w.ret]: r5, return_long14_pct: r14, [w.grade]: grade, grade_long_b2: gradeB2, [w.at]: new Date().toISOString() }).eq("id", row.id);
+    const gradeBracket = row.long_bracket_verdict ? ah.gradeLongCall(row.long_bracket_verdict, r5, r14, normal) : null;
+    await supabase.from("verdict_log").update({ [w.ret]: r5, return_long14_pct: r14, [w.grade]: grade, grade_long_b2: gradeB2, grade_long_bracket: gradeBracket, [w.at]: new Date().toISOString() }).eq("id", row.id);
     graded++;
   }
   return graded;
+}
+// LONG bracket backfill (Nov 2, 2026, Mr. T): scores already-graded LONG
+// calls with ah.longBracket from their stored Gate 1 branch + Pre-Gate, and
+// grades that verdict on the same stored 5/14-session returns. Marked
+// source 'backfill' so the readout keeps these in-sample rows apart from
+// calls made after approval. FLAT uses the row's stored band (flat_band_pct
+// is half the normal daily move), else the fallback.
+async function backfillLongBracket() {
+  const { data: rows, error } = await supabase
+    .from("verdict_log")
+    .select("id, gate1_branch, pre_gate_state, return_long_pct, return_long14_pct, flat_band_pct")
+    .eq("issued_market_open", true)
+    .is("long_bracket_verdict", null)
+    .not("grade_long", "is", null)
+    .not("return_long14_pct", "is", null)
+    .limit(500);
+  if (error) { console.error("backfillLongBracket query:", error.message); return 0; }
+  let n = 0;
+  for (const r of rows || []) {
+    const b = ah.longBracket(r.gate1_branch || null, r.pre_gate_state || null);
+    const normal = r.flat_band_pct != null ? Number(r.flat_band_pct) * 2 : null;
+    const grade = ah.gradeLongCall(b.verdict, Number(r.return_long_pct), Number(r.return_long14_pct), normal);
+    const { error: e } = await supabase.from("verdict_log").update({
+      long_bracket_verdict: b.verdict, long_bracket_score: b.score, long_bracket_version: ah.BRACKET_VERSION,
+      long_bracket_source: "backfill", grade_long_bracket: grade,
+    }).eq("id", r.id);
+    if (e) { console.error("backfillLongBracket update:", e.message); break; }
+    n++;
+  }
+  return n;
 }
 async function gradeWindowRows(kind) {
   const w = GRADE_WINDOWS[kind];
@@ -4692,6 +4728,8 @@ async function runVerdictGradingSweep() {
     if (dayLongStamped) console.log(`Verdict day/long backfill: ${dayLongStamped} row(s) stamped.`);
     const dayCount = await gradeUntilCaughtUp(() => gradeWindowRows("day"));
     const longCount = await gradeUntilCaughtUp(gradeLongRows);
+    const bracketBackfilled = await backfillLongBracket();
+    if (bracketBackfilled) console.log(`LONG bracket backfill: ${bracketBackfilled} graded call(s) scored.`);
     const dayRecovered = await backfillDayCallsFromJobs();
     if (dayRecovered) console.log(`Day call backfill: ${dayRecovered} DAY read(s) attached from day_refinement_jobs.`);
     const dayCallCount = await gradeUntilCaughtUp(gradeDayCallRows);
@@ -7283,6 +7321,11 @@ Run Gates 2 and 3 only. Pre-Gate, Gate 0, Gate 1, Gate 4, and Gate 5 are provide
 Return only single-line minified JSON.
 `;
 
+  // LONG bracket shadow (BR-1, ah.longBracket): scored from gate data that
+  // exists before the model runs. Logged only; never changes the call.
+  let longBracketPre = null;
+  try { longBracketPre = ah.longBracket(gate1Result.branch || null, preGateResult.status || null); } catch (e) { longBracketPre = null; }
+
   try {
     await ensureAnalyzeCacheWarm(apiKey);
     const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
@@ -7434,7 +7477,10 @@ Return only single-line minified JSON.
       // ── SERVER ENFORCEMENT: Gate 5 ───────────────────────────────
       const g2Status = parsed.gates?.g2_catalyst?.status || "GREEN";
       let gate5ForceDown = false;
-      if (gate5Result.status === "RED" && gate5Auth.authorized) {
+      // Gate 0 RED / Gate 1 breakdown already forced DOWN "regardless of any
+      // other gate" -- Gate 5 must not reset it (Nov 2, 2026, ah.gate5MayOverride).
+      const gate5Applies = ah.gate5MayOverride(gate0Status, !!gate1Result.forceDown);
+      if (gate5Applies && gate5Result.status === "RED" && gate5Auth.authorized) {
         // Korea/Taiwan-gated hard trigger, or a dynamically-resolved primary
         // proxy (Patch 2) — both can force DOWN alone, same override
         // authority as Gate 0 RED / Gate 1 forceDown. For the fixed
@@ -7488,7 +7534,7 @@ Return only single-line minified JSON.
           parsed.reason      = `Gate 5 forceDown — ${gate5Result.note}`;
           parsed.wait_for    = `${rule.proxy.name} must stabilize before re-evaluating.`;
         }
-      } else if (gate5Result.status === "RED") {
+      } else if (gate5Applies && gate5Result.status === "RED") {
         // Not independently exempt — original congruency-only handling.
         // Gate 5 RED alone = FLAT (sector stress, not confirmed downtrend)
         // Gate 5 RED + Gate 2 RED = DOWN (double negative, congruent bearish)
@@ -7700,6 +7746,13 @@ Return only single-line minified JSON.
         const trend = gate1Result.branch === "UPTREND" || gate1Result.branch === "DOWNTREND" ? gate1Result.branch : null;
         longB2 = { ...ah.ruleB2(parsed.verdict, trend, rangePos), rangePos, trend };
       } catch (e) { longB2 = null; }
+      if (longBracketPre) {
+        try {
+          logInputs.long_bracket = { ...longBracketPre, version: ah.BRACKET_VERSION,
+            ...ah.bracketLanesForLog(metricsData?.rangePosition, parsed.gates?.g2_catalyst?.status || null),
+            confirms_up: parsed.verdict === "UP" && longBracketPre.verdict === "UP" };
+        } catch (e) { /* shadow only */ }
+      }
       const verdictLogId = await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
         issuedPrice: typeof metricsData?.price === "number" ? metricsData.price : null,
@@ -7723,7 +7776,7 @@ Return only single-line minified JSON.
           // Oct 19, 2026: the numbers behind each color (ah.gateInputsForLog).
           inputs: logInputs,
         }),
-        userEmail: req.userEmail, tier: req.userTier, deviceId: anonDeviceId, longB2,
+        userEmail: req.userEmail, tier: req.userTier, deviceId: anonDeviceId, longB2, longBracket: longBracketPre,
         day: result.window && result.window.day ? { ...result.window.day, asOf: result.window.asOf, entryPrice: result.window.dayEntryPrice } : null,
       });
       // Saved after the log row exists so a DAY read that lands later can be

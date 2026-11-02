@@ -714,6 +714,40 @@ function ruleB2(verdict: string, trend: string | null, rangePos: number | null):
   return { verdict: verdict, check: null };
 }
 
+// ─── LONG bracket: SHADOW only (BR-1, frozen Nov 2, 2026) ───
+// Approved by Mr. T. Scores the LONG call from gate data that exists BEFORE
+// the model runs, so a live UP can be checked against it ("confirmed before
+// AI"). Never changes a live call; graded by the same 5+14 rule.
+// Backtest on 714 graded calls (Aug 26-Oct 12): +8.5 pts over random pick vs
+// live +2.6, positive in all four quarters; in-sample, one falling stretch.
+//   trend  (Gate 1): UPTREND -1, DOWNTREND +1  (5-14 sessions snap back)
+//   filing (Pre-Gate): RED -2, YELLOW -1
+//   score >= +1 UP, <= -1 DOWN, 0 FLAT
+// range52 (Gate 4) and catalyst (model's Gate 2) are logged per call but
+// NOT scored: they weren't stored on the backtest rows. A version that
+// scores them is a new version and its test starts over.
+const BRACKET_VERSION = 'BR-1';
+function longBracket(gate1Branch: string | null, preGateStatus: string | null): { verdict: string; score: number; trend: number; filing: number } {
+  const trend = gate1Branch === 'UPTREND' ? -1 : gate1Branch === 'DOWNTREND' ? 1 : 0;
+  const filing = preGateStatus === 'RED' ? -2 : preGateStatus === 'YELLOW' ? -1 : 0;
+  const score = trend + filing;
+  return { verdict: score >= 1 ? 'UP' : score <= -1 ? 'DOWN' : 'FLAT', score: score, trend: trend, filing: filing };
+}
+// Record-only lane values for a future version (see above).
+function bracketLanesForLog(rangePosition: any, g2Status: string | null): { range52: number | null; catalyst: number | null } {
+  const rp = Number(rangePosition);
+  const range52 = rangePosition == null || !isFinite(rp) ? null : rp > 70 ? -1 : rp < 30 ? 1 : 0;
+  const catalyst = g2Status === 'GREEN' ? 1 : g2Status === 'RED' ? -1 : g2Status === 'YELLOW' ? 0 : null;
+  return { range52: range52, catalyst: catalyst };
+}
+
+// Gate 0 RED and the Gate 1 breakdown force DOWN "regardless of any other
+// gate". Gate 5's branch runs after them and must not reset that verdict
+// (its coherence check could turn it FLAT). Nov 2, 2026, Mr. T.
+function gate5MayOverride(gate0Status: string | null, gate1ForceDown: boolean): boolean {
+  return gate0Status !== 'RED' && !gate1ForceDown;
+}
+
 // ET's UTC offset ("-04:00" in EDT, "-05:00" in EST) for an ET calendar date
 // "YYYY-MM-DD", read at noon UTC that day (well clear of the 2am switch).
 // fetchOpeningBar used to type "-04:00" in, so after DST ended its 9:30
@@ -732,6 +766,10 @@ function sessionOpenIso(dateStr: string): string {
 module.exports = {
   etOffsetIso: etOffsetIso,
   sessionOpenIso: sessionOpenIso,
+  BRACKET_VERSION: BRACKET_VERSION,
+  longBracket: longBracket,
+  bracketLanesForLog: bracketLanesForLog,
+  gate5MayOverride: gate5MayOverride,
   B2_VERSION: B2_VERSION,
   B2_TOP_PCT: B2_TOP_PCT,
   rangePosition: rangePosition,

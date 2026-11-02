@@ -546,6 +546,31 @@ test("ruleB2: the four frozen checks, nothing else", () => {
   assert.deepStrictEqual(ah.ruleB2("UP", null, null), { verdict: "UP", check: null }); // missing inputs never filter
 });
 
+test('longBracket BR-1: Gate 1 trend (contrarian) + Pre-Gate, scored before the model', () => {
+  assert.equal(ah.BRACKET_VERSION, 'BR-1');
+  assert.deepEqual(ah.longBracket('DOWNTREND', 'GREEN'), { verdict: 'UP', score: 1, trend: 1, filing: 0 });
+  assert.deepEqual(ah.longBracket('UPTREND', 'GREEN'), { verdict: 'DOWN', score: -1, trend: -1, filing: 0 });
+  assert.equal(ah.longBracket('DOWNTREND', 'YELLOW').verdict, 'FLAT'); // +1 -1
+  assert.equal(ah.longBracket('DOWNTREND', 'RED').verdict, 'DOWN');    // +1 -2
+  assert.equal(ah.longBracket('FLAT', 'GREEN').verdict, 'FLAT');
+  assert.equal(ah.longBracket(null, null).verdict, 'FLAT');            // missing data never makes a call
+  assert.equal(ah.longBracket('FLAT', 'YELLOW').verdict, 'DOWN');
+});
+
+test('bracketLanesForLog: record-only range52 and catalyst lanes', () => {
+  assert.deepEqual(ah.bracketLanesForLog(85, 'GREEN'), { range52: -1, catalyst: 1 });
+  assert.deepEqual(ah.bracketLanesForLog(10, 'RED'), { range52: 1, catalyst: -1 });
+  assert.deepEqual(ah.bracketLanesForLog(50, 'YELLOW'), { range52: 0, catalyst: 0 });
+  assert.deepEqual(ah.bracketLanesForLog(null, undefined), { range52: null, catalyst: null });
+});
+
+test('gate5MayOverride: Gate 5 never resets a Gate 0 RED or Gate 1 breakdown DOWN', () => {
+  assert.equal(ah.gate5MayOverride('RED', false), false);
+  assert.equal(ah.gate5MayOverride('GREEN', true), false);
+  assert.equal(ah.gate5MayOverride('YELLOW', false), true);
+  assert.equal(ah.gate5MayOverride(null, false), true);
+});
+
 test('sessionOpenIso / etOffsetIso: 9:30 ET open follows DST (Nov 2, 2026 fix)', () => {
   assert.equal(ah.etOffsetIso('2026-10-30'), '-04:00'); // last Friday of EDT
   assert.equal(ah.etOffsetIso('2026-11-01'), '-05:00'); // switch day: 9:30 is EST

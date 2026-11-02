@@ -582,3 +582,61 @@ test('sessionOpenIso / etOffsetIso: 9:30 ET open follows DST (Nov 2, 2026 fix)',
   assert.equal(new Date(ah.sessionOpenIso('2026-11-02')).toISOString(), '2026-11-02T14:30:00.000Z');
   assert.equal(new Date(ah.sessionOpenIso('2026-10-30')).toISOString(), '2026-10-30T13:30:00.000Z');
 });
+
+// ── Ticker news relevance (Nov 2, 2026) ──
+{
+  const ah2 = require("../analyze-helpers");
+  const test2 = require("node:test");
+  const assert2 = require("node:assert");
+  const H = 3600000, now = Date.now();
+  test2("news: unrelated newest article loses to an older one about the company (BB case)", () => {
+    const pool = [
+      { headline: "Paramount Global Says Nickelodeon Added Spin Master's Unicorn Academy and Vida the Vet to July Lineup", url: "u1", timeMs: now - 70 * H, symbols: ["PARA", "TOY", "BB"] },
+      { headline: "BlackBerry Limited (BB) is Attracting Investor Attention: Here is What You Should Know", url: "u2", timeMs: now - 75 * H },
+    ];
+    const best = ah2.pickRelevantNews(pool, "BB", "BlackBerry Ltd");
+    assert2.strictEqual(best.url, "u2");
+    assert2.strictEqual(best.tier, 3);
+  });
+  test2("news: nothing relevant -> null (never the unrelated newest)", () => {
+    const pool = [{ headline: "Paramount adds shows to Nick Jr.", url: "u1", timeMs: now, symbols: ["PARA", "BB"] }];
+    assert2.strictEqual(ah2.pickRelevantNews(pool, "BB", "BlackBerry Ltd"), null);
+  });
+  test2("news: short tickers only count in ticker form", () => {
+    assert2.strictEqual(ah2.textNamesTicker("Stocks ON the move today", "ON", []), false);
+    assert2.strictEqual(ah2.textNamesTicker("onsemi (ON) beats estimates", "ON", []), true);
+    assert2.strictEqual(ah2.textNamesTicker("Should BlackBerry (TSX:BB) Investors Read Into Its New Board", "BB", []), true);
+    assert2.strictEqual(ah2.textNamesTicker("Why $NU shares jumped", "NU", []), true);
+    assert2.strictEqual(ah2.textNamesTicker("STWD raises dividend", "STWD", []), true);
+  });
+  test2("news: company-name variants", () => {
+    assert2.deepStrictEqual(ah2.companyNameVariants("Nu Holdings Ltd"), ["Nu Holdings"]);
+    assert2.ok(ah2.companyNameVariants("Robinhood Markets Inc").includes("Robinhood"));
+    assert2.ok(!ah2.companyNameVariants("Energy Transfer LP").includes("Energy"));
+    assert2.ok(ah2.companyNameVariants("Energy Transfer LP").includes("Energy Transfer"));
+    assert2.ok(ah2.textNamesTicker("Robinhood launches new app", "HOOD", ah2.companyNameVariants("Robinhood Markets Inc")));
+    assert2.ok(!ah2.textNamesTicker("Energy stocks rally", "ET", ah2.companyNameVariants("Energy Transfer LP")));
+  });
+  test2("news: summary mention (tier 2) and a sole feed tag (tier 1) rank below a headline mention", () => {
+    const pool = [
+      { headline: "Chip stocks rally", summary: "Astera Labs led the group.", url: "a", timeMs: now - 1 * H },
+      { headline: "Market wrap", url: "b", timeMs: now, symbols: ["ALAB"] },
+      { headline: "Astera Labs unveils new switch", url: "c", timeMs: now - 50 * H },
+    ];
+    assert2.strictEqual(ah2.pickRelevantNews(pool, "ALAB", "Astera Labs Inc").url, "c");
+    assert2.strictEqual(ah2.pickRelevantNews(pool.slice(0, 2), "ALAB", "Astera Labs Inc").url, "a");
+    assert2.strictEqual(ah2.pickRelevantNews(pool.slice(1, 2), "ALAB", "Astera Labs Inc").url, "b");
+  });
+  test2("news: newest wins within a tier", () => {
+    const pool = [
+      { headline: "Zillow (Z) stock falls", url: "old", timeMs: now - 90 * H },
+      { headline: "Zillow Group earnings preview", url: "new", timeMs: now - 2 * H },
+    ];
+    assert2.strictEqual(ah2.pickRelevantNews(pool, "Z", "Zillow Group Inc").url, "new");
+  });
+}
+require("node:test")("news: exchange prefix counts only for US/TSX listings", () => {
+  const ah3 = require("../analyze-helpers"), a3 = require("node:assert");
+  a3.strictEqual(ah3.textNamesTicker("Admiral Group (LSE:ADM) Stock Fair Value Rises", "ADM", []), false);
+  a3.strictEqual(ah3.textNamesTicker("Gentex (NASDAQ:GNTX) Offers Value", "GNTX", []), true);
+});

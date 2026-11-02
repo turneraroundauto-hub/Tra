@@ -2142,30 +2142,35 @@ function isHeadlineRelevant(headline, symbol, companyName) {
   return new RegExp("\\b" + core.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i").test(h);
 }
 
-async function fetchFinnhubNews(symbol, companyName) {
+// Finnhub /company-news for a symbol over the last `hours`: every article,
+// newest first, as relevance candidates (pickRelevantNews decides).
+async function fetchFinnhubNewsPool(symbol, hours) {
   try {
-    const now    = new Date();
-    const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
-    const from   = cutoff.toISOString().split("T")[0];
-    const to     = now.toISOString().split("T")[0];
-    const data   = await finnhubGet(`/company-news?symbol=${symbol}&from=${from}&to=${to}`);
-    if (!Array.isArray(data) || !data.length) return null;
-    const filtered = data
-      .filter(i => (now - new Date(i.datetime * 1000)) / 3600000 <= MAX_NEWS_AGE_HOURS)
-      .sort((a, b) => b.datetime - a.datetime);
-    if (!filtered.length) return null;
-    const item = (companyName ? filtered.find(i => isHeadlineRelevant(i.headline, symbol, companyName)) : null) || filtered[0];
-    const ageHrs = Math.round((now - new Date(item.datetime * 1000)) / 3600000);
-    return {
-      headline: item.headline,
-      url:      item.url,
-      source:   item.source,
-      ageLabel: ageHrs < 1 ? "just now"
-        : ageHrs < 24 ? `${ageHrs}h ago`
-        : `${Math.floor(ageHrs / 24)}d ago`,
-      ageHours: ageHrs,
-    };
-  } catch(e) { return null; }
+    const now  = new Date();
+    const from = new Date(now.getTime() - hours * 3600000).toISOString().split("T")[0];
+    const to   = now.toISOString().split("T")[0];
+    const data = await finnhubGet(`/company-news?symbol=${symbol}&from=${from}&to=${to}`);
+    if (!Array.isArray(data)) return [];
+    return data
+      .map(i => ({ headline: i.headline, summary: i.summary || "", url: i.url, source: i.source, timeMs: (i.datetime || 0) * 1000, symbols: null }))
+      .filter(a => a.headline && a.url && a.timeMs > 0 && (now - a.timeMs) / 3600000 <= hours);
+  } catch (e) {
+    console.error(`fetchFinnhubNewsPool ${symbol}:`, e.message);
+    return [];
+  }
+}
+
+function newsResult(item) {
+  const ageHrs = Math.max(0, Math.round((Date.now() - item.timeMs) / 3600000));
+  return {
+    headline: item.headline,
+    url:      item.url,
+    source:   item.source,
+    ageLabel: ageHrs < 1 ? "just now"
+      : ageHrs < 24 ? `${ageHrs}h ago`
+      : `${Math.floor(ageHrs / 24)}d ago`,
+    ageHours: ageHrs,
+  };
 }
 
 // Second news source, Alpaca's /v1beta1/news (Benzinga-sourced, same
@@ -2184,35 +2189,21 @@ async function fetchFinnhubNews(symbol, companyName) {
 // from this sandbox. Fails safe (null) on any error including a 403 if the
 // account genuinely lacks the entitlement -- confirm after deploy that a
 // real symbol returns a real headline, not just silent nulls.
-async function fetchAlpacaNews(symbol, companyName) {
-  if (!alpacaKeys()) return null;
+async function fetchAlpacaNewsPool(symbol, hours) {
+  if (!alpacaKeys()) return [];
   try {
     const now    = new Date();
-    const cutoff = new Date(now.getTime() - MAX_NEWS_AGE_HOURS * 3600000);
+    const cutoff = new Date(now.getTime() - hours * 3600000);
     const data   = await alpacaGet(
-      `/v1beta1/news?symbols=${symbol}&start=${cutoff.toISOString()}&end=${now.toISOString()}&limit=10&sort=desc`
+      `/v1beta1/news?symbols=${symbol}&start=${cutoff.toISOString()}&end=${now.toISOString()}&limit=50&sort=desc`
     );
-    const articles = data?.news;
-    if (!Array.isArray(articles) || !articles.length) return null;
-    // sort=desc -> most recent first; prefer a relevant one among the
-    // fetched batch (see isHeadlineRelevant), same fallback posture as
-    // fetchFinnhubNews.
-    const item = (companyName ? articles.find(a => isHeadlineRelevant(a.headline, symbol, companyName)) : null) || articles[0];
-    const itemTime = new Date(item.created_at);
-    const ageHrs   = Math.round((now - itemTime) / 3600000);
-    if (!(ageHrs <= MAX_NEWS_AGE_HOURS)) return null; // guards against a bad/missing created_at too (NaN comparisons are always false)
-    return {
-      headline: item.headline,
-      url:      item.url,
-      source:   item.source || "Benzinga",
-      ageLabel: ageHrs < 1 ? "just now"
-        : ageHrs < 24 ? `${ageHrs}h ago`
-        : `${Math.floor(ageHrs / 24)}d ago`,
-      ageHours: ageHrs,
-    };
-  } catch(e) {
-    console.error(`fetchAlpacaNews ${symbol}:`, e.message);
-    return null;
+    const articles = Array.isArray(data?.news) ? data.news : [];
+    return articles
+      .map(a => ({ headline: a.headline, summary: a.summary || "", url: a.url, source: a.source || "Benzinga", timeMs: new Date(a.created_at).getTime(), symbols: Array.isArray(a.symbols) ? a.symbols : null }))
+      .filter(a => a.headline && a.url && Number.isFinite(a.timeMs));
+  } catch (e) {
+    console.error(`fetchAlpacaNewsPool ${symbol}:`, e.message);
+    return [];
   }
 }
 
@@ -2253,11 +2244,14 @@ async function upsertNewsCache(symbol, item) {
   }
 }
 
-async function readNewsCacheFallback(symbol) {
+async function readNewsCacheFallback(symbol, companyName) {
   if (!supabase) return null;
   try {
     const { data } = await supabase.from("news_cache").select("*").eq("ticker", symbol).maybeSingle();
     if (!data || !data.headline || !data.published_at) return null;
+    // A cached article from before Nov 2, 2026 may be a loosely tagged,
+    // unrelated story: it only comes back if it is actually about the ticker.
+    if (ah.newsRelevanceTier({ headline: data.headline, url: data.url, timeMs: 0 }, symbol, companyName) < 3) return null;
     const ageHrs = Math.round((Date.now() - new Date(data.published_at).getTime()) / 3600000);
     return {
       headline: data.headline, url: data.url, source: data.source,
@@ -2270,23 +2264,75 @@ async function readNewsCacheFallback(symbol) {
   }
 }
 
-// Queries both sources concurrently and returns whichever headline is
-// actually more recent, rather than only falling back to Alpaca when
-// Finnhub comes back completely empty (see fetchAlpacaNews's comment for
-// why that distinction mattered in practice).
+// Company name for news relevance: the 24h fundamentals cache when it has
+// one, otherwise one profile2 lookup kept for a day (same finnhubGet budget).
+const companyNameCache = new Map(); // symbol -> { name, time }
+async function companyNameFor(symbol) {
+  const fromFund = symbolFundamentalsCache.get(symbol)?.data?.sectorInfo?.name;
+  if (fromFund) return fromFund;
+  const hit = companyNameCache.get(symbol);
+  if (hit && Date.now() - hit.time < FUNDAMENTALS_REFRESH_MS) return hit.name;
+  try {
+    const p = await finnhubGet(`/stock/profile2?symbol=${symbol}`);
+    const name = (p && p.name) || null;
+    companyNameCache.set(symbol, { name, time: Date.now() });
+    return name;
+  } catch (e) {
+    return null; // not cached: retry next time
+  }
+}
+
+// Per-ticker news (ticker cards, Gate 2's catalyst, the Agitator). Nov 2,
+// 2026 rebuild: the old version showed the newest article either feed had
+// tagged to the symbol, relevant or not. Now an article must be about the
+// ticker (ah.pickRelevantNews tiers), and when the first look finds none
+// the search widens step by step before giving up:
+//   1. Finnhub + Alpaca, last MAX_NEWS_AGE_HOURS (both always, pooled)
+//   2. Finnhub + Alpaca, last NEWS_WIDE_HOURS (30 days)
+//   3. Marketaux keyword search on the company name (daily budget; at most
+//      once per symbol per MARKETAUX_TICKER_RETRY_MS)
+//   4. the last relevant article this ticker had (news_cache)
+// Only when all four come back empty does the card show no headline, and
+// that is logged ([NEWS] ... no ticker-specific article) so misses can be
+// counted per ticker.
+const NEWS_WIDE_HOURS = 30 * 24;
+const MARKETAUX_TICKER_RETRY_MS = 6 * 60 * 60 * 1000;
+const marketauxTickerTried = new Map(); // symbol -> time of last Marketaux try
 async function fetchNews(symbol, companyName) {
-  const [fh, al] = await Promise.allSettled([
-    fetchFinnhubNews(symbol, companyName),
-    fetchAlpacaNews(symbol, companyName),
-  ]);
-  const finnhub = fh.status === "fulfilled" ? fh.value : null;
-  const alpaca  = al.status === "fulfilled" ? al.value : null;
-  const live = !finnhub ? alpaca : !alpaca ? finnhub : (alpaca.ageHours <= finnhub.ageHours ? alpaca : finnhub);
-  if (live) {
+  const name = companyName || await companyNameFor(symbol).catch(() => null);
+  const pick = (pool) => ah.pickRelevantNews(pool, symbol, name);
+
+  const [fh, al] = await Promise.all([fetchFinnhubNewsPool(symbol, MAX_NEWS_AGE_HOURS), fetchAlpacaNewsPool(symbol, MAX_NEWS_AGE_HOURS)]);
+  let best = pick([...fh, ...al]);
+  let step = "recent";
+
+  if (!best) {
+    const [fh2, al2] = await Promise.all([fetchFinnhubNewsPool(symbol, NEWS_WIDE_HOURS), fetchAlpacaNewsPool(symbol, NEWS_WIDE_HOURS)]);
+    best = pick([...fh2, ...al2]);
+    step = "30d";
+  }
+
+  if (!best && name) {
+    const last = marketauxTickerTried.get(symbol) || 0;
+    if (Date.now() - last >= MARKETAUX_TICKER_RETRY_MS) {
+      marketauxTickerTried.set(symbol, Date.now());
+      const mx = await fetchMarketauxNews(name).catch(() => []);
+      best = pick(mx.map(a => ({ headline: a.headline, summary: a.summary, url: a.url, source: a.source, timeMs: a.timestamp,
+        symbols: (a.entities || []).length === 1 ? a.entities.map(e => e.symbol) : null })));
+      step = "marketaux";
+    }
+  }
+
+  if (best) {
+    const live = newsResult(best);
+    if (step !== "recent") console.log(`[NEWS] ${symbol}: found via ${step} (tier ${best.tier})`);
     await upsertNewsCache(symbol, live);
     return live;
   }
-  return readNewsCacheFallback(symbol);
+  const cached = await readNewsCacheFallback(symbol, name);
+  if (cached) return cached;
+  console.log(`[NEWS] ${symbol}: no ticker-specific article (name: ${name || "unknown"}; pools ${fh.length}+${al.length})`);
+  return null;
 }
 
 // Proposal 4's original news-content-match corroboration source

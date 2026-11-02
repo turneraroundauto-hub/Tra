@@ -118,22 +118,22 @@ test('audit: dial_shift tags calls within a week of a move', () => {
   assert.equal(s.find(x => x.call_type === 'long' && x.signal === 'dial_shift' && x.value === 'more_aggressive').n, 1);
 });
 
-test('audit: summary compares since the latest change vs before it', () => {
+test('audit: summary compares since the latest change vs before it (LONG + DAY grades)', () => {
   const changes = [
     { from_position: 'NEUTRAL', to_position: 'ACTIVE_SWING', direction: 'more_aggressive', changed_at: '2026-09-01T00:00:00Z', source: 'rebuilt' },
     { from_position: 'ACTIVE_SWING', to_position: 'ACTIVE_LEAN', direction: 'more_passive', changed_at: '2026-09-14T00:00:00Z', source: 'app' },
   ];
-  const g = (t, dial, grade, path, verdict = 'UP') => ({ issued_at: t, dial_position: dial, verdict, grade_horizon: grade, path_outcome: path });
+  const g = (t, dial, grade, verdict = 'UP', dayV = null, dayG = null) => ({ issued_at: t, dial_position: dial, verdict, grade_long: grade, day_verdict: dayV, grade_day_call: dayG });
   const rows = [
-    g('2026-08-20T14:00:00Z', 'NEUTRAL', 'TRUE', 'TARGET'),          // before the previous change: ignored
-    g('2026-09-05T14:00:00Z', 'ACTIVE_SWING', 'FALSE', 'STOP'), g('2026-09-06T14:00:00Z', 'ACTIVE_SWING', 'MARGINAL', 'NEITHER'),
-    g('2026-09-20T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', 'TARGET'), g('2026-09-21T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', 'NEITHER'),
-    g('2026-09-22T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', null, 'FLAT'),  // FLAT left out
+    g('2026-08-20T14:00:00Z', 'NEUTRAL', 'TRUE'),                       // before the previous change: ignored
+    g('2026-09-05T14:00:00Z', 'ACTIVE_SWING', 'FALSE', 'UP', 'DOWN', 'TRUE'), g('2026-09-06T14:00:00Z', 'ACTIVE_SWING', 'TRUE'),
+    g('2026-09-20T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', 'DOWN', 'UP', 'FALSE'), g('2026-09-21T14:00:00Z', 'ACTIVE_LEAN', 'TRUE'),
+    g('2026-09-22T14:00:00Z', 'ACTIVE_LEAN', 'TRUE', 'FLAT', 'FLAT', 'TRUE'),  // FLAT left out of both
   ];
   const s = L.dialAuditSummary(changes, rows);
   assert.equal(s.changes[0].to, 'ACTIVE_LEAN');
-  assert.deepEqual(s.latest.after, { n: 2, pct: 100, stopPct: 0 });
-  assert.deepEqual(s.latest.before, { n: 2, pct: 25, stopPct: 50 });
+  assert.deepEqual(s.latest.after, { n: 2, pct: 100, dayN: 1, dayPct: 0 });
+  assert.deepEqual(s.latest.before, { n: 2, pct: 50, dayN: 1, dayPct: 100 });
   assert.deepEqual(L.dialAuditSummary([], rows), { changes: [], latest: null });
 });
 

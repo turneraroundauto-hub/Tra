@@ -527,3 +527,21 @@ test("gradeLongCall: FLAT within normal move x sqrt(sessions)", () => {
   assert.strictEqual(ah.gradeLongCall("FLAT", 2, 3.7, null), "TRUE");
   assert.strictEqual(ah.gradeLongCall("UP", NaN, 3, null), null);
 });
+
+// ─── Nov 2, 2026: rule B-2 (shadow) ───
+test("rangePosition: last 20 completed closes, null when thin", () => {
+  const closes = Array.from({ length: 25 }, (_, i) => 40 + (i % 11)); // last 20 span 40..50
+  assert.strictEqual(ah.rangePosition(closes, 48), 80);
+  assert.strictEqual(ah.rangePosition(closes, 52), 120);
+  assert.strictEqual(ah.rangePosition(closes.slice(0, 14), 48), null);
+});
+test("ruleB2: the four frozen checks, nothing else", () => {
+  assert.deepStrictEqual(ah.ruleB2("UP", "UPTREND", 10), { verdict: "FLAT", check: 1 });
+  assert.deepStrictEqual(ah.ruleB2("UP", "DOWNTREND", 75), { verdict: "FLAT", check: 2 });
+  assert.deepStrictEqual(ah.ruleB2("UP", "DOWNTREND", 74.9), { verdict: "UP", check: null });
+  assert.deepStrictEqual(ah.ruleB2("DOWN", "DOWNTREND", 50), { verdict: "FLAT", check: 3 });
+  assert.deepStrictEqual(ah.ruleB2("DOWN", "UPTREND", 90), { verdict: "DOWN", check: null });
+  assert.deepStrictEqual(ah.ruleB2("FLAT", "UPTREND", 10), { verdict: "DOWN", check: 4 });
+  assert.deepStrictEqual(ah.ruleB2("FLAT", "DOWNTREND", 10), { verdict: "FLAT", check: null });
+  assert.deepStrictEqual(ah.ruleB2("UP", null, null), { verdict: "UP", check: null }); // missing inputs never filter
+});

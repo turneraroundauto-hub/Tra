@@ -684,7 +684,41 @@ function gradeLongCall(verdict: string, r5: number, r14: number, normalDailyPct:
   return Math.abs(r5) <= daily * Math.sqrt(5) && Math.abs(r14) <= daily * Math.sqrt(14) ? 'TRUE' : 'FALSE';
 }
 
+// ─── Rule B-2: LONG trend filter, SHADOW only (frozen Nov 2, 2026) ───
+// Approved by Mr. T. Never changes a live call: /analyze logs what B-2
+// would say next to the live LONG call and both are graded the same way.
+// Live only with his OK after >=100 kept post-approval calls clear 60% (both
+// halves, and >=55% without the biggest ticker). Any change = new version.
+//   1  UP   + Gate 1 UPTREND            -> FLAT
+//   2  UP   + top 25% of 20-day range   -> FLAT
+//   3  DOWN + Gate 1 DOWNTREND          -> FLAT
+//   4  FLAT + Gate 1 UPTREND            -> DOWN (correction expected)
+const B2_VERSION = 'B-2';
+const B2_RANGE_SESSIONS = 20;
+const B2_RANGE_MIN_SESSIONS = 15;
+const B2_TOP_PCT = 75;
+// Call price's position in the range of the last 20 completed closes, 0-100
+// (above the high reads >100). null with fewer than 15 closes.
+function rangePosition(completedCloses: number[], price: number): number | null {
+  const c = (completedCloses || []).filter(x => typeof x === 'number' && x > 0).slice(-B2_RANGE_SESSIONS);
+  if (c.length < B2_RANGE_MIN_SESSIONS || !(price > 0)) return null;
+  const lo = Math.min(...c), hi = Math.max(...c);
+  if (hi === lo) return 100;
+  return +((price - lo) / (hi - lo) * 100).toFixed(1);
+}
+function ruleB2(verdict: string, trend: string | null, rangePos: number | null): { verdict: string; check: number | null } {
+  if (verdict === 'UP' && trend === 'UPTREND') return { verdict: 'FLAT', check: 1 };
+  if (verdict === 'UP' && rangePos != null && rangePos >= B2_TOP_PCT) return { verdict: 'FLAT', check: 2 };
+  if (verdict === 'DOWN' && trend === 'DOWNTREND') return { verdict: 'FLAT', check: 3 };
+  if (verdict === 'FLAT' && trend === 'UPTREND') return { verdict: 'DOWN', check: 4 };
+  return { verdict: verdict, check: null };
+}
+
 module.exports = {
+  B2_VERSION: B2_VERSION,
+  B2_TOP_PCT: B2_TOP_PCT,
+  rangePosition: rangePosition,
+  ruleB2: ruleB2,
   gradeLongCall: gradeLongCall,
   LONG_UP_MIN_5: LONG_UP_MIN_5,
   LONG_UP_MIN_14: LONG_UP_MIN_14,

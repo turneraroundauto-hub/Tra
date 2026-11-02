@@ -775,6 +775,112 @@ function etOffsetIso(dateStr) {
 function sessionOpenIso(dateStr) {
     return dateStr + 'T09:30:00' + etOffsetIso(dateStr);
 }
+// ── Ticker news relevance (Nov 2, 2026) ─────────────────────────────────
+// Finnhub's /company-news and Alpaca's news tag articles to tickers loosely
+// (a Paramount/Spin Master piece came back tagged BB and, being newest,
+// became BB's card headline and Gate 2 catalyst). Every per-ticker news
+// pick goes through pickRelevantNews(): an article must actually be about
+// the ticker before it can be shown. Tiers, best first:
+//   3 = the headline names the ticker or the company
+//   2 = the summary names it
+//   1 = a feed tagged it to THIS ticker alone (a focused tag)
+//   0 = anything else -- never shown
+// Highest tier wins; newest within a tier. Applies to every ticker.
+const NEWS_GENERIC_FIRST_WORDS = new Set([
+    "american", "first", "general", "united", "international", "global", "national", "new",
+    "applied", "advanced", "digital", "capital", "financial", "health", "bank", "real",
+    "western", "eastern", "southern", "northern", "pacific", "atlantic", "royal", "select",
+    "prime", "core", "blue", "green", "golden", "silver", "power", "data", "micro", "smart",
+    "energy", "home", "great", "big", "public", "standard", "summit", "liberty", "pioneer",
+]);
+const LEGAL_SUFFIX_RE = /\b(inc|incorporated|corp|corporation|co|company|ltd|limited|plc|llc|lp|l\.p|n\.v|s\.a|ag|se|sa|nv|the|holdings?|group|class\s+[a-z]|common\s+stock|ordinary\s+shares|adr|ads)\b\.?/gi;
+const US_EXCHANGE_PREFIX = /^(NYSE|NASDAQ|NasdaqGS|NasdaqGM|NasdaqCM|NYSEARCA|NYSEAMERICAN|AMEX|BATS|CBOE|OTC|OTCQX|OTCMKTS|TSX)$/i;
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+// The names an article could use for this company, longest first.
+function companyNameVariants(companyName) {
+    if (!companyName)
+        return [];
+    const raw = String(companyName).replace(/[,]/g, " ").replace(/\s+/g, " ").trim();
+    const core = raw.replace(LEGAL_SUFFIX_RE, " ").replace(/[.]/g, " ").replace(/\s+/g, " ").trim();
+    const out = [];
+    const add = (v) => { v = v.trim(); if (v && !out.some(o => o.toLowerCase() === v.toLowerCase()))
+        out.push(v); };
+    // "Nu Holdings Ltd" -> "Nu Holdings": keep the name with its first suffix
+    // word when the core alone is too short to be distinctive.
+    const firstSuffix = raw.replace(/\s*\b(inc|incorporated|corp|corporation|co|ltd|limited|plc|llc|lp|class\s+[a-z])\b\.?.*$/i, "").trim();
+    if (core.length >= 4)
+        add(core);
+    if (firstSuffix.length >= 4)
+        add(firstSuffix);
+    const words = core.split(" ").filter(Boolean);
+    if (words.length > 1 && words[0].length >= 4 && !NEWS_GENERIC_FIRST_WORDS.has(words[0].toLowerCase()))
+        add(words[0]);
+    return out.sort((a, b) => b.length - a.length);
+}
+function textNamesTicker(text, symbol, variants) {
+    if (!text)
+        return false;
+    const t = String(text);
+    const sym = String(symbol || "").toUpperCase();
+    if (sym) {
+        const s = escapeRe(sym);
+        // A short ticker ("ON", "NU", "ET") is also an everyday word, so it only
+        // counts in ticker form: (ON), $ON, NASDAQ:ON. Longer tickers count as an
+        // upper-case word on their own.
+        // An exchange prefix counts only for US/Canadian listings: "LSE:ADM" is
+        // Admiral Group, not Archer-Daniels-Midland. Every occurrence is checked.
+        const re = new RegExp("(^|[^A-Za-z0-9])" + s + "(?![A-Za-z0-9])", "g");
+        let m;
+        while ((m = re.exec(t))) {
+            const before = t.slice(0, m.index + m[1].length);
+            const pre = /([A-Za-z]+)\s?:\s?$/.exec(before);
+            if (pre) {
+                if (US_EXCHANGE_PREFIX.test(pre[1]))
+                    return true;
+                continue; // a foreign listing's ticker
+            }
+            if (/[($]$/.test(before))
+                return true;
+            if (sym.length >= 3)
+                return true;
+        }
+    }
+    for (const v of variants) {
+        if (new RegExp("\\b" + escapeRe(v) + "\\b", "i").test(t))
+            return true;
+    }
+    return false;
+}
+function newsRelevanceTier(a, symbol, companyName) {
+    const variants = companyNameVariants(companyName);
+    if (textNamesTicker(a.headline, symbol, variants))
+        return 3;
+    if (textNamesTicker(a.summary, symbol, variants))
+        return 2;
+    const tags = Array.isArray(a.symbols) ? a.symbols.map(x => String(x).toUpperCase()) : null;
+    if (tags && tags.length === 1 && tags[0] === String(symbol || "").toUpperCase())
+        return 1;
+    return 0;
+}
+// Best relevant article from a mixed pool (any sources). null = none relevant.
+function pickRelevantNews(pool, symbol, companyName) {
+    const seen = new Set();
+    let best = null;
+    for (const a of pool || []) {
+        if (!a || !a.headline || !a.url || !Number.isFinite(a.timeMs))
+            continue;
+        const k = a.url + "|" + a.headline.toLowerCase();
+        if (seen.has(k))
+            continue;
+        seen.add(k);
+        const tier = newsRelevanceTier(a, symbol, companyName);
+        if (tier < 1)
+            continue;
+        if (!best || tier > best.tier || (tier === best.tier && a.timeMs > best.timeMs))
+            best = { ...a, tier };
+    }
+    return best;
+}
 module.exports = {
     etOffsetIso: etOffsetIso,
     sessionOpenIso: sessionOpenIso,
@@ -827,4 +933,8 @@ module.exports = {
     dayBarSchedule: dayBarSchedule,
     barYardstickPct: barYardstickPct,
     deltaLeanLabel: deltaLeanLabel,
+    companyNameVariants: companyNameVariants,
+    textNamesTicker: textNamesTicker,
+    newsRelevanceTier: newsRelevanceTier,
+    pickRelevantNews: pickRelevantNews,
 };

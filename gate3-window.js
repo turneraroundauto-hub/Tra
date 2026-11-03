@@ -4,6 +4,19 @@ const SESSION_OPEN_MIN = 9 * 60 + 30; // 9:30 ET
 const BARS_NEEDED = 3;
 const FIRST_READ_MIN = SESSION_OPEN_MIN + BARS_NEEDED * BAR_MINUTES; // 10:15 ET = 7:15 PT
 const WINDOW_CUTOFF_MIN = 13 * 60 + 30; // 1:30 PM ET = 10:30 AM PT (Nov 2, 2026; was 12:30 ET)
+// Nov 3, 2026 (Mr. T): a bar only counts 62 s after it closes. Alpaca
+// publishes a just-closed bar a few seconds late; a read right at 7:15 PT saw
+// 2/3 bars and the per-candle cache pinned that for the whole candle (IMVT,
+// Nov 3). Every candle boundary shifts by the same 62 s.
+const BAR_SETTLE_MS = 62 * 1000;
+// Bars that SHOULD be complete by nowMs (already settle-shifted) for a
+// session that opened at openMs. A fetch with fewer than this is missing the
+// newest bar (Alpaca still behind) and must not be cached.
+function expectedCompletedCount(openMs, nowMs, barMinutes = BAR_MINUTES) {
+    if (!(nowMs > openMs))
+        return 0;
+    return Math.floor((nowMs - openMs) / (barMinutes * 60000));
+}
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
 function hhmm(min) { return pad2(Math.floor(min / 60)) + ':' + pad2(min % 60); }
 // Start (ET minutes) of the 15-min candle the clock is currently inside, or
@@ -132,6 +145,8 @@ module.exports = {
     BARS_NEEDED: BARS_NEEDED,
     FIRST_READ_MIN: FIRST_READ_MIN,
     WINDOW_CUTOFF_MIN: WINDOW_CUTOFF_MIN,
+    BAR_SETTLE_MS: BAR_SETTLE_MS,
+    expectedCompletedCount: expectedCompletedCount,
     candleStartMin: candleStartMin,
     candleKey: candleKey,
     completedBars: completedBars,

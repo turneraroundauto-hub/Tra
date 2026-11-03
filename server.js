@@ -2116,7 +2116,7 @@ function evaluateGate4(metricsData) {
   return { status: "GREEN", note: `${rp}% of 52-week range — Phase 1, discovery. Full size entry appropriate.` };
 }
 
-const MAX_NEWS_AGE_HOURS = 300; // 14 days / last business week
+const MAX_NEWS_AGE_HOURS = 14 * 24; // 14 days (Mr. T, Nov 3, 2026; was 300 h = 12.5 days)
 
 // A per-ticker news feed can legitimately include a broad market-wide
 // "top gainers and losers" / sector-roundup article tagged against every
@@ -6878,14 +6878,18 @@ function gate3ScheduleFrom(probe) {
 // One Alpaca call per symbol per candle of the schedule's bar size, shared
 // by every caller -- the bars can't change until the next candle closes.
 const gate3BarsCache = new Map(); // symbol -> { key, bars }
-async function fetchGate3Window(symbol, now = new Date(), schedule = DEFAULT_GATE3_SCHEDULE) {
+// The window's clock runs g3w.BAR_SETTLE_MS (62 s) behind the real one, so a
+// bar only counts once Alpaca has had time to publish it (Nov 3, 2026).
+function settledNow(now = new Date()) { return new Date(now.getTime() - g3w.BAR_SETTLE_MS); }
+async function fetchGate3Window(symbol, realNow = new Date(), schedule = DEFAULT_GATE3_SCHEDULE) {
   const sched = schedule || DEFAULT_GATE3_SCHEDULE;
   const barMin = sched.barMinutes || 15;
+  const now = settledNow(realNow);
   const c = nowCandle(now);
   const key = c.trading ? g3w.candleKey(c.date, c.minutes, c.closeMin, barMin) : null;
   const openMs = Math.floor(now.getTime() / 60000) * 60000 - (c.minutes - g3w.SESSION_OPEN_MIN) * 60000;
-  const readyAt = new Date(openMs + g3w.BARS_NEEDED * barMin * 60000).toISOString();
-  const cutoffAt = new Date(openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000).toISOString();
+  const readyAt = new Date(openMs + g3w.BARS_NEEDED * barMin * 60000 + g3w.BAR_SETTLE_MS).toISOString();
+  const cutoffAt = new Date(openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000 + g3w.BAR_SETTLE_MS).toISOString();
   const base = { dateET: c.date, candleKey: key, readyAt, cutoffAt, barsNeeded: g3w.BARS_NEEDED, schedule: sched };
   const preState = g3w.windowState(c.trading, c.minutes, c.closeMin, 0);
   if (preState === "CLOSED" || preState === "EXPIRED") return { ...base, state: preState, barsDone: 0, seq: null, asOf: null };
@@ -6895,8 +6899,14 @@ async function fetchGate3Window(symbol, now = new Date(), schedule = DEFAULT_GAT
     const hit = gate3BarsCache.get(`${symbol}:${barMin}`);
     if (hit && hit.key === key) bars = hit.bars;
     else {
-      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), now.toISOString(), barMin);
-      if (bars) gate3BarsCache.set(`${symbol}:${barMin}`, { key, bars });
+      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), realNow.toISOString(), barMin);
+      // Guard: only keep a fetch for the rest of the candle when it already
+      // has every bar that should be done; otherwise the next call re-fetches.
+      if (bars && g3w.completedBars(bars, now.getTime(), barMin).length >= g3w.expectedCompletedCount(openMs, now.getTime(), barMin)) {
+        gate3BarsCache.set(`${symbol}:${barMin}`, { key, bars });
+      } else if (bars) {
+        console.log(`[GATE3] ${symbol}: newest ${barMin}-min bar not published yet; not caching, will re-fetch`);
+      }
     }
   }
   if (bars === null) return { ...base, state: "FORMING", barsDone: 0, seq: null, asOf: null, fetchFailed: true };
@@ -6962,7 +6972,7 @@ function windowCacheKey(req, ticker, dial, hold) { return `w:${req.userKey}:${ti
 async function windowCacheLookup(wkey, ticker, gate0) {
   const e = windowVerdictCache.get(wkey);
   if (!e) return null;
-  const c = nowCandle();
+  const c = nowCandle(settledNow()); // same settle-shifted clock as fetchGate3Window
   if (!c.key || e.dateET !== c.date) return null;
   // Same candle of the bar size that read used (5/15/30 min).
   if (e.candleKey === g3w.candleKey(c.date, c.minutes, c.closeMin, e.barMinutes || 15)) return e.result;
@@ -7226,7 +7236,7 @@ app.post("/analyze", async (req, res) => {
     : null;
 
   // ── BUILD NEWS CONTEXT ────────────────────────────────────────────
-  let newsContext = "No news within the last business week (300 hours). Gate 2 catalyst = NEUTRAL.";
+  let newsContext = "No news within the last 14 days. Gate 2 catalyst = NEUTRAL.";
   const relatedCtx = newsData && newsData.basis && newsData.ageHours <= MAX_NEWS_AGE_HOURS ? ah.relatedNewsContext(ticker, newsData) : null;
   if (relatedCtx) {
     newsContext = relatedCtx;

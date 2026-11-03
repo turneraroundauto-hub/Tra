@@ -98,3 +98,20 @@ test('5- and 30-min schedules: candles and completed bars', () => {
   assert.equal(g3.completedBars(bars, Date.parse('2026-10-27T13:45:00Z'), 5).length, 3);
   assert.equal(g3.completedBars(bars, Date.parse('2026-10-27T13:45:00Z')).length, 1);
 });
+
+// ── Nov 3, 2026: 62 s settle + don't cache a fetch missing the newest bar ──
+{
+  const t3 = require("node:test"), a3 = require("node:assert"), w3 = require("../gate3-window");
+  t3("bar settle: 62 s, and the expected-bar count matches the IMVT case", () => {
+    a3.strictEqual(w3.BAR_SETTLE_MS, 62000);
+    const open = Date.parse("2026-11-03T14:30:00Z"); // 9:30 ET = 6:30 PT (after DST)
+    const at = (iso) => Date.parse(iso) - w3.BAR_SETTLE_MS; // settle-shifted clock
+    a3.strictEqual(w3.expectedCompletedCount(open, at("2026-11-03T15:15:30Z"), 15), 2); // 7:15:30 PT: bar 3 not counted yet
+    a3.strictEqual(w3.expectedCompletedCount(open, at("2026-11-03T15:16:02Z"), 15), 3); // 7:16:02 PT: first read
+    a3.strictEqual(w3.expectedCompletedCount(open, at("2026-11-03T15:26:36Z"), 15), 3); // the 7:26 IMVT tap
+    // A fetch at 7:26 that only has 2 bars (Alpaca behind) is short of 3 -> not cached.
+    const bars2 = [{ t: "2026-11-03T14:30:00Z", o: 1, h: 1, l: 1, c: 1 }, { t: "2026-11-03T14:45:00Z", o: 1, h: 1, l: 1, c: 1 }];
+    a3.ok(w3.completedBars(bars2, at("2026-11-03T15:26:36Z"), 15).length < w3.expectedCompletedCount(open, at("2026-11-03T15:26:36Z"), 15));
+    a3.strictEqual(w3.expectedCompletedCount(open, open - 1000, 15), 0);
+  });
+}

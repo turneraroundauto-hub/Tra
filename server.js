@@ -2116,7 +2116,7 @@ function evaluateGate4(metricsData) {
   return { status: "GREEN", note: `${rp}% of 52-week range — Phase 1, discovery. Full size entry appropriate.` };
 }
 
-const MAX_NEWS_AGE_HOURS = 300; // 14 days / last business week
+const MAX_NEWS_AGE_HOURS = 14 * 24; // 14 days (Mr. T, Nov 3, 2026; was 300 h = 12.5 days)
 
 // A per-ticker news feed can legitimately include a broad market-wide
 // "top gainers and losers" / sector-roundup article tagged against every
@@ -2292,13 +2292,15 @@ async function companyNameFor(symbol) {
 //   3. Marketaux keyword search on the company name (daily budget; at most
 //      once per symbol per MARKETAUX_TICKER_RETRY_MS)
 //   4. the last relevant article this ticker had (news_cache)
-// Only when all four come back empty does the card show no headline, and
-// that is logged ([NEWS] ... no ticker-specific article) so misses can be
-// counted per ticker.
+//   5. related news: an associated ticker's own article, or sector news
+//      (fetchRelatedNews), labeled basis/via so the card and Gate 2 know it
+//      isn't the ticker's own. Off for the Agitator (opts.related=false).
+// Only when all five come back empty is there no headline, logged as
+// [NEWS] ... no ticker-specific, related or sector article.
 const NEWS_WIDE_HOURS = 30 * 24;
 const MARKETAUX_TICKER_RETRY_MS = 6 * 60 * 60 * 1000;
 const marketauxTickerTried = new Map(); // symbol -> time of last Marketaux try
-async function fetchNews(symbol, companyName) {
+async function fetchNews(symbol, companyName, opts = {}) {
   const name = companyName || await companyNameFor(symbol).catch(() => null);
   const pick = (pool) => ah.pickRelevantNews(pool, symbol, name);
 
@@ -2331,7 +2333,48 @@ async function fetchNews(symbol, companyName) {
   }
   const cached = await readNewsCacheFallback(symbol, name);
   if (cached) return cached;
-  console.log(`[NEWS] ${symbol}: no ticker-specific article (name: ${name || "unknown"}; pools ${fh.length}+${al.length})`);
+
+  // 5. Related / sector news (Mr. T, Nov 2, 2026: "For ETFs it could pull
+  // sector news or news from associated tickers"; every ticker, labeled).
+  // Not written to news_cache: that row is the ticker's own last article.
+  const related = opts.related === false ? null : await fetchRelatedNews(symbol, name).catch(e => { console.error(`fetchRelatedNews ${symbol}:`, e.message); return null; });
+  if (related) {
+    console.log(`[NEWS] ${symbol}: no ticker-specific article; using ${related.basis} news${related.via ? " via " + related.via : ""}`);
+    return related;
+  }
+  console.log(`[NEWS] ${symbol}: no ticker-specific, related or sector article (name: ${name || "unknown"}; pools ${fh.length}+${al.length})`);
+  return null;
+}
+
+// Associated tickers, best first: Knowledge Graph peers (curated + measured
+// correlation), the ticker's own Gate 5 proxy (for an ETF this is usually
+// the benchmark it tracks best), its category's member list, then Finnhub's
+// same-industry peers. Each candidate's article must be about THAT ticker
+// (tier 2+), newest wins. If none, the newest general-market article that
+// names the ticker's sector keywords.
+async function fetchRelatedNews(symbol, name) {
+  const rule = gx.classifyTicker(symbol, symbolFundamentalsCache.get(symbol)?.data?.sectorInfo || (name ? { name } : null));
+  const proxySyms = symbolMarketCache.get(symbol)?.data?.proxyRule?.proxy?.symbols || null;
+  const [graph, peers] = await Promise.all([
+    fetchGraphPeers(symbol).catch(() => []),
+    fetchTickerPeers(symbol).catch(() => []),
+  ]);
+  const assoc = ah.associatedTickers(symbol, [graph, proxySyms, rule && rule !== DEFAULT_PROXY ? rule.tickers : null, peers], 4);
+  let best = null;
+  for (const t of assoc) {
+    const tName = await companyNameFor(t).catch(() => null);
+    const [p1, p2] = await Promise.all([fetchFinnhubNewsPool(t, MAX_NEWS_AGE_HOURS), fetchAlpacaNewsPool(t, MAX_NEWS_AGE_HOURS)]);
+    const pick = ah.pickRelevantNews([...p1, ...p2], t, tName);
+    if (pick && pick.tier >= 2 && (!best || pick.timeMs > best.pick.timeMs)) best = { pick, via: t };
+  }
+  if (best) return { ...newsResult(best.pick), basis: "related", via: best.via };
+
+  if (rule && rule !== DEFAULT_PROXY && Array.isArray(rule.keywords)) {
+    const general = await fetchGeneralNews().catch(() => []);
+    const pool = general.map(a => ({ headline: a.headline, summary: a.summary, url: a.url, source: a.source, timeMs: a.timestamp }));
+    const sec = ah.pickSectorNews(pool, rule.keywords);
+    if (sec) return { ...newsResult(sec), basis: "sector", sector: rule.category };
+  }
   return null;
 }
 
@@ -3688,7 +3731,7 @@ async function computeAgitatorComps(symbol, mentionedSymbols, marketauxMentioned
   await Promise.all(finalComps.map(async (c) => {
     const fund = await fetchTickerFundamentals(c.symbol);
     const name = fund?.sectorInfo?.name || null;
-    const news = await fetchNews(c.symbol, name).catch(() => null);
+    const news = await fetchNews(c.symbol, name, { related: false }).catch(() => null);
     c.news = news ? { headline: news.headline, url: news.url, ageHours: news.ageHours } : null;
   }));
   return finalComps;
@@ -5805,7 +5848,7 @@ app.get("/agitator", async (req, res) => {
       // rate-limited discovery endpoint.
       fundamentals = await fetchTickerFundamentals(symbol);
       const companyName = fundamentals?.sectorInfo?.name || null;
-      [quote, news] = await Promise.all([fetchQuote(symbol), fetchNews(symbol, companyName).catch(() => null)]);
+      [quote, news] = await Promise.all([fetchQuote(symbol), fetchNews(symbol, companyName, { related: false }).catch(() => null)]);
     }
     // Last resort: nothing real anywhere (no Marketaux article, no
     // explicit client-supplied headline, and the real per-ticker
@@ -6835,14 +6878,18 @@ function gate3ScheduleFrom(probe) {
 // One Alpaca call per symbol per candle of the schedule's bar size, shared
 // by every caller -- the bars can't change until the next candle closes.
 const gate3BarsCache = new Map(); // symbol -> { key, bars }
-async function fetchGate3Window(symbol, now = new Date(), schedule = DEFAULT_GATE3_SCHEDULE) {
+// The window's clock runs g3w.BAR_SETTLE_MS (62 s) behind the real one, so a
+// bar only counts once Alpaca has had time to publish it (Nov 3, 2026).
+function settledNow(now = new Date()) { return new Date(now.getTime() - g3w.BAR_SETTLE_MS); }
+async function fetchGate3Window(symbol, realNow = new Date(), schedule = DEFAULT_GATE3_SCHEDULE) {
   const sched = schedule || DEFAULT_GATE3_SCHEDULE;
   const barMin = sched.barMinutes || 15;
+  const now = settledNow(realNow);
   const c = nowCandle(now);
   const key = c.trading ? g3w.candleKey(c.date, c.minutes, c.closeMin, barMin) : null;
   const openMs = Math.floor(now.getTime() / 60000) * 60000 - (c.minutes - g3w.SESSION_OPEN_MIN) * 60000;
-  const readyAt = new Date(openMs + g3w.BARS_NEEDED * barMin * 60000).toISOString();
-  const cutoffAt = new Date(openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000).toISOString();
+  const readyAt = new Date(openMs + g3w.BARS_NEEDED * barMin * 60000 + g3w.BAR_SETTLE_MS).toISOString();
+  const cutoffAt = new Date(openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000 + g3w.BAR_SETTLE_MS).toISOString();
   const base = { dateET: c.date, candleKey: key, readyAt, cutoffAt, barsNeeded: g3w.BARS_NEEDED, schedule: sched };
   const preState = g3w.windowState(c.trading, c.minutes, c.closeMin, 0);
   if (preState === "CLOSED" || preState === "EXPIRED") return { ...base, state: preState, barsDone: 0, seq: null, asOf: null };
@@ -6852,8 +6899,14 @@ async function fetchGate3Window(symbol, now = new Date(), schedule = DEFAULT_GAT
     const hit = gate3BarsCache.get(`${symbol}:${barMin}`);
     if (hit && hit.key === key) bars = hit.bars;
     else {
-      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), now.toISOString(), barMin);
-      if (bars) gate3BarsCache.set(`${symbol}:${barMin}`, { key, bars });
+      bars = await fetchSessionBars(symbol, new Date(openMs).toISOString(), realNow.toISOString(), barMin);
+      // Guard: only keep a fetch for the rest of the candle when it already
+      // has every bar that should be done; otherwise the next call re-fetches.
+      if (bars && g3w.completedBars(bars, now.getTime(), barMin).length >= g3w.expectedCompletedCount(openMs, now.getTime(), barMin)) {
+        gate3BarsCache.set(`${symbol}:${barMin}`, { key, bars });
+      } else if (bars) {
+        console.log(`[GATE3] ${symbol}: newest ${barMin}-min bar not published yet; not caching, will re-fetch`);
+      }
     }
   }
   if (bars === null) return { ...base, state: "FORMING", barsDone: 0, seq: null, asOf: null, fetchFailed: true };
@@ -6919,7 +6972,7 @@ function windowCacheKey(req, ticker, dial, hold) { return `w:${req.userKey}:${ti
 async function windowCacheLookup(wkey, ticker, gate0) {
   const e = windowVerdictCache.get(wkey);
   if (!e) return null;
-  const c = nowCandle();
+  const c = nowCandle(settledNow()); // same settle-shifted clock as fetchGate3Window
   if (!c.key || e.dateET !== c.date) return null;
   // Same candle of the bar size that read used (5/15/30 min).
   if (e.candleKey === g3w.candleKey(c.date, c.minutes, c.closeMin, e.barMinutes || 15)) return e.result;
@@ -7183,8 +7236,11 @@ app.post("/analyze", async (req, res) => {
     : null;
 
   // ── BUILD NEWS CONTEXT ────────────────────────────────────────────
-  let newsContext = "No news within the last business week (300 hours). Gate 2 catalyst = NEUTRAL.";
-  if (newsData && newsData.ageHours <= MAX_NEWS_AGE_HOURS) {
+  let newsContext = "No news within the last 14 days. Gate 2 catalyst = NEUTRAL.";
+  const relatedCtx = newsData && newsData.basis && newsData.ageHours <= MAX_NEWS_AGE_HOURS ? ah.relatedNewsContext(ticker, newsData) : null;
+  if (relatedCtx) {
+    newsContext = relatedCtx;
+  } else if (newsData && !newsData.basis && newsData.ageHours <= MAX_NEWS_AGE_HOURS) {
     newsContext = `Recent news (${newsData.ageLabel}): "${newsData.headline}" — treat this as a potential catalyst for Gate 2 analysis. Classify as COMPANY-SPECIFIC POSITIVE, NEGATIVE, or NEUTRAL based on the headline content.`;
   }
 
@@ -7317,7 +7373,7 @@ Current price: $${metricsData.price || "?"}
   const buildup = gx.buildupPatternCheck({
     volRatio: typeof openingBarData?.volRatio === "number" ? openingBarData.volRatio : null,
     tickerPct, proxyPct,
-    hasFreshNews: !!(newsData && newsData.ageHours <= 24),
+    hasFreshNews: !!(newsData && !newsData.basis && newsData.ageHours <= 24), // related/sector news is not this ticker's own
   });
   const contextCorroboration = gx.computeGate2Corroboration({ buildup, hasEarningsEvent });
   await logCorroborationHits(ticker, contextCorroboration);

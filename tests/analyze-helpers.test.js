@@ -680,3 +680,21 @@ test('bracketVetoesUp: only a model UP against a BR-1 DOWN is vetoed', () => {
   assert.equal(ah.bracketVetoesUp('UP', ah.longBracket('DOWNTREND', 'RED').verdict), true);
   assert.equal(ah.bracketVetoesUp('UP', ah.longBracket('DOWNTREND', 'YELLOW').verdict), false);
 });
+
+test('longControl A-1: BR-1 sets the LONG direction; the model only keeps sizing/explanation when it agrees', () => {
+  const up = ah.longBracket('DOWNTREND', 'GREEN'), down = ah.longBracket('UPTREND', 'GREEN');
+  const agree = ah.longControl('UP', 'HALF', up, -12.3);
+  assert.deepEqual(agree, { verdict: 'UP', agrees: true, sizing: 'HALF', reason: null, waitFor: null });
+  const flip = ah.longControl('DOWN', 'NONE', up, -12.3);
+  assert.equal(flip.verdict, 'UP'); assert.equal(flip.agrees, false); assert.equal(flip.sizing, 'QUARTER');
+  assert.match(flip.reason, /downtrend \(-12\.3% over 14 days\)/);
+  const fade = ah.longControl('UP', 'FULL', down, 8);
+  assert.equal(fade.verdict, 'DOWN'); assert.equal(fade.sizing, 'NONE'); assert.match(fade.reason, /uptrend \(\+8\.0%/);
+  const filing = ah.longControl('UP', 'HALF', ah.longBracket('DOWNTREND', 'RED'), null);
+  assert.equal(filing.verdict, 'DOWN'); assert.match(filing.reason, /SEC filing flag.*outweighing/);
+  const flat = ah.longControl('UP', 'HALF', ah.longBracket('DOWNTREND', 'YELLOW'), null);
+  assert.equal(flat.verdict, 'FLAT'); assert.equal(flat.sizing, 'NONE');
+  // A FLAT from the model is replaced too: the algorithm always decides.
+  assert.equal(ah.longControl('FLAT', 'NONE', up, null).verdict, 'UP');
+  assert.equal(ah.longControl('UP', 'HALF', null, null), null);
+});

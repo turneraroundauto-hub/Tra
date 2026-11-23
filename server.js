@@ -4701,7 +4701,9 @@ async function runShadowTuner(rows) {
       row: r, date: e.date, close, normal,
       input: {
         // A vetoed row's DAY call was refined from the model's UP, not the shipped FLAT.
-        long: (r.gates.inputs && r.gates.inputs.long_veto)
+        long: (r.gates.inputs && r.gates.inputs.long_source)
+          ? { verdict: r.gates.inputs.long_source.model, sizing: r.gates.inputs.long_source.model_sizing || "NONE" }
+          : (r.gates.inputs && r.gates.inputs.long_veto)
           ? { verdict: r.gates.inputs.long_veto.from, sizing: r.gates.inputs.long_veto.sizing || "NONE" }
           : { verdict: r.verdict, sizing: r.size_action || "NONE" },
         locked: opts ? opts.locked : LOCKING_OVERRIDES.has(r.gates.inputs && r.gates.inputs.override),
@@ -7778,14 +7780,30 @@ Return only single-line minified JSON.
         parsed.wait_for = `Earnings imminent${typeof upcomingEarnings === "string" ? ` (${upcomingEarnings})` : ""} — no new entries until it's reported, unless you explicitly hold through it.`;
       }
 
-      // ── LONG bracket veto (LIVE, Nov 23, 2026, Mr. T; ah.bracketVetoesUp) ──
-      // A model UP that BR-1 (scored before the model ran) calls DOWN ships
-      // as FLAT. LONG only: the DAY call below still refines the model's own
-      // call, and the frozen B-2 shadow still reads it. Off: LONG_BRACKET_VETO=off.
+      // ── LONG direction: the algorithm is the controller (A-1, Nov 23, 2026, Mr. T) ──
+      // BR-1 (scored before the model ran) sets the LONG call. The model's own
+      // call (after every server override above) is kept as modelLongVerdict:
+      // the DAY call below still refines it, and the frozen B-2 shadow reads it.
+      // LONG_DIRECTION=model reverts to the model's call with the V-1 veto
+      // (LONG_BRACKET_VETO=off turns that off too).
       const modelLongVerdict = parsed.verdict;
       const modelLongSizing  = parsed.sizing;
-      let longVeto = null;
-      if (process.env.LONG_BRACKET_VETO !== "off" && longBracketPre && ah.bracketVetoesUp(parsed.verdict, longBracketPre.verdict)) {
+      let longVeto = null;     // V-1 veto (only when LONG_DIRECTION=model)
+      let longSource = null;   // A-1 controller record
+      const algoInControl = process.env.LONG_DIRECTION !== "model";
+      const ctl = algoInControl ? ah.longControl(parsed.verdict, parsed.sizing, longBracketPre, typeof gate1Result.change14 === "number" ? gate1Result.change14 : null) : null;
+      if (ctl) {
+        longSource = { model: modelLongVerdict, model_sizing: modelLongSizing, bracket: ctl.verdict, score: longBracketPre.score, agrees: ctl.agrees, version: ah.LONG_CONTROL_VERSION };
+        if (!ctl.agrees) {
+          overrideFired     = overrideFired || "algo_direction";
+          parsed.verdict    = ctl.verdict;
+          parsed.sizing     = applySizingCeiling(ctl.sizing, effectiveDialPosition);
+          if (earningsBlocked) parsed.sizing = "NONE";
+          parsed.confidence = ctl.verdict === "FLAT" ? "LOW" : ah.applyProxyFitCeiling(ah.priceConfirmedConfidence(ctl.verdict, tickerPct, proxyPct), regime?.rolling);
+          parsed.reason     = ctl.reason;
+          if (!earningsBlocked) parsed.wait_for = ctl.waitFor;
+        }
+      } else if (!algoInControl && process.env.LONG_BRACKET_VETO !== "off" && longBracketPre && ah.bracketVetoesUp(parsed.verdict, longBracketPre.verdict)) {
         longVeto = { from: modelLongVerdict, sizing: modelLongSizing, bracket: longBracketPre.verdict, score: longBracketPre.score, version: ah.BRACKET_VETO_VERSION };
         overrideFired     = overrideFired || "bracket_veto";
         parsed.verdict    = "FLAT";
@@ -7794,6 +7812,9 @@ Return only single-line minified JSON.
         parsed.wait_for   = gate1Result.branch === "UPTREND"
           ? "Trend check: names already in an uptrend have tended to pull back over the next 2-3 weeks. Wait for a pullback before a multi-week UP."
           : "Trend check: a recent SEC filing flag outweighs the upside over the next 2-3 weeks. Wait for it to clear before a multi-week UP.";
+      }
+      if (parsed.confidence === "LOW" && (!parsed.wait_for || parsed.wait_for === "null")) {
+        parsed.wait_for = "Additional confirmation needed before directional entry.";
       }
 
       let windowBarsLog = null;
@@ -7840,6 +7861,7 @@ Return only single-line minified JSON.
           });
       if (optionsProbe) logInputs.options = optionsProbe;
       if (longVeto) logInputs.long_veto = longVeto;
+      if (longSource) logInputs.long_source = longSource;
       // Confidence v2, shadow only (ah.confidenceV2): logged beside the live
       // label so the two can be graded side by side. The historical-accuracy
       // ceiling only needs its query when v2 would otherwise be HIGH.

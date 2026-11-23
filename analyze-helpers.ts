@@ -743,6 +743,39 @@ const BRACKET_VETO_VERSION = 'V-1';
 function bracketVetoesUp(modelVerdict: string | null, bracketVerdict: string | null): boolean {
   return modelVerdict === 'UP' && bracketVerdict === 'DOWN';
 }
+// LONG direction controller (LIVE, Nov 23, 2026, Mr. T: "the algorithm is
+// the controller"). The LONG call's direction is BR-1's, not the model's.
+// Evidence (all graded LONG calls Aug 26-Nov 2, vs a random pick under the
+// same 5+14 rule): model 35.2% vs 37.6% random (beats random on 4 of 17
+// tickers); BR-1 43.9% vs 35.5% (13 of 17 tickers, positive every month).
+// The model still reads Gates 2/3, writes the explanation when it agrees,
+// and its own call still drives the DAY call. When they disagree the
+// explanation is rule-written, sizing is QUARTER for UP / NONE otherwise
+// (BR-1 UP calls clear the strict 5+14 UP bar only ~27% of the time).
+// Off: LONG_DIRECTION=model (back to the model's call + the V-1 veto).
+const LONG_CONTROL_VERSION = 'A-1';
+function longControl(modelVerdict: string | null, modelSizing: string | null, bracket: { verdict: string; trend: number; filing: number } | null,
+  change14: number | null): { verdict: string; agrees: boolean; sizing: string | null; reason: string | null; waitFor: string | null } | null {
+  if (!bracket) return null;
+  const v = bracket.verdict;
+  if (v === modelVerdict) return { verdict: v, agrees: true, sizing: modelSizing, reason: null, waitFor: null };
+  const c = typeof change14 === 'number' && isFinite(change14) ? ' (' + (change14 > 0 ? '+' : '') + change14.toFixed(1) + '% over 14 days)' : '';
+  let reason: string; let waitFor: string;
+  if (v === 'UP') {
+    reason = 'Algorithm: in a downtrend' + c + '. Names like this have tended to rebound over the next 2-3 weeks.';
+    waitFor = 'A first higher close to confirm the rebound; keep it small.';
+  } else if (v === 'DOWN' && bracket.filing < 0 && bracket.trend >= 0) {
+    reason = 'Algorithm: a recent SEC filing flag points lower over the next 2-3 weeks' + (bracket.trend > 0 ? ', outweighing the rebound setup' : '') + '.';
+    waitFor = 'The filing concern to clear before any multi-week UP.';
+  } else if (v === 'DOWN') {
+    reason = 'Algorithm: already in an uptrend' + c + '. Names like this have tended to pull back over the next 2-3 weeks.';
+    waitFor = 'A pullback before any multi-week UP.';
+  } else {
+    reason = 'Algorithm: the rebound setup is offset by an SEC filing flag, so no multi-week direction.';
+    waitFor = 'Either the filing concern clearing or a clear trend.';
+  }
+  return { verdict: v, agrees: false, sizing: v === 'UP' ? 'QUARTER' : 'NONE', reason: reason, waitFor: waitFor };
+}
 // Record-only lane values for a future version (see above).
 function bracketLanesForLog(rangePosition: any, g2Status: string | null): { range52: number | null; catalyst: number | null } {
   const rp = Number(rangePosition);
@@ -929,6 +962,8 @@ module.exports = {
   longBracket: longBracket,
   BRACKET_VETO_VERSION: BRACKET_VETO_VERSION,
   bracketVetoesUp: bracketVetoesUp,
+  LONG_CONTROL_VERSION: LONG_CONTROL_VERSION,
+  longControl: longControl,
   bracketLanesForLog: bracketLanesForLog,
   gate5MayOverride: gate5MayOverride,
   B2_VERSION: B2_VERSION,

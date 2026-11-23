@@ -748,6 +748,16 @@ function longBracket(gate1Branch, preGateStatus) {
     const score = trend + filing;
     return { verdict: score >= 1 ? 'UP' : score <= -1 ? 'DOWN' : 'FLAT', score: score, trend: trend, filing: filing };
 }
+// LONG bracket veto (LIVE, Nov 23, 2026, approved by Mr. T): when the model
+// calls UP and BR-1 (scored before the model ran) says DOWN, the LONG call
+// ships as FLAT. Can only remove UP calls, never add one. Evidence (all
+// graded LONG calls Aug 26-Nov 2): those 66 UPs were right 10.6% vs ~18%
+// for a random UP pick, averaged -6.5% by session 14, spread over 13
+// tickers and below random in every month. Off switch: LONG_BRACKET_VETO=off.
+const BRACKET_VETO_VERSION = 'V-1';
+function bracketVetoesUp(modelVerdict, bracketVerdict) {
+    return modelVerdict === 'UP' && bracketVerdict === 'DOWN';
+}
 // Record-only lane values for a future version (see above).
 function bracketLanesForLog(rangePosition, g2Status) {
     const rp = Number(rangePosition);
@@ -941,6 +951,8 @@ module.exports = {
     sessionOpenIso: sessionOpenIso,
     BRACKET_VERSION: BRACKET_VERSION,
     longBracket: longBracket,
+    BRACKET_VETO_VERSION: BRACKET_VETO_VERSION,
+    bracketVetoesUp: bracketVetoesUp,
     bracketLanesForLog: bracketLanesForLog,
     gate5MayOverride: gate5MayOverride,
     B2_VERSION: B2_VERSION,

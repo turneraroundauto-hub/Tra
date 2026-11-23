@@ -4700,7 +4700,10 @@ async function runShadowTuner(rows) {
     inputs.push({
       row: r, date: e.date, close, normal,
       input: {
-        long: { verdict: r.verdict, sizing: r.size_action || "NONE" },
+        // A vetoed row's DAY call was refined from the model's UP, not the shipped FLAT.
+        long: (r.gates.inputs && r.gates.inputs.long_veto)
+          ? { verdict: r.gates.inputs.long_veto.from, sizing: r.gates.inputs.long_veto.sizing || "NONE" }
+          : { verdict: r.verdict, sizing: r.size_action || "NONE" },
         locked: opts ? opts.locked : LOCKING_OVERRIDES.has(r.gates.inputs && r.gates.inputs.override),
         fridaySkeptic: opts ? opts.fridaySkeptic : e.day === "Fri", // approximation before Oct 27 logging
         issuedAtMs: Date.parse(r.issued_at), openMs, cutoffMs: openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000,
@@ -7775,6 +7778,24 @@ Return only single-line minified JSON.
         parsed.wait_for = `Earnings imminent${typeof upcomingEarnings === "string" ? ` (${upcomingEarnings})` : ""} — no new entries until it's reported, unless you explicitly hold through it.`;
       }
 
+      // ── LONG bracket veto (LIVE, Nov 23, 2026, Mr. T; ah.bracketVetoesUp) ──
+      // A model UP that BR-1 (scored before the model ran) calls DOWN ships
+      // as FLAT. LONG only: the DAY call below still refines the model's own
+      // call, and the frozen B-2 shadow still reads it. Off: LONG_BRACKET_VETO=off.
+      const modelLongVerdict = parsed.verdict;
+      const modelLongSizing  = parsed.sizing;
+      let longVeto = null;
+      if (process.env.LONG_BRACKET_VETO !== "off" && longBracketPre && ah.bracketVetoesUp(parsed.verdict, longBracketPre.verdict)) {
+        longVeto = { from: modelLongVerdict, sizing: modelLongSizing, bracket: longBracketPre.verdict, score: longBracketPre.score, version: ah.BRACKET_VETO_VERSION };
+        overrideFired     = overrideFired || "bracket_veto";
+        parsed.verdict    = "FLAT";
+        parsed.sizing     = "NONE";
+        parsed.confidence = "LOW";
+        parsed.wait_for   = gate1Result.branch === "UPTREND"
+          ? "Trend check: names already in an uptrend have tended to pull back over the next 2-3 weeks. Wait for a pullback before a multi-week UP."
+          : "Trend check: a recent SEC filing flag outweighs the upside over the next 2-3 weeks. Wait for it to clear before a multi-week UP.";
+      }
+
       let windowBarsLog = null;
       let pendingDayJob = null; // saved after logVerdict, so it can carry the row id
       let dayOptsLog = null;    // locked / fridaySkeptic, logged for exact shadow replays
@@ -7788,7 +7809,7 @@ Return only single-line minified JSON.
         const locked = gate0Status === "RED" || !!gate1Result.forceDown || gate5ForceDown || earningsBlocked;
         const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
         // schedule rides along so a DAY read that lands later uses the same bar size.
-        const long = { verdict: parsed.verdict, sizing: parsed.sizing, locked, fridaySkeptic, schedule: win ? win.schedule : null };
+        const long = { verdict: modelLongVerdict, sizing: modelLongSizing, locked, fridaySkeptic, schedule: win ? win.schedule : null };
         dayOptsLog = { locked: !!locked, fridaySkeptic: !!fridaySkeptic };
         result.gateMissing = gateMissing;
         result.window = win ? buildWindowBlock(win, long, { locked, fridaySkeptic }) : null;
@@ -7818,6 +7839,7 @@ Return only single-line minified JSON.
             override: overrideFired,
           });
       if (optionsProbe) logInputs.options = optionsProbe;
+      if (longVeto) logInputs.long_veto = longVeto;
       // Confidence v2, shadow only (ah.confidenceV2): logged beside the live
       // label so the two can be graded side by side. The historical-accuracy
       // ceiling only needs its query when v2 would otherwise be HIGH.
@@ -7846,13 +7868,13 @@ Return only single-line minified JSON.
         const cachedCloses = symbolMarketCache.get(T) && symbolMarketCache.get(T).data ? symbolMarketCache.get(T).data.dailyCloses : null;
         const rangePos = ah.rangePosition(completedDailyCloses(T, cachedCloses), metricsData?.price);
         const trend = gate1Result.branch === "UPTREND" || gate1Result.branch === "DOWNTREND" ? gate1Result.branch : null;
-        longB2 = { ...ah.ruleB2(parsed.verdict, trend, rangePos), rangePos, trend };
+        longB2 = { ...ah.ruleB2(modelLongVerdict, trend, rangePos), rangePos, trend };
       } catch (e) { longB2 = null; }
       if (longBracketPre) {
         try {
           logInputs.long_bracket = { ...longBracketPre, version: ah.BRACKET_VERSION,
             ...ah.bracketLanesForLog(metricsData?.rangePosition, parsed.gates?.g2_catalyst?.status || null),
-            confirms_up: parsed.verdict === "UP" && longBracketPre.verdict === "UP" };
+            confirms_up: modelLongVerdict === "UP" && longBracketPre.verdict === "UP" };
         } catch (e) { /* shadow only */ }
       }
       const verdictLogId = await logVerdict({

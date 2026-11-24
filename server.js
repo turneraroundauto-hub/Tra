@@ -4702,12 +4702,14 @@ async function runShadowTuner(rows) {
       input: {
         // A vetoed row's DAY call was refined from the model's UP, not the shipped FLAT.
         long: (r.gates.inputs && r.gates.inputs.long_source)
-          ? { verdict: r.gates.inputs.long_source.model, sizing: r.gates.inputs.long_source.model_sizing || "NONE" }
+          ? { verdict: r.gates.inputs.long_source.model, sizing: (opts && opts.day_base_sizing) || r.gates.inputs.long_source.model_sizing || "NONE" }
           : (r.gates.inputs && r.gates.inputs.long_veto)
           ? { verdict: r.gates.inputs.long_veto.from, sizing: r.gates.inputs.long_veto.sizing || "NONE" }
           : { verdict: r.verdict, sizing: r.size_action || "NONE" },
         locked: opts ? opts.locked : LOCKING_OVERRIDES.has(r.gates.inputs && r.gates.inputs.override),
         fridaySkeptic: opts ? opts.fridaySkeptic : e.day === "Fri", // approximation before Oct 27 logging
+        // D-2 rows (Nov 24, 2026) replay with g3w.dayCall and their logged lock/v2Low.
+        dayVersion: opts && opts.version ? opts.version : null, lock: opts ? opts.lock || null : null, v2Low: opts ? opts.v2Low || null : null,
         issuedAtMs: Date.parse(r.issued_at), openMs, cutoffMs: openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000,
         barsBySize, impliedDailyMovePct: opt.impliedDailyMovePct ?? null, normalDailyMovePct: opt.normalDailyMovePct ?? null,
         deltaLean: typeof opt.deltaLean === "number" ? opt.deltaLean : null,
@@ -6934,6 +6936,12 @@ function ptClock(iso) {
 // The client-facing window block. long = the verdict the model + server
 // rules produced (that's still what verdict_log grades, so the Scorecard
 // is unchanged); day = long refined by the bars, or null while forming.
+// DAY options from a stored long object: D-2 jobs carry lock/v2Low/version;
+// jobs saved before D-2 keep the old locked/refine behavior.
+function dayOptsFrom(long) {
+  if (long && long.dayVersion === g3w.DAY_CALL_VERSION) return { version: long.dayVersion, lock: long.lock || null, v2Low: long.v2Low || null, fridaySkeptic: !!long.fridaySkeptic };
+  return { locked: !!(long && long.locked), fridaySkeptic: !!(long && long.fridaySkeptic) };
+}
 function buildWindowBlock(win, long, opts) {
   const gate3 = win.seq
     ? { status: win.seq.status, note: win.seq.note }
@@ -6942,7 +6950,9 @@ function buildWindowBlock(win, long, opts) {
       : win.state === "EXPIRED"
         ? { status: null, note: "Day window passed (10:30 AM PT). Long verdict only." }
         : { status: null, note: "Market closed. Long verdict only." };
-  const day = win.state === "RESOLVED" ? g3w.refineDayVerdict(long, win.seq, opts) : null;
+  const day = win.state !== "RESOLVED" ? null
+    : opts && opts.version === g3w.DAY_CALL_VERSION ? g3w.dayCall(long, win.seq, opts)
+    : g3w.refineDayVerdict(long, win.seq, opts);
   return {
     state: win.state, barsDone: win.barsDone, barsNeeded: win.barsNeeded,
     readyAt: win.readyAt, cutoffAt: win.cutoffAt, asOf: win.asOf, candleKey: win.candleKey,
@@ -7034,7 +7044,7 @@ async function resolveDayJob(job) {
   if (win.dateET !== job.dateET || win.state === "CLOSED" || win.state === "EXPIRED") job.status = "EXPIRED";
   else if (win.state === "RESOLVED") job.status = "READY";
   else return job; // still forming (or a fetch hiccup) -- try again next tick
-  job.window = buildWindowBlock(win, job.long, { locked: job.long.locked, fridaySkeptic: job.long.fridaySkeptic });
+  job.window = buildWindowBlock(win, job.long, dayOptsFrom(job.long));
   await saveDayJob(job);
   if (job.status === "READY") await recordDayCall(job.verdictLogId, job.window);
   const cached = windowVerdictCache.get(job.wkey);
@@ -7772,6 +7782,7 @@ Return only single-line minified JSON.
       // forces NONE outright, regardless of verdict direction -- this
       // isn't a directional call, it's "don't size into a print."
       parsed.sizing = applySizingCeiling(parsed.sizing, effectiveDialPosition);
+      const sizingBeforeEarnings = parsed.sizing; // DAY ignores the earnings block (D-2, Mr. T)
       let earningsBlocked = false;
       if (upcomingEarnings) {
         earningsBlocked = true;
@@ -7795,6 +7806,7 @@ Return only single-line minified JSON.
       if (ctl) {
         longSource = { model: modelLongVerdict, model_sizing: modelLongSizing, bracket: ctl.verdict, score: longBracketPre.score, agrees: ctl.agrees, version: ah.LONG_CONTROL_VERSION };
         if (!ctl.agrees) {
+          longSource.prior_override = overrideFired || null; // the rule that set the AI's call, if any
           overrideFired     = overrideFired || "algo_direction";
           parsed.verdict    = ctl.verdict;
           parsed.sizing     = applySizingCeiling(ctl.sizing, effectiveDialPosition);
@@ -7827,13 +7839,21 @@ Return only single-line minified JSON.
         // by the bars -- rules only, no second model call.
         const win = await windowP;
         windowBarsLog = win && win.bars ? win.bars : null;
-        const locked = gate0Status === "RED" || !!gate1Result.forceDown || gate5ForceDown || earningsBlocked;
+        // DAY call D-2 (g3w.dayCall): its own call, separate from LONG. Locks are
+        // market/breakdown rules only (no earnings lock); a price already moving
+        // against the DAY direction makes it FLAT (v2 LOW, computed now).
+        const dayLock = gate0Status === "RED" ? "gate0_red" : gate1Result.forceDown ? "gate1_forcedown" : gate5ForceDown ? "gate5_forcedown" : null;
+        const locked = !!dayLock;
         const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
+        const v2Low = {
+          UP: ah.confidenceV2("UP", tickerPct, proxyPct, regime?.rolling, null) === "LOW",
+          DOWN: ah.confidenceV2("DOWN", tickerPct, proxyPct, regime?.rolling, null) === "LOW",
+        };
         // schedule rides along so a DAY read that lands later uses the same bar size.
-        const long = { verdict: modelLongVerdict, sizing: modelLongSizing, locked, fridaySkeptic, schedule: win ? win.schedule : null };
-        dayOptsLog = { locked: !!locked, fridaySkeptic: !!fridaySkeptic };
+        const long = { verdict: modelLongVerdict, sizing: earningsBlocked ? sizingBeforeEarnings : modelLongSizing, locked, lock: dayLock, v2Low, dayVersion: g3w.DAY_CALL_VERSION, fridaySkeptic, schedule: win ? win.schedule : null };
+        dayOptsLog = { locked, fridaySkeptic: !!fridaySkeptic, lock: dayLock, v2Low, version: g3w.DAY_CALL_VERSION, day_base_sizing: long.sizing };
         result.gateMissing = gateMissing;
-        result.window = win ? buildWindowBlock(win, long, { locked, fridaySkeptic }) : null;
+        result.window = win ? buildWindowBlock(win, long, dayOptsFrom(long)) : null;
         const c = nowCandle();
         if (c.key) {
           if (windowVerdictCache.size > 2000) windowVerdictCache.clear();
@@ -7862,6 +7882,9 @@ Return only single-line minified JSON.
       if (optionsProbe) logInputs.options = optionsProbe;
       if (longVeto) logInputs.long_veto = longVeto;
       if (longSource) logInputs.long_source = longSource;
+      // Which rule set the SHIPPED LONG call: override names the first rule that
+      // fired on the AI's call; final_override is the last word (Nov 24, 2026).
+      logInputs.final_override = longSource && !longSource.agrees ? "algo_direction" : (logInputs.override || null);
       // Confidence v2, shadow only (ah.confidenceV2): logged beside the live
       // label so the two can be graded side by side. The historical-accuracy
       // ceiling only needs its query when v2 would otherwise be HIGH.

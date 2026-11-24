@@ -115,3 +115,26 @@ test('5- and 30-min schedules: candles and completed bars', () => {
     a3.strictEqual(w3.expectedCompletedCount(open, open - 1000, 15), 0);
   });
 }
+
+test('dayCall D-2: DAY is its own call (locks, green bars over a breakdown, price against, no earnings lock)', () => {
+  const green = { direction: 1 }, red = { direction: -1 }, mixed = { direction: 0 };
+  // Gate 1 breakdown DOWN on 3 green bars -> UP for today, QUARTER.
+  const flip = g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, green, { lock: 'gate1_forcedown' });
+  assert.equal(flip.verdict, 'UP'); assert.equal(flip.sizing, 'QUARTER'); assert.equal(flip.rule, 'bars_over_breakdown');
+  // The breakdown still holds on red or mixed bars.
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, red, { lock: 'gate1_forcedown' }).verdict, 'DOWN');
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, mixed, { lock: 'gate1_forcedown' }).verdict, 'DOWN');
+  // Gate 0 RED (market) is not flipped by green bars.
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, green, { lock: 'gate0_red' }).verdict, 'DOWN');
+  // No lock: same refinement as before.
+  assert.deepEqual(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, {}).verdict, 'UP');
+  assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, red, {}).verdict, 'FLAT');
+  // Price already moving against the DAY direction -> FLAT, NONE.
+  const against = g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, { v2Low: { UP: true, DOWN: false } });
+  assert.equal(against.verdict, 'FLAT'); assert.equal(against.sizing, 'NONE'); assert.equal(against.rule, 'price_against');
+  // ...checked against the DAY direction, including a flipped UP.
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, green, { lock: 'gate1_forcedown', v2Low: { UP: true } }).verdict, 'FLAT');
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, red, { v2Low: { UP: true, DOWN: false } }).verdict, 'DOWN');
+  // Still null while the bars haven't resolved and nothing is locked.
+  assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, null, {}), null);
+});

@@ -159,6 +159,43 @@ function refineDayVerdict(long: { verdict: string; sizing: string }, seq: any, o
   return { verdict: 'FLAT', sizing: ls, note: 'Long is FLAT; the bars alone never make a call.' + fri };
 }
 
+// DAY call D-2 (Nov 24, 2026, Mr. T: "delineate day from long completely").
+// Pro only. Starts from the AI's own read (modelLongVerdict) and the morning bars;
+// never from the LONG controller. Rules, from 155 replayed DAY calls (Oct 21-
+// Nov 20: 64.2% right vs 58.1% live, better in both halves):
+//  - A market/breakdown lock (Gate 0 RED, Gate 1 breakdown, Gate 5 forceDown)
+//    keeps its call, EXCEPT a Gate 1 breakdown DOWN on a morning of 3 green bars:
+//    the bars win for today (UP, QUARTER). 8 of 10 such past calls kept rising.
+//  - If the price is already moving against the DAY direction (confidence v2
+//    LOW for that direction, computed at issue), the DAY call is FLAT.
+//  - The earnings block does NOT apply to DAY (Mr. T): no lock, normal sizing.
+const DAY_CALL_VERSION = 'D-2';
+function dayCall(long: { verdict: string; sizing: string }, seq: any,
+  opts: { lock?: string | null; fridaySkeptic?: boolean; v2Low?: { UP?: boolean; DOWN?: boolean } | null } = {}) {
+  const lv = (long && long.verdict) || 'FLAT';
+  const ls = (long && long.sizing) || 'NONE';
+  let day: any;
+  if (opts.lock) {
+    if (opts.lock === 'gate1_forcedown' && lv === 'DOWN' && seq && seq.direction === 1) {
+      day = { verdict: 'UP', sizing: 'QUARTER', rule: 'bars_over_breakdown',
+        note: 'Morning bars: 3 green. They override the 2-week breakdown for today only.' };
+    } else {
+      day = { verdict: lv, sizing: ls, rule: 'lock',
+        note: opts.lock === 'gate0_red' ? 'Broad market selloff: the market rule sets today\'s call.'
+          : opts.lock === 'gate1_forcedown' ? '2-week breakdown and the bars don\'t say otherwise: DOWN for today.'
+          : 'A hard override set this call; the bars do not change it.' };
+    }
+  } else {
+    day = refineDayVerdict(long, seq, { fridaySkeptic: opts.fridaySkeptic });
+    if (!day) return null;
+  }
+  if ((day.verdict === 'UP' || day.verdict === 'DOWN') && opts.v2Low && opts.v2Low[day.verdict as 'UP' | 'DOWN']) {
+    return { verdict: 'FLAT', sizing: 'NONE', rule: 'price_against',
+      note: 'The stock or its sector is already moving against a ' + day.verdict + ' call today. No day trade.' };
+  }
+  return day;
+}
+
 module.exports = {
   BAR_MINUTES: BAR_MINUTES,
   SESSION_OPEN_MIN: SESSION_OPEN_MIN,
@@ -175,4 +212,6 @@ module.exports = {
   DAY_BAR_MIN_SHARE: DAY_BAR_MIN_SHARE,
   stepDownSizing: stepDownSizing,
   refineDayVerdict: refineDayVerdict,
+  DAY_CALL_VERSION: DAY_CALL_VERSION,
+  dayCall: dayCall,
 };

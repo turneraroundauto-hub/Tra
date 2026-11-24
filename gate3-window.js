@@ -149,7 +149,22 @@ function refineDayVerdict(long, seq, opts = {}) {
 //    that direction) -> FLAT. No earnings lock on DAY.
 // Replay on 155 past DAY calls (Oct 21-Nov 20): 62.9% right on 132 calls vs
 // 58.1% live. Re-read for free on every later tap before the cutoff.
-const DAY_CALL_VERSION = 'D-2';
+// D-3 (Nov 24, 2026, Mr. T: "keep the whole day in focus"): the last 3 bars
+// still set the direction (the 3-bar window only paces how often a read can
+// happen), and the day so far -- every completed bar since the 9:30 ET open --
+// confirms it. Agree: size unchanged. Against: one size down (never below
+// QUARTER). At the first read the 3 bars ARE the day, so it only acts once
+// more than 3 bars are done (7:30 PT onward and on re-reads).
+const DAY_CALL_VERSION = 'D-3';
+const DAY_CALL_VERSIONS = ['D-2', 'D-3'];
+function isDayCallVersion(v) { return DAY_CALL_VERSIONS.indexOf(v) >= 0; }
+function sessionRead(doneBars) {
+    if (!doneBars || !doneBars.length || !doneBars[0].o)
+        return null;
+    const first = doneBars[0], last = doneBars[doneBars.length - 1];
+    const netPct = (last.c - first.o) / first.o * 100;
+    return { bars: doneBars.length, netPct, direction: netPct > 0 ? 1 : netPct < 0 ? -1 : 0 };
+}
 function dayCall(long, seq, opts = {}) {
     if (!seq)
         return null;
@@ -176,6 +191,19 @@ function dayCall(long, seq, opts = {}) {
         day = { verdict: bar, sizing: 'QUARTER', rule: 'bars_lead',
             note: 'Last 3 bars point ' + bar + ', against the AI\'s ' + lv + ' read. The bars lead today; tap ↻ Re-read bars later to update.' };
     }
+    const ses = opts.session;
+    if ((day.verdict === 'UP' || day.verdict === 'DOWN') && ses && ses.bars > BARS_NEEDED && ses.direction !== 0) {
+        const sesDir = ses.direction === 1 ? 'UP' : 'DOWN';
+        const since = (ses.netPct >= 0 ? '+' : '') + ses.netPct.toFixed(2) + '% since the open';
+        if (sesDir === day.verdict) {
+            day = { ...day, session: 'agrees', note: day.note + ' The day so far agrees (' + since + ').' };
+        }
+        else {
+            const smaller = stepDownSizing(day.sizing);
+            day = { ...day, sizing: smaller, session: 'against',
+                note: day.note + ' The day so far is ' + sesDir + ' (' + since + ')' + (smaller === day.sizing ? '; already at the smallest size.' : ': one size down.') };
+        }
+    }
     if ((day.verdict === 'UP' || day.verdict === 'DOWN') && opts.v2Low && opts.v2Low[day.verdict]) {
         return { verdict: 'FLAT', sizing: 'NONE', rule: 'price_against',
             note: 'The stock or its sector is already moving against a ' + day.verdict + ' call today. No day trade.' };
@@ -199,5 +227,8 @@ module.exports = {
     stepDownSizing: stepDownSizing,
     refineDayVerdict: refineDayVerdict,
     DAY_CALL_VERSION: DAY_CALL_VERSION,
+    DAY_CALL_VERSIONS: DAY_CALL_VERSIONS,
+    isDayCallVersion: isDayCallVersion,
+    sessionRead: sessionRead,
     dayCall: dayCall,
 };

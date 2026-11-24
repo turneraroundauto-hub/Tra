@@ -192,8 +192,10 @@ function replayDayCall(input, params) {
     });
     const day = params.dayModel === 'g23'
         ? dayFromGates23(input, seq)
-        : input.dayVersion === g3w.DAY_CALL_VERSION
-            ? g3w.dayCall(input.long, seq, { lock: input.lock || null, v2Low: input.v2Low || null, fridaySkeptic: !!input.fridaySkeptic })
+        : g3w.isDayCallVersion(input.dayVersion)
+            ? g3w.dayCall(input.long, seq, { lock: input.lock || null, v2Low: input.v2Low || null, fridaySkeptic: !!input.fridaySkeptic,
+                // D-3 rows: the day so far (every completed bar since the open) confirms the 3-bar read.
+                session: input.dayVersion === 'D-2' ? null : g3w.sessionRead(done) })
             : g3w.refineDayVerdict(input.long, seq, { locked: !!input.locked, fridaySkeptic: !!input.fridaySkeptic });
     if (!day)
         return { skipped: 'no read', barMinutes };

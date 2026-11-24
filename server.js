@@ -4013,6 +4013,46 @@ async function recordDayCall(verdictLogId, windowBlock) {
 // (same day scope as supersedeSameDayVerdicts), the latest DAY call stands
 // and earlier ones are marked day_superseded. A later LONG-only re-run (past
 // the 1:30 PM ET / 10:30 AM PT cutoff, no DAY call) never touches the morning's DAY call.
+// D-2 free DAY re-read (Nov 24, 2026, Mr. T: grade each change from its own
+// entry). When a re-read's DAY call differs from the latest DAY call already
+// logged today for this account+ticker, insert a DAY-only row: a copy of the
+// original call's identity with superseded=true (so it never counts as a LONG
+// call) and the new DAY call. Re-read rows are never superseded by, and never
+// supersede, other DAY calls (markDaySuperseded skips gates.day_reread).
+async function logDayReread(origId, block, dayOpts) {
+  if (!supabase || !origId || !block || !block.day) return;
+  const { data: row, error } = await supabase.from("verdict_log")
+    .select("ticker, user_email, device_id, verdict, size_action, issued_price, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, issued_at")
+    .eq("id", origId).single();
+  if (error || !row) { if (error) console.error(`logDayReread ${origId}:`, error.message); return; }
+  const dayStart = new Date(row.issued_at); dayStart.setUTCHours(0, 0, 0, 0);
+  let q = supabase.from("verdict_log").select("day_verdict, issued_at, day_issued_at")
+    .eq("ticker", row.ticker).not("day_verdict", "is", null)
+    .gte("issued_at", dayStart.toISOString()).lt("issued_at", new Date(dayStart.getTime() + 86400000).toISOString());
+  q = row.user_email ? q.eq("user_email", row.user_email) : q.eq("device_id", row.device_id || "");
+  const { data: prior } = await q;
+  const latest = (prior || []).sort((a, b) => Date.parse(b.day_issued_at || b.issued_at) - Date.parse(a.day_issued_at || a.issued_at))[0];
+  if (latest && latest.day_verdict === block.day.verdict) return; // unchanged: nothing new to grade
+  const now = new Date();
+  const gates = Object.assign({}, row.gates || {}, {
+    day_reread: true, reread_of: origId,
+    g3_bars: block.gate3 ? block.gate3.status : null, g3_bars_note: block.gate3 ? block.gate3.note : null,
+    g3_bars_done: block.barsDone, g3_window: block.state, g3_bar_minutes: block.barMinutes,
+    g3_day_opts: dayOpts || null,
+  });
+  const { error: insErr } = await supabase.from("verdict_log").insert({
+    ticker: row.ticker, user_email: row.user_email, device_id: row.device_id, verdict: row.verdict, size_action: row.size_action,
+    issued_price: row.issued_price, confidence: row.confidence, dial_position: row.dial_position, tier: row.tier,
+    pre_gate_state: row.pre_gate_state, gate0_read: row.gate0_read, gate1_branch: row.gate1_branch,
+    gate2_corroboration_state: row.gate2_corroboration_state, gates,
+    issued_at: now.toISOString(), issued_market_open: isMarketOpenAt(now),
+    superseded: true, day_superseded: false,
+    ...dayCallFields({ ...block.day, asOf: block.asOf, entryPrice: block.dayEntryPrice }),
+  });
+  if (insErr) console.error(`logDayReread ${row.ticker}:`, insErr.message);
+  else console.log(`[DAY] ${row.ticker}: re-read changed DAY to ${block.day.verdict} (${block.day.rule || ""})`);
+}
+
 async function markDaySuperseded(verdictLogId) {
   try {
     const { data: row } = await supabase.from("verdict_log")
@@ -4020,14 +4060,16 @@ async function markDaySuperseded(verdictLogId) {
     if (!row || !row.user_email) return;
     const dayStart = new Date(row.issued_at); dayStart.setUTCHours(0, 0, 0, 0);
     const { data: rows, error } = await supabase.from("verdict_log")
-      .select("id, issued_at, day_verdict, day_superseded")
+      .select("id, issued_at, day_verdict, day_superseded, gates")
       .eq("ticker", row.ticker).eq("user_email", row.user_email)
       .not("day_verdict", "is", null)
       .gte("issued_at", dayStart.toISOString())
       .lt("issued_at", new Date(dayStart.getTime() + 86400000).toISOString());
     if (error) { console.error(`markDaySuperseded ${verdictLogId}:`, error.message); return; }
-    const { keep } = ah.daySupersedeSplit(rows || []);
-    for (const r of rows || []) {
+    // D-2 free re-reads are graded each on their own: never part of this rule.
+    const own = (rows || []).filter(r => !(r.gates && r.gates.day_reread));
+    const { keep } = ah.daySupersedeSplit(own);
+    for (const r of own) {
       const want = r.id !== keep;
       if (!!r.day_superseded !== want) await supabase.from("verdict_log").update({ day_superseded: want }).eq("id", r.id);
     }
@@ -4709,7 +4751,7 @@ async function runShadowTuner(rows) {
         locked: opts ? opts.locked : LOCKING_OVERRIDES.has(r.gates.inputs && r.gates.inputs.override),
         fridaySkeptic: opts ? opts.fridaySkeptic : e.day === "Fri", // approximation before Oct 27 logging
         // D-2 rows (Nov 24, 2026) replay with g3w.dayCall and their logged lock/v2Low.
-        dayVersion: opts && opts.version ? opts.version : null, lock: opts ? opts.lock || null : null, v2Low: opts ? opts.v2Low || null : null,
+        dayVersion: opts && opts.version ? opts.version : null, v2Low: opts ? opts.v2Low || null : null,
         issuedAtMs: Date.parse(r.issued_at), openMs, cutoffMs: openMs + (g3w.WINDOW_CUTOFF_MIN - g3w.SESSION_OPEN_MIN) * 60000,
         barsBySize, impliedDailyMovePct: opt.impliedDailyMovePct ?? null, normalDailyMovePct: opt.normalDailyMovePct ?? null,
         deltaLean: typeof opt.deltaLean === "number" ? opt.deltaLean : null,
@@ -6939,7 +6981,7 @@ function ptClock(iso) {
 // DAY options from a stored long object: D-2 jobs carry lock/v2Low/version;
 // jobs saved before D-2 keep the old locked/refine behavior.
 function dayOptsFrom(long) {
-  if (long && long.dayVersion === g3w.DAY_CALL_VERSION) return { version: long.dayVersion, lock: long.lock || null, v2Low: long.v2Low || null, fridaySkeptic: !!long.fridaySkeptic };
+  if (long && long.dayVersion === g3w.DAY_CALL_VERSION) return { version: long.dayVersion, v2Low: long.v2Low || null, fridaySkeptic: !!long.fridaySkeptic };
   return { locked: !!(long && long.locked), fridaySkeptic: !!(long && long.fridaySkeptic) };
 }
 function buildWindowBlock(win, long, opts) {
@@ -6993,7 +7035,42 @@ async function windowCacheLookup(wkey, ticker, gate0) {
   if (e.candleKey === g3w.candleKey(c.date, c.minutes, c.closeMin, e.barMinutes || 15)) return e.result;
   const postCutoff = c.minutes >= g3w.WINDOW_CUTOFF_MIN;
   if (postCutoff && e.postCutoff && e.gate0 === gate0 && (await catalystKey(ticker)) === e.catalyst) return e.result;
+  // D-2 (Nov 24, 2026, Mr. T): before the cutoff a later tap re-reads the bars
+  // for free -- same AI read, fresh DAY call, no model call, no credit.
+  if (!postCutoff && e.long && e.long.dayVersion === g3w.DAY_CALL_VERSION) return { reread: e };
   return null;
+}
+
+// "Price already against" for both directions (confidence v2 LOW), from the
+// opening bar's move and the proxy's move -- the same inputs /analyze uses.
+function dayV2Low(tickerPct, proxyPct, rolling) {
+  return {
+    UP: ah.confidenceV2("UP", tickerPct, proxyPct, rolling, null) === "LOW",
+    DOWN: ah.confidenceV2("DOWN", tickerPct, proxyPct, rolling, null) === "LOW",
+  };
+}
+
+// Free DAY re-read on a later tap (D-2): fresh bars and fresh v2 numbers from
+// this request, the cached AI read. A DAY call that differs from the last one
+// shown is logged as its own graded call (logDayReread).
+async function rereadDay(e, T, body) {
+  const win = await fetchGate3Window(T, new Date(), e.long.schedule);
+  if (!win) return null;
+  const ob = body && body.openingBarData;
+  const tickerPct = ob && ob.open ? (ob.close - ob.open) / ob.open * 100 : null;
+  const syms = ((e.long.v2Proxy && e.long.v2Proxy.symbols) || []).map(s => String(s).toLowerCase());
+  const vals = syms.map(s => ah.parsePctString(body && body.sectorContext ? body.sectorContext[s] : null)).filter(v => v !== null);
+  const proxyPct = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  const long = { ...e.long, v2Low: dayV2Low(tickerPct, proxyPct, e.long.v2Proxy ? e.long.v2Proxy.rolling : null) };
+  const block = buildWindowBlock(win, long, dayOptsFrom(long));
+  const result = { ...e.result, window: block };
+  e.result = result; e.long = long;
+  if (win.candleKey) e.candleKey = win.candleKey;
+  if (block.day && e.verdictLogId) {
+    await logDayReread(e.verdictLogId, block, { ...e.dayOptsLog, v2Low: long.v2Low }).catch(err => console.error(`rereadDay ${T}:`, err.message));
+  }
+  if (block.day) e.lastDay = block.day.verdict;
+  return result;
 }
 
 // Pending Day jobs: an ANALYZE tapped before the 3rd bar closes. When it
@@ -7117,6 +7194,16 @@ app.post("/analyze", async (req, res) => {
   const T = ticker.toUpperCase();
   const wkey = windowMode ? windowCacheKey(req, T, effectiveDialPosition, holdThroughEarnings) : null;
 
+  // D-2 free DAY re-read (no credit needed, so it runs before the credit check).
+  if (windowMode) {
+    const hit = await windowCacheLookup(wkey, T, sectorContext?.gateStatus || "GREEN");
+    if (hit && hit.reread) {
+      const fresh = await rereadDay(hit.reread, T, req.body).catch(err => { console.error(`rereadDay ${T}:`, err.message); return null; });
+      // If the bars can't be fetched, show the last result rather than charge.
+      return res.json({ ...(fresh || hit.reread.result), fromCache: true, reread: !!fresh });
+    }
+  }
+
   // ── CREDIT CHECK ──────────────────────────────────────────────
   const userStatus = await credits.getUserStatus(req.userKey, req.userTier);
 
@@ -7144,7 +7231,7 @@ app.post("/analyze", async (req, res) => {
   const cached      = windowMode
     ? await windowCacheLookup(wkey, T, sectorContext?.gateStatus || "GREEN")
     : getCached(cacheKey, cacheMinutes);
-  if (cached) {
+  if (cached && !cached.reread) {
     return res.json({ ...cached, fromCache: true });
   }
 
@@ -7839,25 +7926,25 @@ Return only single-line minified JSON.
         // by the bars -- rules only, no second model call.
         const win = await windowP;
         windowBarsLog = win && win.bars ? win.bars : null;
-        // DAY call D-2 (g3w.dayCall): its own call, separate from LONG. Locks are
-        // market/breakdown rules only (no earnings lock); a price already moving
-        // against the DAY direction makes it FLAT (v2 LOW, computed now).
-        const dayLock = gate0Status === "RED" ? "gate0_red" : gate1Result.forceDown ? "gate1_forcedown" : gate5ForceDown ? "gate5_forcedown" : null;
-        const locked = !!dayLock;
+        // DAY call D-2 (g3w.dayCall): its own call, separate from LONG, and never
+        // held by a rule (Mr. T: "a day call should never be locked for the day").
+        // The market rules still shape the AI's read it starts from. No earnings
+        // lock. A price already moving against the DAY direction makes it FLAT.
+        const marketRule = gate0Status === "RED" ? "gate0_red" : gate1Result.forceDown ? "gate1_forcedown" : gate5ForceDown ? "gate5_forcedown" : null;
+        const locked = false;
         const fridaySkeptic = etWeekday() === 5 && !(weekRange && weekRange.flat);
-        const v2Low = {
-          UP: ah.confidenceV2("UP", tickerPct, proxyPct, regime?.rolling, null) === "LOW",
-          DOWN: ah.confidenceV2("DOWN", tickerPct, proxyPct, regime?.rolling, null) === "LOW",
-        };
-        // schedule rides along so a DAY read that lands later uses the same bar size.
-        const long = { verdict: modelLongVerdict, sizing: earningsBlocked ? sizingBeforeEarnings : modelLongSizing, locked, lock: dayLock, v2Low, dayVersion: g3w.DAY_CALL_VERSION, fridaySkeptic, schedule: win ? win.schedule : null };
-        dayOptsLog = { locked, fridaySkeptic: !!fridaySkeptic, lock: dayLock, v2Low, version: g3w.DAY_CALL_VERSION, day_base_sizing: long.sizing };
+        const v2Proxy = { symbols: (rule.proxy?.symbols || []).slice(0, 6), rolling: regime?.rolling ?? null };
+        const v2Low = dayV2Low(tickerPct, proxyPct, v2Proxy.rolling);
+        // schedule rides along so a DAY read that lands later uses the same bar size;
+        // v2Proxy lets a free re-read recompute "price against" from fresh numbers.
+        const long = { verdict: modelLongVerdict, sizing: earningsBlocked ? sizingBeforeEarnings : modelLongSizing, locked, v2Low, v2Proxy, dayVersion: g3w.DAY_CALL_VERSION, fridaySkeptic, schedule: win ? win.schedule : null };
+        dayOptsLog = { locked, fridaySkeptic: !!fridaySkeptic, market_rule: marketRule, v2Low, version: g3w.DAY_CALL_VERSION, day_base_sizing: long.sizing };
         result.gateMissing = gateMissing;
         result.window = win ? buildWindowBlock(win, long, dayOptsFrom(long)) : null;
         const c = nowCandle();
         if (c.key) {
           if (windowVerdictCache.size > 2000) windowVerdictCache.clear();
-          windowVerdictCache.set(wkey, { result, dateET: c.date, candleKey: win && win.candleKey ? win.candleKey : c.key, barMinutes: win && win.schedule ? win.schedule.barMinutes : 15, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
+          windowVerdictCache.set(wkey, { result, long, lastDay: result.window && result.window.day ? result.window.day.verdict : null, dateET: c.date, candleKey: win && win.candleKey ? win.candleKey : c.key, barMinutes: win && win.schedule ? win.schedule.barMinutes : 15, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
         }
         if (win && result.window.pending) pendingDayJob = { dateET: win.dateET, long, readyAt: win.readyAt };
       } else {
@@ -7948,6 +8035,11 @@ Return only single-line minified JSON.
         userEmail: req.userEmail, tier: req.userTier, deviceId: anonDeviceId, longB2, longBracket: longBracketPre,
         day: result.window && result.window.day ? { ...result.window.day, asOf: result.window.asOf, entryPrice: result.window.dayEntryPrice } : null,
       });
+      // The free DAY re-read (D-2) logs its changes against this row.
+      if (wkey && windowVerdictCache.has(wkey)) {
+        const ce = windowVerdictCache.get(wkey);
+        ce.verdictLogId = verdictLogId; ce.dayOptsLog = dayOptsLog;
+      }
       // Saved after the log row exists so a DAY read that lands later can be
       // written onto that same row (recordDayCall).
       if (pendingDayJob) {

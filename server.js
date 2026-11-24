@@ -4022,7 +4022,7 @@ async function recordDayCall(verdictLogId, windowBlock) {
 async function logDayReread(origId, block, dayOpts) {
   if (!supabase || !origId || !block || !block.day) return;
   const { data: row, error } = await supabase.from("verdict_log")
-    .select("ticker, user_email, device_id, verdict, size_action, issued_price, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, issued_at")
+    .select("ticker, user_email, device_id, verdict, size_action, issued_price, confidence, dial_position, tier, pre_gate_state, gate0_read, gate1_branch, gate2_corroboration_state, gates, issued_at, crf_version, grading_window_days, grade_due_at")
     .eq("id", origId).single();
   if (error || !row) { if (error) console.error(`logDayReread ${origId}:`, error.message); return; }
   const dayStart = new Date(row.issued_at); dayStart.setUTCHours(0, 0, 0, 0);
@@ -4046,6 +4046,8 @@ async function logDayReread(origId, block, dayOpts) {
     issued_price: row.issued_price, confidence: row.confidence, dial_position: row.dial_position, tier: row.tier,
     pre_gate_state: row.pre_gate_state, gate0_read: row.gate0_read, gate1_branch: row.gate1_branch,
     gate2_corroboration_state: row.gate2_corroboration_state, gates,
+    // NOT NULL columns (Nov 24, 2026: the first live re-read insert failed on crf_version).
+    crf_version: row.crf_version, grading_window_days: row.grading_window_days, grade_due_at: row.grade_due_at,
     issued_at: now.toISOString(), issued_market_open: isMarketOpenAt(now),
     superseded: true, day_superseded: false,
     ...dayCallFields({ ...block.day, asOf: block.asOf, entryPrice: block.dayEntryPrice }),
@@ -7925,7 +7927,8 @@ Return only single-line minified JSON.
       let windowBarsLog = null;
       let pendingDayJob = null; // saved after logVerdict, so it can carry the row id
       let dayOptsLog = null;    // locked / fridaySkeptic, logged for exact shadow replays
-      const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
+      // analyzedAt: when the AI read was made; a free DAY re-read reuses it (Pro card shows it).
+      const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked, analyzedAt: new Date().toISOString() };
       if (windowMode) {
         // The verdict above is the Long call (still what verdict_log grades,
         // so the Scorecard doesn't change). The Day call is that Long refined

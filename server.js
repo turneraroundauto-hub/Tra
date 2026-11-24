@@ -4037,6 +4037,7 @@ async function logDayReread(origId, block, dayOpts) {
   const gates = Object.assign({}, row.gates || {}, {
     day_reread: true, reread_of: origId,
     g3_bars: block.gate3 ? block.gate3.status : null, g3_bars_note: block.gate3 ? block.gate3.note : null,
+    g3_session: block.session || null,
     g3_bars_done: block.barsDone, g3_window: block.state, g3_bar_minutes: block.barMinutes,
     g3_day_opts: dayOpts || null,
   });
@@ -6967,6 +6968,8 @@ async function fetchGate3Window(symbol, realNow = new Date(), schedule = DEFAULT
     barsDone: Math.min(done.length, g3w.BARS_NEEDED),
     seq: state === "RESOLVED" ? g3w.classifySequence(done.slice(-g3w.BARS_NEEDED), { yardstickPct: sched.yardstickPct, lean: sched.lean, barMinutes: barMin }) : null,
     bars: done.slice(-g3w.BARS_NEEDED), // logged in verdict_log.gates.inputs; not sent to the card
+    // D-3: the day so far -- session open -> latest completed close, every bar since 9:30 ET.
+    session: state === "RESOLVED" ? g3w.sessionRead(done) : null,
     asOf: last ? new Date(Date.parse(last.t) + barMin * 60000).toISOString() : null,
   };
 }
@@ -6981,7 +6984,7 @@ function ptClock(iso) {
 // DAY options from a stored long object: D-2 jobs carry lock/v2Low/version;
 // jobs saved before D-2 keep the old locked/refine behavior.
 function dayOptsFrom(long) {
-  if (long && long.dayVersion === g3w.DAY_CALL_VERSION) return { version: long.dayVersion, v2Low: long.v2Low || null, fridaySkeptic: !!long.fridaySkeptic };
+  if (long && g3w.isDayCallVersion(long.dayVersion)) return { version: long.dayVersion, v2Low: long.v2Low || null, fridaySkeptic: !!long.fridaySkeptic };
   return { locked: !!(long && long.locked), fridaySkeptic: !!(long && long.fridaySkeptic) };
 }
 function buildWindowBlock(win, long, opts) {
@@ -6993,7 +6996,9 @@ function buildWindowBlock(win, long, opts) {
         ? { status: null, note: "Day window passed (10:30 AM PT). Long verdict only." }
         : { status: null, note: "Market closed. Long verdict only." };
   const day = win.state !== "RESOLVED" ? null
-    : opts && opts.version === g3w.DAY_CALL_VERSION ? g3w.dayCall(long, win.seq, opts)
+    // D-3: the day so far (every completed bar since the open) confirms the 3-bar read.
+    // D-2 jobs/cache entries saved earlier today keep the plain 3-bar read.
+    : opts && g3w.isDayCallVersion(opts.version) ? g3w.dayCall(long, win.seq, opts.version === "D-2" ? opts : { ...opts, session: win.session || null })
     : g3w.refineDayVerdict(long, win.seq, opts);
   return {
     state: win.state, barsDone: win.barsDone, barsNeeded: win.barsNeeded,
@@ -7002,6 +7007,7 @@ function buildWindowBlock(win, long, opts) {
     barMinutes: (win.schedule && win.schedule.barMinutes) || 15,
     lens: win.schedule && win.schedule.source === "options" ? { yardstickPct: win.schedule.yardstickPct, lean: win.schedule.lean } : null,
     pending: win.state === "FORMING", gate3, long: { verdict: long.verdict, sizing: long.sizing }, day,
+    session: win.session || null,
     // Close of the bar the DAY read was made on -- the DAY call's entry price.
     dayEntryPrice: day && win.bars && win.bars.length ? win.bars[win.bars.length - 1].c : null,
   };
@@ -7037,7 +7043,7 @@ async function windowCacheLookup(wkey, ticker, gate0) {
   if (postCutoff && e.postCutoff && e.gate0 === gate0 && (await catalystKey(ticker)) === e.catalyst) return e.result;
   // D-2 (Nov 24, 2026, Mr. T): before the cutoff a later tap re-reads the bars
   // for free -- same AI read, fresh DAY call, no model call, no credit.
-  if (!postCutoff && e.long && e.long.dayVersion === g3w.DAY_CALL_VERSION) return { reread: e };
+  if (!postCutoff && e.long && g3w.isDayCallVersion(e.long.dayVersion)) return { reread: e };
   return null;
 }
 
@@ -8021,6 +8027,7 @@ Return only single-line minified JSON.
         // keep both so the stored G3 says how many bars it actually saw.
         gates: Object.assign(ah.gatesForLog(parsed.gates, { g3Read }), result.window ? {
           g3_bars: result.window.gate3 ? result.window.gate3.status : null,
+          g3_session: result.window.session || null,
           g3_bars_note: result.window.gate3 ? result.window.gate3.note : null,
           g3_bars_done: result.window.barsDone,
           g3_window: result.window.state,

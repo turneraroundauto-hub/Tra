@@ -137,3 +137,29 @@ test('dayCall D-2: DAY is its own call; the bars decide, nothing holds it', () =
   assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, red, { fridaySkeptic: true }).verdict, 'UP');
   assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, null, {}), null);
 });
+
+test('dayCall D-3: the day so far confirms the 3-bar read', () => {
+  const green = { direction: 1 }, mixed = { direction: 0 };
+  const day = [bar('2026-11-24T14:30:00Z', 30, 29), bar('2026-11-24T14:45:00Z', 29, 28.5), bar('2026-11-24T15:00:00Z', 28.5, 28.4),
+    bar('2026-11-24T15:15:00Z', 28.4, 28.6), bar('2026-11-24T15:30:00Z', 28.6, 28.8), bar('2026-11-24T15:45:00Z', 28.8, 29)];
+  const s = g3.sessionRead(day);
+  assert.equal(s.bars, 6); assert.equal(s.direction, -1); assert.ok(Math.abs(s.netPct - (-3.3333)) < 0.01);
+  // Last 3 bars green, day so far down -> UP stays, one size down.
+  const up = g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, { session: s });
+  assert.equal(up.verdict, 'UP'); assert.equal(up.sizing, 'QUARTER'); assert.equal(up.session, 'against');
+  assert.match(up.note, /day so far is DOWN \(-3\.33% since the open\): one size down/);
+  // Never below QUARTER.
+  const lead = g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, green, { session: s });
+  assert.equal(lead.sizing, 'QUARTER'); assert.match(lead.note, /already at the smallest size/);
+  // Agrees -> size unchanged.
+  const agree = g3.dayCall({ verdict: 'DOWN', sizing: 'HALF' }, mixed, { session: s });
+  assert.equal(agree.sizing, 'QUARTER'); assert.equal(agree.session, 'agrees');
+  // First read: the 3 bars ARE the day -> no session effect.
+  const first = g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, { session: g3.sessionRead(day.slice(0, 3)) });
+  assert.equal(first.sizing, 'HALF'); assert.equal(first.session, undefined);
+  // FLAT stays FLAT; price-against still wins.
+  assert.equal(g3.dayCall({ verdict: 'FLAT', sizing: 'NONE' }, green, { session: s }).verdict, 'FLAT');
+  assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, { session: s, v2Low: { UP: true } }).verdict, 'FLAT');
+  assert.equal(g3.sessionRead([]), null);
+  assert.ok(g3.isDayCallVersion('D-2') && g3.isDayCallVersion('D-3') && !g3.isDayCallVersion('D-1'));
+});

@@ -115,3 +115,25 @@ test('5- and 30-min schedules: candles and completed bars', () => {
     a3.strictEqual(w3.expectedCompletedCount(open, open - 1000, 15), 0);
   });
 }
+
+test('dayCall D-2: DAY is its own call; the bars decide, nothing holds it', () => {
+  const green = { direction: 1 }, red = { direction: -1 }, mixed = { direction: 0 };
+  // Bars clearly against the AI's read -> follow the bars, QUARTER.
+  const lead = g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, green, {});
+  assert.equal(lead.verdict, 'UP'); assert.equal(lead.sizing, 'QUARTER'); assert.equal(lead.rule, 'bars_lead');
+  assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, red, {}).verdict, 'DOWN');
+  // Agree -> the AI's call at its size; mixed -> same call, one size down.
+  assert.deepEqual([g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, {}).verdict, g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, {}).sizing], ['UP', 'HALF']);
+  const mix = g3.dayCall({ verdict: 'DOWN', sizing: 'HALF' }, mixed, {});
+  assert.equal(mix.verdict, 'DOWN'); assert.equal(mix.sizing, 'QUARTER');
+  // FLAT AI read stays FLAT; the bars alone never make a call.
+  assert.equal(g3.dayCall({ verdict: 'FLAT', sizing: 'NONE' }, green, {}).verdict, 'FLAT');
+  // Price already against the DAY direction -> FLAT/NONE, including a bars-led call.
+  const against = g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, green, { v2Low: { UP: true, DOWN: false } });
+  assert.equal(against.verdict, 'FLAT'); assert.equal(against.sizing, 'NONE'); assert.equal(against.rule, 'price_against');
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, green, { v2Low: { UP: true } }).verdict, 'FLAT');
+  assert.equal(g3.dayCall({ verdict: 'DOWN', sizing: 'NONE' }, red, { v2Low: { UP: true, DOWN: false } }).verdict, 'DOWN');
+  // Friday reversal risk treats one-way bars as mixed; no bars yet -> null.
+  assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, red, { fridaySkeptic: true }).verdict, 'UP');
+  assert.equal(g3.dayCall({ verdict: 'UP', sizing: 'HALF' }, null, {}), null);
+});

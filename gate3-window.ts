@@ -159,6 +159,44 @@ function refineDayVerdict(long: { verdict: string; sizing: string }, seq: any, o
   return { verdict: 'FLAT', sizing: ls, note: 'Long is FLAT; the bars alone never make a call.' + fri };
 }
 
+// DAY call D-2 (Nov 24, 2026, Mr. T: "delineate day from long completely";
+// "a day call should never be locked for the day"). Pro only. Starts from the
+// AI's own read (modelLongVerdict) and the latest 3 bars; never from the LONG
+// controller, and no rule holds it against the bars:
+//  - bars agree -> the AI's call at its size; bars mixed -> same call, one size
+//    down; bars clearly the other way -> the bars' direction, QUARTER.
+//  - a price already moving against the DAY direction (confidence v2 LOW for
+//    that direction) -> FLAT. No earnings lock on DAY.
+// Replay on 155 past DAY calls (Oct 21-Nov 20): 62.9% right on 132 calls vs
+// 58.1% live. Re-read for free on every later tap before the cutoff.
+const DAY_CALL_VERSION = 'D-2';
+function dayCall(long: { verdict: string; sizing: string }, seq: any,
+  opts: { fridaySkeptic?: boolean; v2Low?: { UP?: boolean; DOWN?: boolean } | null } = {}) {
+  if (!seq) return null;
+  const lv = (long && long.verdict) || 'FLAT';
+  const ls = (long && long.sizing) || 'NONE';
+  let dir = seq.direction;
+  let fri = '';
+  if (opts.fridaySkeptic && dir !== 0) { dir = 0; fri = ' Friday reversal risk: treated as mixed.'; }
+  const bar = dir === 1 ? 'UP' : dir === -1 ? 'DOWN' : null;
+  let day: any;
+  if (lv !== 'UP' && lv !== 'DOWN') {
+    day = { verdict: 'FLAT', sizing: 'NONE', rule: 'ai_flat', note: 'The AI reads today as FLAT; the bars alone never make a call.' + fri };
+  } else if (!bar) {
+    day = { verdict: lv, sizing: stepDownSizing(ls), rule: 'bars_mixed', note: 'Bars mixed so far: ' + lv + ', one size down.' + fri };
+  } else if (bar === lv) {
+    day = { verdict: lv, sizing: ls, rule: 'bars_agree', note: 'Bars confirm ' + lv + ' for today.' };
+  } else {
+    day = { verdict: bar, sizing: 'QUARTER', rule: 'bars_lead',
+      note: 'Last 3 bars point ' + bar + ', against the AI\'s ' + lv + ' read. The bars lead today; tap ↻ Re-read bars later to update.' };
+  }
+  if ((day.verdict === 'UP' || day.verdict === 'DOWN') && opts.v2Low && opts.v2Low[day.verdict as 'UP' | 'DOWN']) {
+    return { verdict: 'FLAT', sizing: 'NONE', rule: 'price_against',
+      note: 'The stock or its sector is already moving against a ' + day.verdict + ' call today. No day trade.' };
+  }
+  return day;
+}
+
 module.exports = {
   BAR_MINUTES: BAR_MINUTES,
   SESSION_OPEN_MIN: SESSION_OPEN_MIN,
@@ -175,4 +213,6 @@ module.exports = {
   DAY_BAR_MIN_SHARE: DAY_BAR_MIN_SHARE,
   stepDownSizing: stepDownSizing,
   refineDayVerdict: refineDayVerdict,
+  DAY_CALL_VERSION: DAY_CALL_VERSION,
+  dayCall: dayCall,
 };

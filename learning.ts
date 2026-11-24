@@ -183,7 +183,9 @@ function replayDayCall(input: any, params: any): any {
   });
   const day = params.dayModel === 'g23'
     ? dayFromGates23(input, seq)
-    : g3w.refineDayVerdict(input.long, seq, { locked: !!input.locked, fridaySkeptic: !!input.fridaySkeptic });
+    : input.dayVersion === g3w.DAY_CALL_VERSION
+      ? g3w.dayCall(input.long, seq, { lock: input.lock || null, v2Low: input.v2Low || null, fridaySkeptic: !!input.fridaySkeptic })
+      : g3w.refineDayVerdict(input.long, seq, { locked: !!input.locked, fridaySkeptic: !!input.fridaySkeptic });
   if (!day) return { skipped: 'no read', barMinutes };
   const last = done[done.length - 1];
   return { verdict: day.verdict, sizing: day.sizing, strength: day.strength || null, quiet: day.quiet,

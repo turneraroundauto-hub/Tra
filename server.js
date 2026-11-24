@@ -7927,7 +7927,8 @@ Return only single-line minified JSON.
       let windowBarsLog = null;
       let pendingDayJob = null; // saved after logVerdict, so it can carry the row id
       let dayOptsLog = null;    // locked / fridaySkeptic, logged for exact shadow replays
-      const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked };
+      // analyzedAt: when the AI read was made; a free DAY re-read reuses it (Pro card shows it).
+      const result = { ...parsed, marketOpen: isMarketOpen(), earningsBlocked, analyzedAt: new Date().toISOString() };
       if (windowMode) {
         // The verdict above is the Long call (still what verdict_log grades,
         // so the Scorecard doesn't change). The Day call is that Long refined

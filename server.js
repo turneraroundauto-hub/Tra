@@ -371,6 +371,10 @@ const TIER_KEYS = {
 // add_purchased_credits, same RPCs credits.js itself calls), not
 // per-caller and not through any signup flow.
 const MCP_AGENT_KEY = process.env.MCP_AGENT_KEY;
+// Shadow DAY trials (Nov 25, 2026): the in-process runner calls /analyze over
+// loopback with this per-boot random token. It never leaves the process, so
+// only the runner can make a shadow request.
+const SHADOW_RUN_TOKEN = require("crypto").randomBytes(24).toString("hex");
 const MCP_AGENT_CREDITS_KEY = "mcp:agent";
 
 // OAuth discovery/registration/authorization endpoints are, by spec,
@@ -412,6 +416,15 @@ app.use(async (req, res, next) => {
     req.userTier   = resolved.tier;
     req.userKey    = `sub:${resolved.user.email}`;  // stable key — email not JWT
     req.tierConfig = credits.TIERS[resolved.tier];
+    return next();
+  }
+
+  // ── PATH 0: in-process shadow DAY trials runner (loopback only) ──
+  if (req.headers["x-shadow-run"] && req.headers["x-shadow-run"] === SHADOW_RUN_TOKEN) {
+    req.userTier   = "pro";
+    req.userKey    = "shadow:runner";
+    req.tierConfig = credits.TIERS.pro;
+    req.shadowRun  = true;
     return next();
   }
 
@@ -4874,6 +4887,7 @@ async function runVerdictGradingSweep() {
     const dayRecovered = await backfillDayCallsFromJobs();
     if (dayRecovered) console.log(`Day call backfill: ${dayRecovered} DAY read(s) attached from day_refinement_jobs.`);
     const dayCallCount = await gradeUntilCaughtUp(gradeDayCallRows);
+    await gradeShadowTrials().catch(e => console.error("gradeShadowTrials:", e.message));
     if (primaryCount || secondaryCount || horizonCount || dayCount || longCount || dayCallCount) {
       console.log(`Verdict grading sweep: ${primaryCount} primary, ${secondaryCount} secondary, ${horizonCount} horizon, ${dayCount} day, ${longCount} long, ${dayCallCount} DAY-call row(s) graded.`);
     }
@@ -7198,12 +7212,15 @@ app.post("/analyze", async (req, res) => {
 
   // Gate 3 rolling window + Day verdict (Oct 19, 2026) -- beta accounts only
   // (see gate3WindowEnabled). Off = exactly the old behavior below.
-  const windowMode = gate3WindowEnabled(req);
+  // Shadow runs (Nov 25, 2026): always read the 3-bar window; never charge,
+  // never touch a cache, never write verdict_log (see runShadowSlot).
+  const shadowRun = !!req.shadowRun;
+  const windowMode = shadowRun || gate3WindowEnabled(req);
   const T = ticker.toUpperCase();
   const wkey = windowMode ? windowCacheKey(req, T, effectiveDialPosition, holdThroughEarnings) : null;
 
   // D-2 free DAY re-read (no credit needed, so it runs before the credit check).
-  if (windowMode) {
+  if (windowMode && !shadowRun) {
     const hit = await windowCacheLookup(wkey, T, sectorContext?.gateStatus || "GREEN");
     if (hit && hit.reread) {
       const fresh = await rereadDay(hit.reread, T, req.body).catch(err => { console.error(`rereadDay ${T}:`, err.message); return null; });
@@ -7213,7 +7230,7 @@ app.post("/analyze", async (req, res) => {
   }
 
   // ── CREDIT CHECK ──────────────────────────────────────────────
-  const userStatus = await credits.getUserStatus(req.userKey, req.userTier);
+  const userStatus = shadowRun ? { totalCredits: 1 } : await credits.getUserStatus(req.userKey, req.userTier);
 
   // Check ticker limit
   if (req.userTier !== "shark" && req.userTier !== "pro") {
@@ -7236,7 +7253,7 @@ app.post("/analyze", async (req, res) => {
   // Check cache before deducting credit
   const cacheKey    = `${req.userTier}:${ticker.toUpperCase()}`;
   const cacheMinutes = credits.TIERS[req.userTier]?.cacheMinutes || 15;
-  const cached      = windowMode
+  const cached      = shadowRun ? null : windowMode
     ? await windowCacheLookup(wkey, T, sectorContext?.gateStatus || "GREEN")
     : getCached(cacheKey, cacheMinutes);
   if (cached && !cached.reread) {
@@ -7248,7 +7265,7 @@ app.post("/analyze", async (req, res) => {
   // unparseable response) can refund it -- a user should never pay for an
   // error. Sep 28, 2026: an Anthropic account usage cap made every ANALYZE
   // fail with a raw "Anthropic error 400" while still charging for it.
-  const charged = await credits.deductCredit(req.userKey, 1, req.userTier);
+  const charged = shadowRun ? false : await credits.deductCredit(req.userKey, 1, req.userTier);
   let refunded = false;
   const refundIfCharged = async (reason) => {
     if (!charged || refunded) return;
@@ -7486,7 +7503,7 @@ Current price: $${metricsData.price || "?"}
     hasFreshNews: !!(newsData && !newsData.basis && newsData.ageHours <= 24), // related/sector news is not this ticker's own
   });
   const contextCorroboration = gx.computeGate2Corroboration({ buildup, hasEarningsEvent });
-  await logCorroborationHits(ticker, contextCorroboration);
+  if (!shadowRun) await logCorroborationHits(ticker, contextCorroboration);
 
   const userMessage = `
 Analyze ${ticker.toUpperCase()}.
@@ -7579,6 +7596,8 @@ Return only single-line minified JSON.
 
     try {
       const parsed = JSON.parse(clean);
+      // The AI's own read, before any server market rule (shadow trials).
+      const aiRaw = { verdict: parsed.verdict, sizing: parsed.sizing };
 
       // The model only writes Gates 2 and 3 (the two judgment gates); the
       // other five are server-computed and attached here. Rebuilt in the
@@ -7951,11 +7970,11 @@ Return only single-line minified JSON.
         result.gateMissing = gateMissing;
         result.window = win ? buildWindowBlock(win, long, dayOptsFrom(long)) : null;
         const c = nowCandle();
-        if (c.key) {
+        if (c.key && !shadowRun) {
           if (windowVerdictCache.size > 2000) windowVerdictCache.clear();
           windowVerdictCache.set(wkey, { result, long, lastDay: result.window && result.window.day ? result.window.day.verdict : null, dateET: c.date, candleKey: win && win.candleKey ? win.candleKey : c.key, barMinutes: win && win.schedule ? win.schedule.barMinutes : 15, postCutoff: c.minutes >= g3w.WINDOW_CUTOFF_MIN, catalyst: await catalystKey(T), gate0: gate0Status });
         }
-        if (win && result.window.pending) pendingDayJob = { dateET: win.dateET, long, readyAt: win.readyAt };
+        if (win && result.window.pending && !shadowRun) pendingDayJob = { dateET: win.dateET, long, readyAt: win.readyAt };
       } else {
         setCache(cacheKey, result);
       }
@@ -8017,6 +8036,13 @@ Return only single-line minified JSON.
             ...ah.bracketLanesForLog(metricsData?.rangePosition, parsed.gates?.g2_catalyst?.status || null),
             confirms_up: modelLongVerdict === "UP" && longBracketPre.verdict === "UP" };
         } catch (e) { /* shadow only */ }
+      }
+      if (shadowRun) {
+        // Shadow DAY trials: hand the runner the snapshot; write nothing.
+        return res.json({ ...result, shadow: {
+          aiRaw, aiAfterRules: { verdict: modelLongVerdict, sizing: earningsBlocked ? sizingBeforeEarnings : modelLongSizing },
+          override: overrideFired, inputs: logInputs, dayOpts: dayOptsLog,
+        } });
       }
       const verdictLogId = await logVerdict({
         ticker, verdict: parsed.verdict, sizeAction: parsed.sizing,
@@ -8517,6 +8543,159 @@ setInterval(async () => {
 }, 60 * 1000);
 
 // ─── START ────────────────────────────────────────────────────────
+
+// ─── SHADOW DAY TRIALS (Nov 25, 2026, Mr. T) ─────────────────────────────
+// Twice a day (7:17 and 9:00 AM PT) the server runs the real analysis on a
+// frozen ticker list in complete shadow: no credit, no cache, no verdict_log,
+// no Scorecard or learning input. Each run stores one snapshot per ticker and
+// every frozen trial's DAY call (shadow-trials.ts, S-1) in shadow_day_trials;
+// gradeShadowTrials() grades them at that session's close exactly like a live
+// DAY call. Off switch: Render env SHADOW_TRIALS=off. Window: 3 weeks.
+const st = require("./shadow-trials");
+const SHADOW_TICKERS = (process.env.SHADOW_TICKERS || "ALAB,ARCC,AS,BB,DRAM,ET,HOOD,IMVT,IREN,MU,NU,PLTR,SDGR,TWST,VCYT")
+  .split(",").map(x => x.trim().toUpperCase()).filter(Boolean);
+const SHADOW_FIRST_DATE = process.env.SHADOW_TRIALS_START || "2026-11-25";
+const SHADOW_LAST_DATE  = process.env.SHADOW_TRIALS_UNTIL || "2026-12-15";
+const SHADOW_SLOTS = [{ slot: "0717PT", min: 10 * 60 + 17 }, { slot: "0900PT", min: 12 * 60 }]; // ET minutes
+const SHADOW_RULE_OVERRIDES = new Set(["gate1_forcedown", "gate0_red", "gate5_coherence_down", "gate5_coherence_flat",
+  "gate5_forcedown", "gate5_g2_down", "gate5_flat", "pre_gate_candidate", "congruency_flat"]);
+const shadowSlotsStarted = new Set();
+
+function shadowSectorContext(market) {
+  const chg = (k) => (market && market[k] ? market[k].change : "?");
+  return {
+    spy: chg("spy"), qqq: chg("qqq"), btc: chg("btc"), iwm: chg("iwm"), soxx: chg("soxx"), xbi: chg("xbi"),
+    ibb: chg("ibb"), gld: chg("gld"), uso: chg("uso"), tsm: chg("tsm"), msft: chg("msft"),
+    gateStatus: (market && market.gateStatus) || "GREEN", gateNote: (market && market.gateNote) || "",
+    btcSignal: (market && market.btcSignal) || "neutral",
+  };
+}
+async function shadowLoopback(path, body) {
+  const r = await fetch(`http://127.0.0.1:${PORT}${path}`, {
+    method: body ? "POST" : "GET",
+    headers: Object.assign({ "x-shadow-run": SHADOW_RUN_TOKEN }, body ? { "content-type": "application/json" } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => null);
+  return { ok: r.ok, status: r.status, data };
+}
+// One ticker: real analysis in shadow, then every trial from that snapshot.
+async function shadowAnalyzeOne(T, market) {
+  const tk = await shadowLoopback(`/ticker/${encodeURIComponent(T)}`);
+  if (!tk.ok || !tk.data) return { error: `ticker ${tk.status}` };
+  const td = tk.data;
+  const an = await shadowLoopback("/analyze", {
+    ticker: T, sectorContext: shadowSectorContext(market), marketContext: "",
+    metricsData: td.metrics || null, newsData: td.news || null, openingBarData: td.openingBar || null,
+    proxyRule: td.proxyRule || null, gate1Data: td.gate1 || null, preGateData: td.preGate || null,
+    weeklyCarryoverData: td.weeklyCarryover || null, regimeData: td.regime || null,
+    dialPosition: "NEUTRAL", holdThroughEarnings: false,
+  });
+  if (!an.ok || !an.data || !an.data.shadow) return { error: `analyze ${an.status}` };
+  const res = an.data, sh = res.shadow, win = res.window || {};
+  if (win.state !== "RESOLVED" || !win.day || !(win.dayEntryPrice > 0)) return { error: `no DAY read (${win.state || "no window"})`, retry: true };
+  const g3 = win.gate3 && win.gate3.status;
+  const snapshot = {
+    liveDay: { verdict: win.day.verdict, sizing: win.day.sizing },
+    aiRaw: sh.aiRaw && sh.aiRaw.verdict ? { verdict: sh.aiRaw.verdict, sizing: sh.aiRaw.sizing || "NONE" } : null,
+    ruleFired: SHADOW_RULE_OVERRIDES.has(sh.override),
+    barsDir: g3 === "GREEN" ? 1 : g3 === "RED" ? -1 : g3 === "YELLOW" ? 0 : null,
+    v2Low: sh.dayOpts && sh.dayOpts.v2Low ? sh.dayOpts.v2Low : null,
+    session: win.session || null,
+    deltaLean: sh.inputs && sh.inputs.options && typeof sh.inputs.options.deltaLean === "number" ? sh.inputs.options.deltaLean : null,
+    pctAbove50: sh.inputs && sh.inputs.g4 && typeof sh.inputs.g4.pct_above_50d === "number" ? sh.inputs.g4.pct_above_50d : null,
+    g5Status: res.gates && res.gates.g5_korea ? res.gates.g5_korea.status : null,
+  };
+  return {
+    snapshot: Object.assign({}, snapshot, { override: sh.override || null, aiAfterRules: sh.aiAfterRules,
+      long: { verdict: res.verdict, sizing: res.sizing }, gates: ah.gatesForLog(res.gates || {}, { g3Read: true }),
+      g3_note: win.gate3 ? win.gate3.note : null, day_note: win.day.note || null }),
+    trials: st.computeTrials(snapshot), readAt: win.asOf, entry: win.dayEntryPrice,
+  };
+}
+async function runShadowSlot(dateET, slot) {
+  const { data: have, error } = await supabase.from("shadow_day_trials").select("ticker").eq("run_date", dateET).eq("slot", slot);
+  if (error) { console.error("[SHADOW] lookup:", error.message); return; }
+  const done = new Set((have || []).map(r => r.ticker));
+  const todo = SHADOW_TICKERS.filter(t => !done.has(t));
+  if (!todo.length) return;
+  const mk = await shadowLoopback("/market");
+  const market = mk.ok ? mk.data : null;
+  let ok = 0, failed = [];
+  for (const T of todo) {
+    let out = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { out = await shadowAnalyzeOne(T, market); } catch (e) { out = { error: e.message }; }
+      if (!out.error || !out.retry) break;
+      await new Promise(r => setTimeout(r, 75000));
+    }
+    if (out.error) { failed.push(`${T}: ${out.error}`); continue; }
+    const due = horizonTargetFor(new Date(out.readAt), 0).dueAt.toISOString();
+    const { error: insErr } = await supabase.from("shadow_day_trials").insert({
+      run_date: dateET, slot, ticker: T, read_at: out.readAt, entry_price: out.entry, due_at: due,
+      version: st.TRIALS_VERSION, snapshot: out.snapshot, trials: out.trials,
+    });
+    if (insErr) failed.push(`${T}: insert ${insErr.message}`); else ok++;
+  }
+  console.log(`[SHADOW] ${dateET} ${slot}: ${ok}/${todo.length} ticker(s) recorded${failed.length ? "; failed " + failed.join(" | ") : ""}`);
+}
+async function maybeRunShadowSlots() {
+  if (!supabase || process.env.SHADOW_TRIALS === "off") return;
+  const now = new Date();
+  const { date, minutes } = etClock(now);
+  if (date < SHADOW_FIRST_DATE || date > SHADOW_LAST_DATE || !isMarketOpenAt(now)) return;
+  for (const s of SHADOW_SLOTS) {
+    const key = `${date}:${s.slot}`;
+    if (minutes < s.min || minutes >= s.min + 20 || shadowSlotsStarted.has(key)) continue;
+    shadowSlotsStarted.add(key);
+    runShadowSlot(date, s.slot).catch(e => console.error(`[SHADOW] ${key}:`, e.message));
+  }
+}
+setInterval(() => { maybeRunShadowSlots().catch(e => console.error("[SHADOW]:", e.message)); }, 30 * 1000);
+
+// Grade every trial at its session's close: same rules as a live DAY call
+// (UP/DOWN from the entry to the close, half credit for touching +4% then
+// closing wrong; FLAT within the ticker's normal move, shrunk for the part
+// of the session left).
+async function gradeShadowTrials() {
+  if (!supabase) return 0;
+  const w = GRADE_WINDOWS.day;
+  const now = Date.now();
+  const { data: due, error } = await supabase.from("shadow_day_trials")
+    .select("id, ticker, run_date, read_at, entry_price, due_at, trials")
+    .is("graded_at", null).lte("due_at", new Date(now).toISOString()).order("due_at", { ascending: true }).limit(60);
+  if (error) { console.error("gradeShadowTrials query:", error.message); return 0; }
+  let graded = 0;
+  for (const row of due || []) {
+    const stale = now - new Date(row.due_at).getTime() > HORIZON_GIVE_UP_AFTER_MS;
+    const readMs = Date.parse(row.read_at);
+    const close = await fetchSessionClose(row.ticker, row.run_date);
+    const bars = await fetchSessionBars(row.ticker, new Date(readMs - 60 * 60000).toISOString(), row.due_at);
+    const entry = Number(row.entry_price);
+    if (close == null || bars == null || !(entry > 0)) {
+      if (stale) await supabase.from("shadow_day_trials").update({ graded_at: new Date().toISOString() }).eq("id", row.id);
+      continue;
+    }
+    const r = (close - entry) / entry * 100;
+    const after = bars.filter(b => Date.parse(b.t) >= readMs);
+    const normal = await fetchNormalDailyMovePct(row.ticker, row.run_date);
+    const band = normal == null ? null : normal * flatScaleFor(row.read_at, 0, w.flatScale);
+    const grades = {};
+    for (const [name, call] of Object.entries(row.trials || {})) {
+      if (!call) { grades[name] = null; continue; }
+      grades[name] = call.verdict === "UP" || call.verdict === "DOWN"
+        ? gradeDirectionalCall(after, entry, call.verdict, w.target, r)
+        : classifyFlatReturn(r, band);
+    }
+    const { error: upErr } = await supabase.from("shadow_day_trials").update({
+      close_price: close, return_pct: r, normal_move_pct: normal, grades, graded_at: new Date().toISOString(),
+    }).eq("id", row.id);
+    if (upErr) console.error("gradeShadowTrials update:", upErr.message); else graded++;
+  }
+  if (graded) console.log(`[SHADOW] graded ${graded} shadow run(s).`);
+  return graded;
+}
+
 const PORT = process.env.PORT || 3001;
 mcpServer.mountMcpRoutes(app, PORT);
 oauth.mountOAuthRoutes(app, supabase);

@@ -955,7 +955,37 @@ function relatedNewsContext(ticker: string, news: any): string | null {
   return null;
 }
 
+// The first complete top-level JSON object in a model reply, ignoring any
+// text after it (Nov 26, 2026: the model sometimes appends a note after its
+// JSON answer, and JSON.parse rejected the whole reply). String-aware, so a
+// brace inside a quoted value doesn't count. Returns { json, trailing } where
+// trailing is whatever followed the object (trimmed); json is the whole input
+// when no balanced object is found, so JSON.parse still reports the real error.
+function extractFirstJsonObject(text: string): { json: string; trailing: string } {
+  const s = String(text || "");
+  const start = s.indexOf("{");
+  if (start < 0) return { json: s.trim(), trailing: "" };
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return { json: s.slice(start, i + 1), trailing: s.slice(i + 1).trim() };
+    }
+  }
+  return { json: s.trim(), trailing: "" };
+}
+
 module.exports = {
+  extractFirstJsonObject: extractFirstJsonObject,
   etOffsetIso: etOffsetIso,
   sessionOpenIso: sessionOpenIso,
   BRACKET_VERSION: BRACKET_VERSION,

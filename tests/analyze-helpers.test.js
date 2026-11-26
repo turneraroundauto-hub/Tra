@@ -698,3 +698,15 @@ test('longControl A-1: BR-1 sets the LONG direction; the model only keeps sizing
   assert.equal(ah.longControl('FLAT', 'NONE', up, null).verdict, 'UP');
   assert.equal(ah.longControl('UP', 'HALF', null, null), null);
 });
+
+test('extractFirstJsonObject ignores text after the JSON answer', () => {
+  const ah2 = require('../analyze-helpers.js');
+  const a = ah2.extractFirstJsonObject('{"verdict":"DOWN","reason":"a } brace \\" quote"}\n\nNote: extra {text}');
+  assert.equal(JSON.parse(a.json).verdict, 'DOWN');
+  assert.equal(a.trailing, 'Note: extra {text}');
+  const b = ah2.extractFirstJsonObject('{"a":{"b":1}}');
+  assert.deepEqual(JSON.parse(b.json), { a: { b: 1 } }); assert.equal(b.trailing, '');
+  const c = ah2.extractFirstJsonObject('{"a":1');
+  assert.equal(c.json, '{"a":1'); assert.throws(() => JSON.parse(c.json));
+  assert.equal(ah2.extractFirstJsonObject('no json').json, 'no json');
+});

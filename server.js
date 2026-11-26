@@ -7592,7 +7592,11 @@ Return only single-line minified JSON.
     logClaudeUsage(`analyze ${ticker}`, data.usage);
     noteAnalyzeCacheUse(data.usage);
     const text  = data.content?.[0]?.text || "";
-    const clean = text.replace(/```json|```/g, "").trim();
+    const stripped = text.replace(/```json|```/g, "").trim();
+    // Read only the first complete JSON object; the model sometimes adds a
+    // note after it (Nov 25, 2026: ARCC/HOOD failed on that).
+    const { json: clean, trailing } = ah.extractFirstJsonObject(stripped);
+    if (trailing) console.warn(`/analyze ${ticker}: ignored ${trailing.length} char(s) after the AI's JSON: ${trailing.slice(0, 120)}`);
 
     try {
       const parsed = JSON.parse(clean);
@@ -8591,7 +8595,7 @@ async function shadowAnalyzeOne(T, market) {
     weeklyCarryoverData: td.weeklyCarryover || null, regimeData: td.regime || null,
     dialPosition: "NEUTRAL", holdThroughEarnings: false,
   });
-  if (!an.ok || !an.data || !an.data.shadow) return { error: `analyze ${an.status}` };
+  if (!an.ok || !an.data || !an.data.shadow) return { error: `analyze ${an.status}`, serverError: an.status >= 500 };
   const res = an.data, sh = res.shadow, win = res.window || {};
   if (win.state !== "RESOLVED" || !win.day || !(win.dayEntryPrice > 0)) return { error: `no DAY read (${win.state || "no window"})`, retry: true };
   const g3 = win.gate3 && win.gate3.status;
@@ -8623,10 +8627,14 @@ async function runShadowSlot(dateET, slot) {
   const market = mk.ok ? mk.data : null;
   let ok = 0, failed = [];
   for (const T of todo) {
-    let out = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    let out = null, serverRetried = false;
+    for (let attempt = 0; attempt < 4; attempt++) {
       try { out = await shadowAnalyzeOne(T, market); } catch (e) { out = { error: e.message }; }
-      if (!out.error || !out.retry) break;
+      if (!out.error) break;
+      // A server error gets one quick retry (shadow calls cost no credit);
+      // an unresolved DAY read keeps its two 75 s retries.
+      if (out.serverError && !serverRetried) { serverRetried = true; await new Promise(r => setTimeout(r, 5000)); continue; }
+      if (!out.retry || attempt >= 2) break;
       await new Promise(r => setTimeout(r, 75000));
     }
     if (out.error) { failed.push(`${T}: ${out.error}`); continue; }
